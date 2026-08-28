@@ -162,13 +162,16 @@ def _stream_response(routes, upstream_body, holder, user_key):
         log.status = "success"
         log.http_status = 200
         log.duration_ms = round((time.monotonic() - holder["started"]) * 1000, 1)
+        log.routes = winner.report or []
         log.save()
         api_key_service.record_result(user_key, True)
         first = True
         for chunk in _drain(loop, winner):
             yield chunk
     except (NoRouteAvailable, AllRoutesFailed) as exc:
-        _finish_log(holder["log"], holder["started"], False, 503, "no_available_route")
+        report = exc.report if isinstance(exc, AllRoutesFailed) else None
+        _finish_log(holder["log"], holder["started"], False, 503, "no_available_route",
+                    routes=report)
         api_key_service.record_result(user_key, False)
         yield "data: " + json.dumps({
             "error": {"message": "当前没有可用线路或所有线路均失败", "type": "api_error",

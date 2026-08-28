@@ -582,6 +582,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
                 log.winner_key_name = winner.route.key.name
                 log.winner_proxy_name = winner.route.proxy.name if winner.route.proxy else ""
                 log.proxy_public_ip = winner.route.proxy.public_ip if winner.route.proxy else ""
+                log.routes = winner.report or []
                 log.save()
 
                 yield "data: " + json.dumps({
@@ -591,6 +592,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
                         "key_name": winner.route.key.name,
                         "proxy_name": winner.route.proxy.name if winner.route.proxy else "",
                         "first_chunk_ms": duration,
+                        "routes": winner.report or [],
                     }
                 }) + "\n\n"
 

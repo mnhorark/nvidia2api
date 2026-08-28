@@ -295,31 +295,43 @@ def race_chat(routes: list[Route], body: dict, base_url: str) -> RaceResult:
 
 
 async def race_stream_winner(routes: list[Route], body: dict, base_url: str):
-    """Race streaming connections; returns (route, cm, req_cm, resp, aiter, first_line)."""
+    """Race streaming connections; returns (route, cm, req_cm, resp, aiter, first_line, report)."""
+    import time as _time
     if not routes:
         raise NoRouteAvailable()
+    t0 = _time.monotonic()
     tasks = {
         asyncio.ensure_future(_stream_first_valid(r, body, base_url)): r for r in routes
     }
-    failures: list[dict] = []
+    report: list[dict] = []
+    n_failed = 0
     try:
         pending = set(tasks.keys())
-        while pending and len(failures) < len(routes):
+        while pending and n_failed < len(routes):
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
                 res, fail_info = t.result()
                 if res is not None:
+                    winner_route = tasks[t]
+                    latency = (_time.monotonic() - t0) * 1000
+                    report.append(route_info(winner_route, "winner", latency))
                     for p in pending:
                         p.cancel()
                     await asyncio.gather(*pending, return_exceptions=True)
+                    for p in pending:
+                        report.append(route_info(
+                            tasks[p], "cancelled",
+                            (_time.monotonic() - t0) * 1000, "winner decided"))
                     cm, req_cm, resp, ait, first_line = res
-                    return tasks[t], cm, req_cm, resp, ait, first_line
+                    return winner_route, cm, req_cm, resp, ait, first_line, report
                 if fail_info:
-                    failures.append(fail_info)
+                    report.append(fail_info)
+                n_failed += 1
     finally:
         pass
+    failures = [r for r in report if r.get("status") == "failed"] or report
     raise AllRoutesFailed(
-        [f"{f['name']}:{f['error']}" for f in failures], report=failures)
+        [f"{f['name']}:{f['error']}" for f in failures], report=report)
 
 
 async def iter_sse(first_line: str, aiter, include_first: bool = True) -> AsyncIterator[str]:
@@ -344,6 +356,7 @@ class StreamWinner:
     req_cm: Any
     aiter: Any
     first_line: str
+    report: list[dict] = None  # type: ignore[assignment]
 
     async def lines(self) -> AsyncIterator[str]:
         async for chunk in iter_sse(self.first_line, self.aiter):
@@ -361,5 +374,6 @@ class StreamWinner:
 
 
 async def race_stream(routes: list[Route], body: dict, base_url: str) -> StreamWinner:
-    route, cm, req_cm, resp, ait, first_line = await race_stream_winner(routes, body, base_url)
-    return StreamWinner(route=route, cm=cm, req_cm=req_cm, aiter=ait, first_line=first_line)
+    route, cm, req_cm, resp, ait, first_line, report = await race_stream_winner(routes, body, base_url)
+    return StreamWinner(route=route, cm=cm, req_cm=req_cm, aiter=ait, first_line=first_line,
+                        report=report)
