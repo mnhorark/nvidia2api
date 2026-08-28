@@ -1,6 +1,8 @@
-# nvidia2api
+# NVIDIA2API
 
 针对 NVIDIA AI API 的 API 聚合、代理加速、Key 池管理、代理池管理与 OpenAI 兼容中转平台。
+
+![cover](doc/img/cover.png)
 
 ## 功能
 
@@ -96,3 +98,8 @@ Key 的 RPM 计数使用 SQLite 条件更新（`UPDATE ... WHERE count < rpm_lim
 ## 环境变量
 
 见 `.env.example`。
+
+
+## 文档
+
+详见 [docs/](docs)：架构、数据库、后端模块、竞速引擎、Admin API、OpenAI API、前端、部署。
