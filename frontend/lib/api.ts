@@ -259,6 +259,11 @@ export interface AdminChatMeta {
   proxy_name?: string;
   duration_ms?: number;
   first_chunk_ms?: number;
+  first_token_ms?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  cached_tokens?: number;
   usage?: Record<string, number>;
   routes?: AdminChatRoute[];
 }

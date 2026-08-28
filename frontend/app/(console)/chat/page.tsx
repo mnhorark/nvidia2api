@@ -126,7 +126,12 @@ export default function ChatPage() {
             continue;
           }
           if (data.meta) {
-            meta = data.meta as ChatMessage["meta"];
+            meta = { ...(meta ?? {}), ...(data.meta as ChatMessage["meta"]) };
+            paint();
+            continue;
+          }
+          if (data.summary) {
+            meta = { ...(meta ?? {}), ...(data.summary as ChatMessage["meta"]) };
             paint();
             continue;
           }
@@ -199,12 +204,16 @@ export default function ChatPage() {
                   {m.meta && (
                     <div className="mt-2 border-t border-white/10 pt-2 text-[11px] text-gray-500">
                       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                        <span>{m.meta.duration_ms ?? m.meta.first_chunk_ms ?? 0}ms</span>
+                        <span>首字 {Math.round(m.meta.first_token_ms ?? m.meta.first_chunk_ms ?? 0)}ms</span>
+                        <span>总耗时 {Math.round(m.meta.duration_ms ?? m.meta.first_chunk_ms ?? 0)}ms</span>
                         <span>线路: {m.meta.route_type === "direct" ? "直连" : m.meta.proxy_name}</span>
                         <span>Key: {m.meta.key_name}</span>
-                        <span>
-                          tokens: {(m.meta.usage?.prompt_tokens ?? 0)} + {(m.meta.usage?.completion_tokens ?? 0)} = {(m.meta.usage?.total_tokens ?? 0)}
-                        </span>
+                      </div>
+                      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-gray-500">
+                        <span>输入 {m.meta.prompt_tokens ?? m.meta.usage?.prompt_tokens ?? 0}</span>
+                        <span>输出 {m.meta.completion_tokens ?? m.meta.usage?.completion_tokens ?? 0}</span>
+                        <span>缓存 {m.meta.cached_tokens ?? 0}</span>
+                        <span>合计 {m.meta.total_tokens ?? m.meta.usage?.total_tokens ?? 0}</span>
                       </div>
                       {(m.meta.routes?.length ?? 0) > 0 && (
                         <div className="mt-1.5 space-y-0.5">

@@ -161,13 +161,26 @@ def _stream_response(routes, upstream_body, holder, user_key):
         log.proxy_public_ip = winner.route.proxy.public_ip if winner.route.proxy else ""
         log.status = "success"
         log.http_status = 200
-        log.duration_ms = round((time.monotonic() - holder["started"]) * 1000, 1)
+        log.first_token_ms = round((time.monotonic() - holder["started"]) * 1000, 1)
         log.routes = winner.report or []
         log.save()
         api_key_service.record_result(user_key, True)
-        first = True
+        usage: dict = {}
         for chunk in _drain(loop, winner):
+            try:
+                if chunk.startswith("data:"):
+                    payload = json.loads(chunk[5:].strip())
+                    if isinstance(payload, dict) and payload.get("usage"):
+                        usage = payload["usage"]
+            except Exception:  # noqa: BLE001
+                pass
             yield chunk
+        log.duration_ms = round((time.monotonic() - holder["started"]) * 1000, 1)
+        log.prompt_tokens = usage.get("prompt_tokens", 0) or 0
+        log.completion_tokens = usage.get("completion_tokens", 0) or 0
+        log.total_tokens = usage.get("total_tokens", 0) or 0
+        log.cached_tokens = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
+        log.save()
     except (NoRouteAvailable, AllRoutesFailed) as exc:
         report = exc.report if isinstance(exc, AllRoutesFailed) else None
         _finish_log(holder["log"], holder["started"], False, 503, "no_available_route",
@@ -232,6 +245,7 @@ def _finish_log(log: RequestLog, started: float, success: bool, http_status: int
         log.prompt_tokens = usage.get("prompt_tokens", 0) or 0
         log.completion_tokens = usage.get("completion_tokens", 0) or 0
         log.total_tokens = usage.get("total_tokens", 0) or 0
+        log.cached_tokens = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
     if routes:
         log.routes = routes
     log.save()

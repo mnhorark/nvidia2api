@@ -525,6 +525,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
         log.prompt_tokens = usage.get("prompt_tokens", 0) or 0
         log.completion_tokens = usage.get("completion_tokens", 0) or 0
         log.total_tokens = usage.get("total_tokens", 0) or 0
+        log.cached_tokens = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
         log.routes = result.report or []
         log.save()
         return Response({
@@ -560,6 +561,9 @@ class AdminChatView(AdminRequiredMixin, APIView):
         log = RequestLog.objects.create(
             request_id=request_id, model=model, routes_count=len(routes), is_stream=True
         )
+        # Ask upstream for usage in the last SSE chunk so we can record tokens.
+        body = dict(body)
+        body.setdefault("stream_options", {}).update({"include_usage": True})
         if not routes:
             log.status, log.http_status, log.error_type = "error", 503, "no_available_route"
             log.save()
@@ -597,11 +601,39 @@ class AdminChatView(AdminRequiredMixin, APIView):
                 }) + "\n\n"
 
                 stream = winner.lines()
+                usage: dict = {}
                 while True:
                     chunk = loop.run_until_complete(_next_line(stream))
                     if chunk is None:
                         break
+                    # harvest usage snapshot if present
+                    try:
+                        payload = json.loads(chunk[5:].strip()) if chunk.startswith("data:") else {}
+                        if isinstance(payload, dict) and payload.get("usage"):
+                            usage = payload["usage"]
+                    except Exception:  # noqa: BLE001
+                        pass
                     yield chunk
+
+                total_ms = round((time.monotonic() - t0) * 1000, 1)
+                log.duration_ms = total_ms
+                log.first_token_ms = duration
+                log.prompt_tokens = usage.get("prompt_tokens", 0) or 0
+                log.completion_tokens = usage.get("completion_tokens", 0) or 0
+                log.total_tokens = usage.get("total_tokens", 0) or 0
+                details = (usage.get("prompt_tokens_details") or {})
+                log.cached_tokens = details.get("cached_tokens", 0) or 0
+                log.save()
+                yield "data: " + json.dumps({
+                    "summary": {
+                        "duration_ms": total_ms,
+                        "first_token_ms": duration,
+                        "prompt_tokens": log.prompt_tokens,
+                        "completion_tokens": log.completion_tokens,
+                        "total_tokens": log.total_tokens,
+                        "cached_tokens": log.cached_tokens,
+                    }
+                }) + "\n\n"
             except (NoRouteAvailable, AllRoutesFailed) as exc:
                 log.status, log.http_status, log.error_type = "error", 502, "all_routes_failed"
                 if isinstance(exc, AllRoutesFailed):

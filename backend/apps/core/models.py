@@ -165,6 +165,8 @@ class RequestLog(models.Model):
     prompt_tokens = models.IntegerField(default=0)
     completion_tokens = models.IntegerField(default=0)
     total_tokens = models.IntegerField(default=0)
+    cached_tokens = models.IntegerField(default=0)          # 缓存读取的输入 token
+    first_token_ms = models.FloatField(null=True, blank=True)  # 首 chunk 耗时（TTFT）
     # Full per-route outcome of the race: winner / failed / cancelled
     routes = models.JSONField(default=list, blank=True)
 
