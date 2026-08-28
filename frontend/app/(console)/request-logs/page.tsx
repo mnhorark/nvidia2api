@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import { ChevronDown, ChevronRight, RefreshCw, Search } from "lucide-react";
 import { api, asList, RequestLog } from "@/lib/api";
 import {
@@ -97,9 +97,8 @@ export default function RequestLogsPage() {
         {logs.map((l) => {
           const open = expanded === l.request_id;
           return (
-            <>
+            <Fragment key={l.id ?? l.request_id}>
               <tr
-                key={l.id ?? l.request_id}
                 onClick={() => setExpanded(open ? null : l.request_id)}
                 className="cursor-pointer hover:bg-white/[0.02]"
               >
@@ -124,7 +123,7 @@ export default function RequestLogsPage() {
                 </Td>
               </tr>
               {open && (
-                <tr key={`${l.request_id}-detail`} className="bg-white/[0.02]">
+                <tr className="bg-white/[0.02]">
                   <Td colSpan={9} className="!py-3">
                     <div className="space-y-1.5">
                       <div className="mb-2 text-xs font-medium text-gray-400">线路竞速明细</div>
@@ -162,7 +161,7 @@ export default function RequestLogsPage() {
                   </Td>
                 </tr>
               )}
-            </>
+            </Fragment>
           );
         })}
       </DataTable>

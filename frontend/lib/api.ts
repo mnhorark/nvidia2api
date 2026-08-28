@@ -254,12 +254,13 @@ export interface AdminChatRoute {
 }
 
 export interface AdminChatMeta {
-  route_type: string;
-  key_name: string;
-  proxy_name: string;
-  duration_ms: number;
-  usage: Record<string, number>;
-  routes: AdminChatRoute[];
+  route_type?: string;
+  key_name?: string;
+  proxy_name?: string;
+  duration_ms?: number;
+  first_chunk_ms?: number;
+  usage?: Record<string, number>;
+  routes?: AdminChatRoute[];
 }
 
 export interface AdminChatResponse {

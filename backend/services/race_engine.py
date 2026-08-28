@@ -250,10 +250,11 @@ async def _stream_first_valid(route: Route, body: dict, base_url: str):
         )
         resp = await req_cm.__aenter__()
         if resp.status_code != 200:
-            _mark_failure(route, _classify_status(resp.status_code, {}), resp.status_code)
+            typ = _classify_status(resp.status_code, {})
+            _mark_failure(route, typ, resp.status_code)
             await req_cm.__aexit__(None, None, None)
             await cm.__aexit__(None, None, None)
-            return None
+            return None, route_info(route, "failed", error=typ, http_status=resp.status_code)
         first_line: str | None = None
         ait = resp.aiter_lines()
         async for line in ait:
@@ -267,14 +268,14 @@ async def _stream_first_valid(route: Route, body: dict, base_url: str):
                 _mark_failure(route, "invalid_response", 200)
                 await req_cm.__aexit__(None, None, None)
                 await cm.__aexit__(None, None, None)
-                return None
+                return None, route_info(route, "failed", error="invalid_response", http_status=200)
         if first_line is None:
             _mark_failure(route, "empty_stream", 200)
             await req_cm.__aexit__(None, None, None)
             await cm.__aexit__(None, None, None)
-            return None
+            return None, route_info(route, "failed", error="empty_stream", http_status=200)
         _mark_success(route)
-        return (cm, req_cm, resp, ait, first_line)
+        return (cm, req_cm, resp, ait, first_line), None
     except asyncio.CancelledError:
         await cm.__aexit__(None, None, None)
         raise
@@ -285,7 +286,7 @@ async def _stream_first_valid(route: Route, body: dict, base_url: str):
             await cm.__aexit__(None, None, None)
         except Exception:  # noqa: BLE001
             pass
-        return None
+        return None, route_info(route, "failed", error=typ)
 
 
 def race_chat(routes: list[Route], body: dict, base_url: str) -> RaceResult:
@@ -300,23 +301,25 @@ async def race_stream_winner(routes: list[Route], body: dict, base_url: str):
     tasks = {
         asyncio.ensure_future(_stream_first_valid(r, body, base_url)): r for r in routes
     }
-    failed = 0
+    failures: list[dict] = []
     try:
         pending = set(tasks.keys())
-        while pending and failed < len(routes):
+        while pending and len(failures) < len(routes):
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
-                res = t.result()
+                res, fail_info = t.result()
                 if res is not None:
                     for p in pending:
                         p.cancel()
                     await asyncio.gather(*pending, return_exceptions=True)
                     cm, req_cm, resp, ait, first_line = res
                     return tasks[t], cm, req_cm, resp, ait, first_line
-                failed += 1
+                if fail_info:
+                    failures.append(fail_info)
     finally:
         pass
-    raise AllRoutesFailed([f"{t}(stream)" for t in tasks])
+    raise AllRoutesFailed(
+        [f"{f['name']}:{f['error']}" for f in failures], report=failures)
 
 
 async def iter_sse(first_line: str, aiter, include_first: bool = True) -> AsyncIterator[str]:

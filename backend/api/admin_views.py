@@ -459,7 +459,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
     """Playground: run a real chat completion through the race engine."""
 
     ALLOWED = {"model", "messages", "temperature", "top_p", "max_tokens",
-               "frequency_penalty", "presence_penalty"}
+               "frequency_penalty", "presence_penalty", "stream"}
 
     def post(self, request):
         from services.load_balancer import build_routes
@@ -481,6 +481,9 @@ class AdminChatView(AdminRequiredMixin, APIView):
         body = {k: v for k, v in request.data.items() if k in self.ALLOWED and v is not None}
         body["model"] = model
         body["messages"] = messages
+
+        if request.data.get("stream"):
+            return self._stream(body, model)
 
         routes = build_routes()
         started = timezone.now().timestamp()
@@ -536,3 +539,100 @@ class AdminChatView(AdminRequiredMixin, APIView):
                 "routes": result.report or [],
             },
         })
+
+    def _stream(self, body, model):
+        """SSE: race streaming connections, first valid chunk wins, rest cancelled.
+
+        Emits a leading `data: {"meta": {...}}` event describing the winning route,
+        then relays upstream chunks verbatim, terminated by data: [DONE].
+        """
+        import asyncio
+        import json
+
+        from django.http import StreamingHttpResponse
+
+        from services import key_service
+        from services.load_balancer import build_routes
+        from services.race_engine import AllRoutesFailed, NoRouteAvailable, race_stream
+
+        routes = build_routes()
+        request_id = key_service.new_request_id()
+        log = RequestLog.objects.create(
+            request_id=request_id, model=model, routes_count=len(routes), is_stream=True
+        )
+        if not routes:
+            log.status, log.http_status, log.error_type = "error", 503, "no_available_route"
+            log.save()
+            return Response({"error": {"message": "当前没有可用线路",
+                                       "code": "no_available_route"}}, status=503)
+
+        def gen():
+            import time
+            t0 = time.monotonic()
+            loop = asyncio.new_event_loop()
+            winner = None
+            try:
+                winner = loop.run_until_complete(
+                    race_stream(routes, body, settings.NVIDIA_BASE_URL))
+
+                duration = round((time.monotonic() - t0) * 1000, 1)
+                log.status, log.http_status = "success", 200
+                log.duration_ms = duration
+                log.winner_route_type = winner.route.kind
+                log.winner_key_name = winner.route.key.name
+                log.winner_proxy_name = winner.route.proxy.name if winner.route.proxy else ""
+                log.proxy_public_ip = winner.route.proxy.public_ip if winner.route.proxy else ""
+                log.save()
+
+                yield "data: " + json.dumps({
+                    "meta": {
+                        "request_id": request_id,
+                        "route_type": winner.route.kind,
+                        "key_name": winner.route.key.name,
+                        "proxy_name": winner.route.proxy.name if winner.route.proxy else "",
+                        "first_chunk_ms": duration,
+                    }
+                }) + "\n\n"
+
+                stream = winner.lines()
+                while True:
+                    chunk = loop.run_until_complete(_next_line(stream))
+                    if chunk is None:
+                        break
+                    yield chunk
+            except (NoRouteAvailable, AllRoutesFailed) as exc:
+                log.status, log.http_status, log.error_type = "error", 502, "all_routes_failed"
+                if isinstance(exc, AllRoutesFailed):
+                    log.routes = exc.report
+                log.save()
+                yield "data: " + json.dumps({
+                    "error": {"message": f"所有线路均失败: {exc}", "type": "api_error",
+                              "param": None, "code": "upstream_error"}
+                }) + "\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as exc:  # noqa: BLE001
+                log.status, log.error_type = "error", "stream_error"
+                log.save()
+                yield "data: " + json.dumps({
+                    "error": {"message": f"stream error: {exc}", "type": "api_error",
+                              "param": None, "code": "stream_error"}
+                }) + "\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                try:
+                    if winner is not None:
+                        loop.run_until_complete(winner.close())
+                except Exception:  # noqa: BLE001
+                    pass
+                loop.close()
+
+        async def _next_line(ait):
+            try:
+                return await ait.__anext__()
+            except StopAsyncIteration:
+                return None
+
+        response = StreamingHttpResponse(gen(), content_type="text/event-stream")
+        response["Cache-Control"] = "no-cache"
+        response["X-Accel-Buffering"] = "no"
+        return response

@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Bot, Brain, ChevronDown, ChevronRight, CornerDownLeft, Loader2, Trash2, Zap } from "lucide-react";
-import { AdminChatResponse, api, asList, Model } from "@/lib/api";
+import { AdminChatResponse, API_BASE_URL, api, asList, getToken, Model } from "@/lib/api";
 import { Button, Card, PageHeader, Select } from "@/components/ui";
 import { toast } from "@/components/toaster";
 
@@ -61,19 +61,89 @@ export default function ChatPage() {
     }
     setInput("");
     const history: ChatMessage[] = [...messages, { role: "user", content: text }];
-    setMessages(history);
+    // Streamed assistant message placeholder — updated in place per SSE chunk
+    const assistant: ChatMessage = { role: "assistant", content: "", reasoning: "" };
+    setMessages([...history, assistant]);
     setSending(true);
-    try {
-      const res = await api.post<AdminChatResponse>("/api/admin/chat", {
-        model,
-        messages: history.map((m) => ({ role: m.role, content: m.content })),
+
+    let content = "";
+    let reasoning = "";
+    let meta: ChatMessage["meta"];
+    let failed = false;
+
+    const paint = () => {
+      const { reasoning: r, content: c } = splitReasoning(content, reasoning || undefined);
+      setMessages((prev) => {
+        const next = prev.slice();
+        next[next.length - 1] = { role: "assistant", content: c, reasoning: r, meta };
+        return next;
       });
-      const msg = res.payload?.choices?.[0]?.message;
-      const { reasoning, content } = splitReasoning(msg?.content ?? "", msg?.reasoning_content);
-      setMessages([...history, { role: "assistant", content: content || "(无内容)", reasoning, meta: res.meta }]);
+    };
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Token ${getToken() ?? ""}`,
+        },
+        body: JSON.stringify({
+          model,
+          stream: true,
+          messages: history.map((m) => ({ role: m.role, content: m.content })),
+        }),
+      });
+      if (!res.ok || !res.body) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err?.error?.message || `HTTP ${res.status}`);
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const events = buf.split("\n\n");
+        buf = events.pop() ?? "";
+        for (const evt of events) {
+          const line = evt.trim();
+          if (!line.startsWith("data:")) continue;
+          const raw = line.slice(5).trim();
+          if (raw === "[DONE]") continue;
+          let data: Record<string, unknown>;
+          try {
+            data = JSON.parse(raw);
+          } catch {
+            continue;
+          }
+          if (data.error) {
+            failed = true;
+            const e = data.error as { message?: string };
+            content = `⚠ ${e.message || "请求失败"}`;
+            paint();
+            toast.error(e.message || "请求失败");
+            continue;
+          }
+          if (data.meta) {
+            meta = data.meta as ChatMessage["meta"];
+            paint();
+            continue;
+          }
+          const delta = (data.choices as { delta?: Record<string, string> }[])?.[0]?.delta;
+          if (delta?.content) content += delta.content;
+          if (delta?.reasoning_content) reasoning += delta.reasoning_content;
+          if (delta) paint();
+        }
+      }
+      paint();
+      if (!content && !reasoning && !failed) {
+        setMessages(history); // nothing arrived
+        toast.error("未收到有效响应");
+      }
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "请求失败");
       setMessages(history);
+      toast.error(e instanceof Error ? e.message : "请求失败");
     } finally {
       setSending(false);
     }
@@ -123,20 +193,22 @@ export default function ChatPage() {
                   }
                 >
                   {m.reasoning && <ReasoningBlock text={m.reasoning} />}
-                  <p className="whitespace-pre-wrap leading-relaxed">{m.content}</p>
+                  {m.content
+                    ? <p className="whitespace-pre-wrap leading-relaxed">{m.content}</p>
+                    : <p className="text-gray-600">&nbsp;</p>}
                   {m.meta && (
                     <div className="mt-2 border-t border-white/10 pt-2 text-[11px] text-gray-500">
                       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                        <span>{m.meta.duration_ms}ms</span>
+                        <span>{m.meta.duration_ms ?? m.meta.first_chunk_ms ?? 0}ms</span>
                         <span>线路: {m.meta.route_type === "direct" ? "直连" : m.meta.proxy_name}</span>
                         <span>Key: {m.meta.key_name}</span>
                         <span>
                           tokens: {(m.meta.usage?.prompt_tokens ?? 0)} + {(m.meta.usage?.completion_tokens ?? 0)} = {(m.meta.usage?.total_tokens ?? 0)}
                         </span>
                       </div>
-                      {m.meta.routes?.length > 0 && (
+                      {(m.meta.routes?.length ?? 0) > 0 && (
                         <div className="mt-1.5 space-y-0.5">
-                          {m.meta.routes.map((r, i) => (
+                          {(m.meta.routes ?? []).map((r, i) => (
                             <div key={i} className="flex items-center gap-2">
                               <span
                                 className={

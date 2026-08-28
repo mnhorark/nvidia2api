@@ -98,9 +98,9 @@ class StreamRaceTests(TestCase):
             try:
                 await asyncio.sleep(delay)
                 if not ok:
-                    return None
+                    return None, {"name": route.name, "error": "boom"}
                 # cm, req_cm, resp, aiter, first_line
-                return (None, None, None, None, 'data: {"choices":[{"delta":{"content":"h"}}]}')
+                return (None, None, None, None, 'data: {"choices":[{"delta":{"content":"h"}}]}'), None
             except asyncio.CancelledError:
                 cancelled[idx] = True
                 raise
@@ -117,7 +117,7 @@ class StreamRaceTests(TestCase):
         from services import race_engine
 
         async def fake_stream(route, body, base_url):
-            return None
+            return None, {"name": route.name, "error": "boom"}
 
         with patch.object(race_engine, "_stream_first_valid", fake_stream):
             routes = [make_route("r0", 0)]
