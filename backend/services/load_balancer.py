@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from django.conf import settings
 
 from apps.core.models import NvidiaApiKey, Proxy
-from services import key_service, proxy_service
+from services import key_service, proxy_service, sysconfig
 
 logger = logging.getLogger("nvidia2api.balancer")
 
@@ -35,7 +35,8 @@ class Route:
 
 def build_routes(max_routes: int | None = None) -> list[Route]:
     """Pick keys + proxies, claim RPM slots, return routes (0..N)."""
-    max_routes = min(max_routes or settings.MAX_ROUTES_PER_REQUEST, settings.MAX_ROUTES_PER_REQUEST)
+    cfg_max = sysconfig.get("max_routes_per_request")
+    max_routes = min(max_routes or cfg_max, cfg_max)
     keys = key_service.available_keys()[:max_routes]
     proxies = proxy_service.schedulable_proxies()[: max(len(keys) - 1, 0)]
 

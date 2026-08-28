@@ -12,6 +12,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
+from services import sysconfig
 from apps.core.models import NvidiaApiKey, NvidiaApiKeyStatus
 
 logger = logging.getLogger("nvidia2api.keys")
@@ -66,7 +67,7 @@ def bulk_import_keys(text: str) -> dict:
             result["duplicate"] += 1
             continue
         try:
-            NvidiaApiKey.objects.create(name=name, api_key=key, rpm_limit=settings.DEFAULT_NVIDIA_RPM)
+            NvidiaApiKey.objects.create(name=name, api_key=key, rpm_limit=sysconfig.get("default_nvidia_rpm"))
             seen_in_batch.add(key)
             auto_idx += 1
             result["success"] += 1

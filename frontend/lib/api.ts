@@ -98,12 +98,12 @@ export const api = {
 export interface NvidiaKey {
   id: number;
   name: string;
-  key_preview: string;
+  api_key: string; // 已脱敏
   status: string;
   enabled?: boolean;
   rpm_limit: number;
-  current_minute_requests: number;
-  remaining_requests?: number;
+  minute_request_count: number;
+  remaining_rpm?: number;
   success_count: number;
   failure_count: number;
   last_used_at: string | null;
@@ -210,4 +210,37 @@ export interface DashboardStats {
 
 export interface SystemSetting {
   [key: string]: string | number | boolean;
+}
+
+export interface RuntimeParam {
+  key: string;
+  type: "int" | "float" | "bool" | "str";
+  value: number | string;
+  default: number | string;
+  description: string;
+}
+
+export interface TokenUsageDay {
+  date: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  requests: number;
+  success: number;
+}
+
+export interface AdminChatMeta {
+  route_type: string;
+  key_name: string;
+  proxy_name: string;
+  duration_ms: number;
+  usage: Record<string, number>;
+}
+
+export interface AdminChatResponse {
+  request_id: string;
+  payload: {
+    choices?: { message?: { role?: string; content?: string } }[];
+  };
+  meta: AdminChatMeta;
 }

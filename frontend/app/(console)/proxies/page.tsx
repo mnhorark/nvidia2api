@@ -19,6 +19,7 @@ import {
   Th,
   Toggle,
 } from "@/components/ui";
+import { toast } from "@/components/toaster";
 
 export default function ProxiesPage() {
   const [proxies, setProxies] = useState<Proxy[]>([]);
@@ -66,7 +67,7 @@ export default function ProxiesPage() {
       await api.patch(`/api/admin/proxies/${p.id}`, { enabled });
       await load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "操作失败");
+      toast.error(e instanceof Error ? e.message : "操作失败");
     } finally {
       setBusyId(null);
     }
@@ -78,7 +79,7 @@ export default function ProxiesPage() {
       await api.post(`/api/admin/proxies/${p.id}/test`, {});
       await load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "测速失败");
+      toast.error(e instanceof Error ? e.message : "测速失败");
     } finally {
       setBusyId(null);
     }
@@ -90,7 +91,7 @@ export default function ProxiesPage() {
       await api.post(`/api/admin/proxies/${p.id}/fetch-ip`, {});
       await load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "获取 IP 失败");
+      toast.error(e instanceof Error ? e.message : "获取 IP 失败");
     } finally {
       setBusyId(null);
     }
@@ -102,7 +103,7 @@ export default function ProxiesPage() {
       await api.post("/api/admin/proxies/test-all", {});
       await load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "测速失败");
+      toast.error(e instanceof Error ? e.message : "测速失败");
     } finally {
       setTestingAll(false);
     }
@@ -114,7 +115,7 @@ export default function ProxiesPage() {
       await api.del(`/api/admin/proxies/${p.id}`);
       load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "删除失败");
+      toast.error(e instanceof Error ? e.message : "删除失败");
     }
   }
 
@@ -123,14 +124,12 @@ export default function ProxiesPage() {
       const res = await api.post<Record<string, number>>("/api/admin/proxies/import", {
         text: importText,
       });
-      alert(
-        `导入完成\n成功: ${res.success ?? 0}\n重复: ${res.duplicate ?? 0}\n无效: ${res.invalid ?? 0}`
-      );
+      toast.success(`导入完成：成功 ${res.success ?? 0}，重复 ${res.duplicate ?? 0}，无效 ${res.invalid ?? 0}`);
       setImportOpen(false);
       setImportText("");
       load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "导入失败");
+      toast.error(e instanceof Error ? e.message : "导入失败");
     }
   }
 
@@ -150,7 +149,7 @@ export default function ProxiesPage() {
       setEditItem(null);
       load();
     } catch (err) {
-      alert(err instanceof Error ? err.message : "保存失败");
+      toast.error(err instanceof Error ? err.message : "保存失败");
     }
   }
 

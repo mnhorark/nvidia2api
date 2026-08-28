@@ -16,6 +16,7 @@ import {
   Th,
   Toggle,
 } from "@/components/ui";
+import { toast } from "@/components/toaster";
 
 export default function ApiKeysPage() {
   const [keys, setKeys] = useState<UserApiKey[]>([]);
@@ -50,7 +51,7 @@ export default function ApiKeysPage() {
       if (res.key) setCreatedKey(res.key);
       load();
     } catch (err) {
-      alert(err instanceof Error ? err.message : "创建失败");
+      toast.error(err instanceof Error ? err.message : "创建失败");
     }
   }
 
@@ -60,7 +61,7 @@ export default function ApiKeysPage() {
       await api.patch(`/api/admin/api-keys/${k.id}`, { enabled });
       await load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "操作失败");
+      toast.error(e instanceof Error ? e.message : "操作失败");
     } finally {
       setBusyId(null);
     }
@@ -72,7 +73,7 @@ export default function ApiKeysPage() {
       await api.del(`/api/admin/api-keys/${k.id}`);
       load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "删除失败");
+      toast.error(e instanceof Error ? e.message : "删除失败");
     }
   }
 
@@ -83,7 +84,7 @@ export default function ApiKeysPage() {
         subtitle="通过 Bearer Token 访问 OpenAI 兼容接口"
         actions={
           <>
-            <Button variant="primary" onClick={() => setCreate({ name: "", rate_limit: 60 })}>
+            <Button variant="primary" onClick={() => setCreate({ name: "", rate_limit: 0 })}>
               <Plus size={14} /> 创建 API Key
             </Button>
             <Button onClick={load} loading={loading}>
@@ -121,7 +122,7 @@ export default function ApiKeysPage() {
             <Td>
               <Badge status={k.enabled ? "enabled" : "disabled"} />
             </Td>
-            <Td className="text-gray-400">{k.rate_limit}</Td>
+            <Td className="text-gray-400">{k.rate_limit > 0 ? `${k.rate_limit}/分钟` : "不限"}</Td>
             <Td>{k.total_requests}</Td>
             <Td>
               <span className="text-accent">{k.success_requests}</span>
@@ -157,11 +158,11 @@ export default function ApiKeysPage() {
               required
             />
           </Field>
-          <Field label="每分钟限流">
+          <Field label="每分钟限流（0 表示不限）">
             <Input
               type="number"
-              min={1}
-              value={create?.rate_limit ?? 60}
+              min={0}
+              value={create?.rate_limit ?? 0}
               onChange={(e) =>
                 setCreate((p) => p && { ...p, rate_limit: Number(e.target.value) })
               }

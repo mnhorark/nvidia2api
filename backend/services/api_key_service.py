@@ -18,7 +18,7 @@ def hash_key(raw: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def create_key(name: str, rate_limit: int = 120) -> tuple[UserApiKey, str]:
+def create_key(name: str, rate_limit: int = 0) -> tuple[UserApiKey, str]:
     raw = generate_key()
     rec = UserApiKey.objects.create(
         name=name, key_hash=hash_key(raw), key_prefix=raw[:22], rate_limit=rate_limit
@@ -43,13 +43,14 @@ def check_and_count(rec: UserApiKey) -> tuple[bool, str]:
         key = UserApiKey.objects.select_for_update().get(pk=rec.pk)
         if not key.enabled:
             return False, "disabled"
-        if key.minute_window_start is None or (
-            (now - key.minute_window_start).total_seconds() >= 60
-        ):
-            key.minute_window_start = now
-            key.minute_request_count = 0
-        if key.minute_request_count >= key.rate_limit:
-            return False, "rate_limited"
+        if key.rate_limit and key.rate_limit > 0:
+            if key.minute_window_start is None or (
+                (now - key.minute_window_start).total_seconds() >= 60
+            ):
+                key.minute_window_start = now
+                key.minute_request_count = 0
+            if key.minute_request_count >= key.rate_limit:
+                return False, "rate_limited"
         key.minute_request_count += 1
         key.total_requests += 1
         key.last_used_at = now

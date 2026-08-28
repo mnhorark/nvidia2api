@@ -11,7 +11,7 @@ import {
   Timer,
   TrendingUp,
 } from "lucide-react";
-import { api, DashboardStats } from "@/lib/api";
+import { api, DashboardStats, TokenUsageDay } from "@/lib/api";
 import { Badge, Button, Card, PageHeader } from "@/components/ui";
 
 function StatCard({
@@ -66,6 +66,7 @@ function StatusBreakdown({
 
 export default function DashboardPage() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
+  const [usage, setUsage] = useState<TokenUsageDay[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -73,7 +74,12 @@ export default function DashboardPage() {
     setLoading(true);
     setError("");
     try {
-      setStats(await api.get<DashboardStats>("/api/admin/dashboard"));
+      const [s, u] = await Promise.all([
+        api.get<DashboardStats>("/api/admin/dashboard"),
+        api.get<{ days: TokenUsageDay[] }>("/api/admin/dashboard/usage?days=7"),
+      ]);
+      setStats(s);
+      setUsage(u?.days ?? []);
     } catch (e) {
       setError(e instanceof Error ? e.message : "加载失败");
     } finally {
@@ -88,7 +94,7 @@ export default function DashboardPage() {
   return (
     <div>
       <PageHeader
-        title="Dashboard"
+        title="仪表盘"
         subtitle="平台运行状态总览"
         actions={
           <Button onClick={load} loading={loading}>
@@ -141,10 +147,58 @@ export default function DashboardPage() {
         />
       </div>
 
+      <TokenUsageChart days={usage} />
+
       <div className="mt-6 grid gap-4 md:grid-cols-2">
         <StatusBreakdown title="NVIDIA Key 状态" data={stats?.key_status} />
         <StatusBreakdown title="Proxy 状态" data={stats?.proxy_status} />
       </div>
     </div>
+  );
+}
+
+function fmtNum(n: number) {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+function TokenUsageChart({ days }: { days: TokenUsageDay[] }) {
+  const max = Math.max(1, ...days.map((d) => d.total_tokens || 0));
+  return (
+    <Card className="mt-6">
+      <h3 className="mb-4 text-sm font-medium text-gray-300">Token 使用情况（近 7 天）</h3>
+      {days.length === 0 ? (
+        <p className="text-sm text-gray-600">暂无数据</p>
+      ) : (
+        <div className="flex items-end gap-2" style={{ height: 132 }}>
+          {days.map((d) => {
+            const p = Math.min(100, ((d.prompt_tokens || 0) / max) * 100);
+            const c = Math.min(100, ((d.completion_tokens || 0) / max) * 100);
+            return (
+              <div key={d.date} className="group relative flex-1">
+                <div className="pointer-events-none absolute -top-9 left-1/2 z-10 hidden -translate-x-1/2 whitespace-nowrap rounded-md border border-white/10 bg-[#14141d] px-2 py-1 text-[11px] text-gray-300 shadow-xl group-hover:block">
+                  总计 {d.total_tokens.toLocaleString()} · 请求 {d.requests}
+                </div>
+                <div className="flex h-full flex-col justify-end overflow-hidden rounded-md">
+                  <div style={{ height: `${c}%` }} className="w-full bg-sky-400/80" />
+                  <div style={{ height: `${p}%` }} className="w-full bg-accent/80" />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      <div className="mt-2 flex justify-between text-[11px] text-gray-600">
+        {days.map((d) => (
+          <span key={d.date} className="flex-1 text-center">{d.date.slice(5)}</span>
+        ))}
+      </div>
+      <div className="mt-3 flex items-center gap-4 text-[11px] text-gray-500">
+        <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-sm bg-accent/80" /> 输入 tokens</span>
+        <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-sm bg-sky-400/80" /> 输出 tokens</span>
+        <span className="ml-auto">峰值 {fmtNum(max)}</span>
+      </div>
+    </Card>
   );
 }

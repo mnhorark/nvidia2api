@@ -88,10 +88,12 @@ def is_valid_stream_chunk(line: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def _client_kwargs(route: Route, stream: bool) -> dict:
-    read = settings.UPSTREAM_READ_TIMEOUT
+    from services import sysconfig
+    read = sysconfig.get("upstream_read_timeout")
     kwargs: dict[str, Any] = {
         "timeout": httpx.Timeout(
-            connect=settings.UPSTREAM_CONNECT_TIMEOUT, read=read, write=read, pool=read
+            connect=sysconfig.get("upstream_connect_timeout"),
+            read=read, write=read, pool=read,
         ),
     }
     if route.proxy is not None:

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import {
   Activity,
+  MessageSquareText,
   Boxes,
   FileClock,
   Globe2,
@@ -19,7 +20,8 @@ import { clearToken, getToken } from "@/lib/api";
 import { cx } from "@/components/ui";
 
 const NAV = [
-  { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { href: "/dashboard", label: "仪表盘", icon: LayoutDashboard },
+  { href: "/chat", label: "对话", icon: MessageSquareText },
   { href: "/nvidia-keys", label: "NVIDIA Keys", icon: KeyRound },
   { href: "/proxies", label: "代理池", icon: Globe2 },
   { href: "/proxy-groups", label: "代理分组", icon: Network },

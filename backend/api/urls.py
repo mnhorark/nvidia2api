@@ -10,6 +10,8 @@ urlpatterns = [
     # Admin
     path("api/admin/login", admin_views.LoginView.as_view()),
     path("api/admin/dashboard", admin_views.DashboardView.as_view()),
+    path("api/admin/dashboard/usage", admin_views.DashboardUsageView.as_view()),
+    path("api/admin/chat", admin_views.AdminChatView.as_view()),
     path("api/admin/settings", admin_views.SettingsView.as_view()),
 
     path("api/admin/nvidia-keys", admin_views.NvidiaKeyListView.as_view()),

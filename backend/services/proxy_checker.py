@@ -15,7 +15,8 @@ IP_INFO_URL = "https://ipinfo.io/json"
 
 
 async def check_proxy(proxy: Proxy, timeout: float | None = None) -> dict:
-    timeout = timeout or settings.PROXY_TIMEOUT
+    from services import sysconfig
+    timeout = timeout or sysconfig.get("proxy_timeout")
     start = time.monotonic()
     try:
         async with httpx.AsyncClient(proxy=proxy.url, timeout=timeout) as client:

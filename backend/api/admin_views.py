@@ -319,7 +319,7 @@ class UserApiKeyListView(AdminRequiredMixin, APIView):
         if not name:
             return Response({"error": {"message": "name required", "code": "bad_request"}}, status=400)
         rec, raw = api_key_service.create_key(
-            name, rate_limit=int(request.data.get("rate_limit") or 120)
+            name, rate_limit=int(request.data.get("rate_limit") or 0)
         )
         data = UserApiKeySerializer(rec).data
         data["key"] = raw  # full key shown once at creation only
@@ -406,14 +406,123 @@ class DashboardView(AdminRequiredMixin, APIView):
 
 class SettingsView(AdminRequiredMixin, APIView):
     def get(self, request):
-        return Response(SettingSerializer(SystemSetting.objects.order_by("key"), many=True).data)
+        from services import sysconfig
+        return Response(sysconfig.all_params())
 
     def patch(self, request):
-        key = request.data.get("key")
-        value = request.data.get("value")
-        if not key:
-            return Response({"detail": "key required"}, status=400)
-        rec, _ = SystemSetting.objects.get_or_create(key=key)
-        rec.value = "" if value is None else str(value)
-        rec.save()
-        return Response(SettingSerializer(rec).data)
+        from services import sysconfig
+        updates = request.data.get("settings")
+        if not isinstance(updates, dict):
+            key = request.data.get("key")
+            if not key:
+                return Response({"detail": "settings or key required"}, status=400)
+            updates = {key: request.data.get("value")}
+        sysconfig.set_params(updates)
+        return Response(sysconfig.all_params())
+
+
+class DashboardUsageView(AdminRequiredMixin, APIView):
+    """Per-day token usage + request counts for the dashboard chart."""
+
+    def get(self, request):
+        from collections import defaultdict
+        days = max(1, min(int(request.query_params.get("days", 7)), 30))
+        today = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        start = today - timedelta(days=days - 1)
+
+        buckets: dict = {}
+        cur = start
+        while cur <= today:
+            key = cur.strftime("%Y-%m-%d")
+            buckets[key] = {"date": key, "prompt_tokens": 0, "completion_tokens": 0,
+                            "total_tokens": 0, "requests": 0, "success": 0}
+            cur += timedelta(days=1)
+
+        logs = RequestLog.objects.filter(created_at__gte=start).values(
+            "created_at", "prompt_tokens", "completion_tokens", "total_tokens", "status"
+        )
+        for row in logs:
+            key = timezone.localtime(row["created_at"]).strftime("%Y-%m-%d")
+            b = buckets.get(key)
+            if not b:
+                continue
+            b["prompt_tokens"] += row["prompt_tokens"] or 0
+            b["completion_tokens"] += row["completion_tokens"] or 0
+            b["total_tokens"] += row["total_tokens"] or 0
+            b["requests"] += 1
+            if row["status"] == "success":
+                b["success"] += 1
+        return Response({"days": list(buckets.values())})
+
+
+class AdminChatView(AdminRequiredMixin, APIView):
+    """Playground: run a real chat completion through the race engine."""
+
+    ALLOWED = {"model", "messages", "temperature", "top_p", "max_tokens",
+               "frequency_penalty", "presence_penalty"}
+
+    def post(self, request):
+        from services.load_balancer import build_routes
+        from services.race_engine import AllRoutesFailed, NoRouteAvailable, race_chat
+        from services import key_service
+
+        model = (request.data.get("model") or "").strip()
+        prompt = request.data.get("prompt")
+        messages = request.data.get("messages")
+        if prompt and not messages:
+            messages = [{"role": "user", "content": str(prompt)}]
+        if not model or not messages:
+            return Response({"error": {"message": "model and prompt/messages required",
+                                       "code": "bad_request"}}, status=400)
+        if not AIModel.objects.filter(model_name=model, enabled=True).exists():
+            return Response({"error": {"message": f"模型 {model} 不存在或未启用",
+                                       "code": "model_not_found"}}, status=404)
+
+        body = {k: v for k, v in request.data.items() if k in self.ALLOWED and v is not None}
+        body["model"] = model
+        body["messages"] = messages
+
+        routes = build_routes()
+        started = timezone.now().timestamp()
+        request_id = key_service.new_request_id()
+        log = RequestLog.objects.create(request_id=request_id, model=model,
+                                        routes_count=len(routes))
+        if not routes:
+            log.status, log.http_status, log.error_type = "error", 503, "no_available_route"
+            log.save()
+            return Response({"error": {"message": "当前没有可用线路（没有可用的 NVIDIA Key）",
+                                       "code": "no_available_route"}}, status=503)
+        import time
+        t0 = time.monotonic()
+        try:
+            result = race_chat(routes, body, settings.NVIDIA_BASE_URL)
+        except (NoRouteAvailable, AllRoutesFailed) as exc:
+            log.status, log.error_type = "error", "all_routes_failed"
+            log.http_status = 502
+            log.save()
+            return Response({"error": {"message": f"所有线路均失败: {exc}",
+                                       "code": "upstream_error"}}, status=502)
+        duration = round((time.monotonic() - t0) * 1000, 1)
+        r = result.route
+        usage = (result.payload or {}).get("usage") or {}
+        log.status, log.http_status = "success", 200
+        log.duration_ms = duration
+        log.winner_route_type = r.kind
+        log.winner_key_name = r.key.name
+        log.winner_proxy_name = r.proxy.name if r.proxy else ""
+        log.proxy_public_ip = r.proxy.public_ip if r.proxy else ""
+        log.prompt_tokens = usage.get("prompt_tokens", 0) or 0
+        log.completion_tokens = usage.get("completion_tokens", 0) or 0
+        log.total_tokens = usage.get("total_tokens", 0) or 0
+        log.save()
+        return Response({
+            "request_id": request_id,
+            "payload": result.payload,
+            "meta": {
+                "route_type": r.kind,
+                "key_name": r.key.name,
+                "proxy_name": r.proxy.name if r.proxy else "",
+                "duration_ms": duration,
+                "usage": usage,
+            },
+        })

@@ -17,6 +17,7 @@ import {
   Textarea,
   Th,
 } from "@/components/ui";
+import { toast } from "@/components/toaster";
 
 interface ImportResult {
   success?: number;
@@ -61,7 +62,7 @@ export default function NvidiaKeysPage() {
       setImportResult(res);
       load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "导入失败");
+      toast.error(e instanceof Error ? e.message : "导入失败");
     }
   }
 
@@ -69,8 +70,8 @@ export default function NvidiaKeysPage() {
     e.preventDefault();
     if (!editItem) return;
     const body: Record<string, unknown> = { name: editItem.name };
-    if (editItem.key_preview && editItem.key_preview.includes("nvapi")) {
-      body.api_key = editItem.key_preview;
+    if (editItem.api_key && editItem.api_key.includes("nvapi")) {
+      body.api_key = editItem.api_key;
     }
     if (editItem.rpm_limit) body.rpm_limit = editItem.rpm_limit;
     try {
@@ -82,7 +83,7 @@ export default function NvidiaKeysPage() {
       setEditItem(null);
       load();
     } catch (err) {
-      alert(err instanceof Error ? err.message : "保存失败");
+      toast.error(err instanceof Error ? err.message : "保存失败");
     }
   }
 
@@ -94,7 +95,7 @@ export default function NvidiaKeysPage() {
       });
       await load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "操作失败");
+      toast.error(e instanceof Error ? e.message : "操作失败");
     } finally {
       setBusyId(null);
     }
@@ -106,7 +107,7 @@ export default function NvidiaKeysPage() {
       await api.del(`/api/admin/nvidia-keys/${k.id}`);
       load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "删除失败");
+      toast.error(e instanceof Error ? e.message : "删除失败");
     }
   }
 
@@ -114,10 +115,10 @@ export default function NvidiaKeysPage() {
     setBusyId(k.id);
     try {
       await api.post(`/api/admin/nvidia-keys/${k.id}/test`, {});
-      alert(`${k.name} 测试完成`);
+      toast.success(`${k.name} 测试完成`);
       load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "测试失败");
+      toast.error(e instanceof Error ? e.message : "测试失败");
     } finally {
       setBusyId(null);
     }
@@ -168,13 +169,13 @@ export default function NvidiaKeysPage() {
             <tr key={k.id} className="hover:bg-white/[0.02]">
               <Td className="font-medium text-gray-200">{k.name}</Td>
               <Td>
-                <code className="font-mono text-xs text-gray-500">{k.key_preview}</code>
+                <code className="font-mono text-xs text-gray-500">{k.api_key}</code>
               </Td>
               <Td>
                 <Badge status={k.status} />
               </Td>
               <Td className="text-gray-400">{k.rpm_limit ?? 40}/分钟</Td>
-              <Td>{k.current_minute_requests ?? 0}</Td>
+              <Td>{k.minute_request_count ?? 0}</Td>
               <Td>{safePct(k.success_count, k.success_count + k.failure_count)}</Td>
               <Td className="text-gray-500">
                 <span className="text-accent">{k.success_count}</span>
@@ -293,7 +294,7 @@ export default function NvidiaKeysPage() {
             <Field label="API Key">
               <Input
                 placeholder="nvapi-..."
-                onChange={(e) => setEditItem((p) => ({ ...p, key_preview: e.target.value }))}
+                onChange={(e) => setEditItem((p) => ({ ...p, api_key: e.target.value }))}
                 required
               />
             </Field>

@@ -1,5 +1,3 @@
-c'd
-
 # nvidia2api
 
 针对 NVIDIA AI API 的 API 聚合、代理加速、Key 池管理、代理池管理与 OpenAI 兼容中转平台。

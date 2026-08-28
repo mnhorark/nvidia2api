@@ -15,6 +15,7 @@ import {
   Td,
   Th,
 } from "@/components/ui";
+import { toast } from "@/components/toaster";
 
 export default function ProxyGroupsPage() {
   const [groups, setGroups] = useState<ProxyGroup[]>([]);
@@ -52,7 +53,7 @@ export default function ProxyGroupsPage() {
       setEdit(null);
       load();
     } catch (err) {
-      alert(err instanceof Error ? err.message : "保存失败");
+      toast.error(err instanceof Error ? err.message : "保存失败");
     }
   }
 
@@ -62,7 +63,7 @@ export default function ProxyGroupsPage() {
       await api.del(`/api/admin/proxy-groups/${g.id}`);
       load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "删除失败");
+      toast.error(e instanceof Error ? e.message : "删除失败");
     }
   }
 

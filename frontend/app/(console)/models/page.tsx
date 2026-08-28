@@ -16,6 +16,7 @@ import {
   Th,
   Toggle,
 } from "@/components/ui";
+import { toast } from "@/components/toaster";
 
 export default function ModelsPage() {
   const [models, setModels] = useState<Model[]>([]);
@@ -55,7 +56,7 @@ export default function ModelsPage() {
       await api.post("/api/admin/models/sync", {});
       await load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "同步失败");
+      toast.error(e instanceof Error ? e.message : "同步失败");
     } finally {
       setSyncing(false);
     }
@@ -67,7 +68,7 @@ export default function ModelsPage() {
       await api.patch(`/api/admin/models/${m.id}`, { enabled });
       await load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "操作失败");
+      toast.error(e instanceof Error ? e.message : "操作失败");
     } finally {
       setBusyId(null);
     }
@@ -79,7 +80,7 @@ export default function ModelsPage() {
       await api.del(`/api/admin/models/${m.id}`);
       load();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "删除失败");
+      toast.error(e instanceof Error ? e.message : "删除失败");
     }
   }
 
@@ -97,7 +98,7 @@ export default function ModelsPage() {
       setEdit(null);
       load();
     } catch (err) {
-      alert(err instanceof Error ? err.message : "保存失败");
+      toast.error(err instanceof Error ? err.message : "保存失败");
     }
   }
 

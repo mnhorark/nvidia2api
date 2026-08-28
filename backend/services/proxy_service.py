@@ -118,9 +118,9 @@ def report_proxy_result(proxy_id: int, success: bool, latency_ms: float | None =
         else:
             p.failure_count += 1
             p.consecutive_failures += 1
-            if p.consecutive_failures >= 3:
+            if p.consecutive_failures >= __import__("services.sysconfig", fromlist=["get"]).get("proxy_unhealthy_threshold"):
                 p.status = ProxyStatus.UNHEALTHY
-                p.cooldown_until = now + timedelta(seconds=60)
+                p.cooldown_until = now + timedelta(seconds=__import__("services.sysconfig", fromlist=["get"]).get("proxy_failure_cooldown_seconds"))
             elif p.consecutive_failures >= 1:
                 p.status = ProxyStatus.DEGRADED
             p.save(update_fields=[

@@ -130,7 +130,7 @@ class UserApiKey(Timestamped):
     key_hash = models.CharField(max_length=64, unique=True, db_index=True)
     key_prefix = models.CharField(max_length=32)
     enabled = models.BooleanField(default=True)
-    rate_limit = models.IntegerField(default=120, help_text="requests per minute")
+    rate_limit = models.IntegerField(default=0, help_text="requests per minute, 0 = unlimited")
     total_requests = models.IntegerField(default=0)
     success_requests = models.IntegerField(default=0)
     failed_requests = models.IntegerField(default=0)
