@@ -1,0 +1,419 @@
+from __future__ import annotations
+
+from datetime import timedelta
+
+from django.conf import settings
+from django.db.models import Count, Q
+from django.utils import timezone
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from apps.core.models import (
+    AIModel, NvidiaApiKey, NvidiaApiKeyStatus, Proxy, ProxyGroup, ProxyStatus,
+    RequestLog, SystemSetting, UserApiKey,
+)
+from services import api_key_service, key_service, nvidia_service, proxy_service
+from services.proxy_checker import check_all, check_proxy
+
+from .auth import AdminRequiredMixin
+from .serializers import (
+    ModelSerializer, NvidiaKeySerializer, ProxyGroupSerializer, ProxySerializer,
+    ProxyWriteSerializer, RequestLogSerializer, SettingSerializer, UserApiKeySerializer,
+)
+
+
+class LoginView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        u = request.data.get("username", "")
+        p = request.data.get("password", "")
+        if u == settings.ADMIN_USERNAME and p == settings.ADMIN_PASSWORD:
+            return Response({"token": settings.ADMIN_TOKEN})
+        return Response({"detail": "Invalid credentials"}, status=401)
+
+
+# ---------------------------------------------------------------- nvidia keys
+
+class NvidiaKeyListView(AdminRequiredMixin, APIView):
+    def get(self, request):
+        qs = NvidiaApiKey.objects.order_by("id")
+        return Response(NvidiaKeySerializer(qs, many=True).data)
+
+    def post(self, request):
+        name = (request.data.get("name") or "").strip()
+        key = (request.data.get("api_key") or "").strip()
+        rpm = int(request.data.get("rpm_limit") or settings.DEFAULT_NVIDIA_RPM)
+        if not key:
+            return Response({"error": {"message": "api_key required", "code": "bad_request"}}, status=400)
+        if NvidiaApiKey.objects.filter(api_key=key).exists():
+            return Response({"error": {"message": "duplicate key", "code": "duplicate"}}, status=400)
+        if not name:
+            name = f"NVIDIA Key {NvidiaApiKey.objects.count() + 1:03d}"
+        rec = NvidiaApiKey.objects.create(name=name, api_key=key, rpm_limit=rpm)
+        return Response(NvidiaKeySerializer(rec).data, status=201)
+
+
+class NvidiaKeyImportView(AdminRequiredMixin, APIView):
+    def post(self, request):
+        text = request.data.get("text", "")
+        if not text.strip():
+            return Response({"error": {"message": "text required", "code": "bad_request"}}, status=400)
+        return Response(key_service.bulk_import_keys(text))
+
+
+class NvidiaKeyDetailView(AdminRequiredMixin, APIView):
+    def _get(self, pk):
+        try:
+            return NvidiaApiKey.objects.get(pk=pk)
+        except NvidiaApiKey.DoesNotExist:
+            return None
+
+    def get(self, request, pk):
+        rec = self._get(pk)
+        if not rec:
+            return Response({"detail": "not found"}, status=404)
+        data = NvidiaKeySerializer(rec).data
+        if request.query_params.get("reveal") == "1":
+            data["api_key"] = rec.api_key
+        return Response(data)
+
+    def patch(self, request, pk):
+        rec = self._get(pk)
+        if not rec:
+            return Response({"detail": "not found"}, status=404)
+        name = request.data.get("name")
+        if name:
+            rec.name = name.strip()
+        if "rpm_limit" in request.data:
+            rec.rpm_limit = int(request.data["rpm_limit"])
+        action = request.data.get("action")
+        enabled = request.data.get("enabled")
+        if enabled is False or action == "disable":
+            rec.status = NvidiaApiKeyStatus.DISABLED
+        elif enabled is True or action == "enable":
+            rec.status = NvidiaApiKeyStatus.AVAILABLE
+            rec.cooldown_until = None
+        rec.save()
+        return Response(NvidiaKeySerializer(rec).data)
+
+    def delete(self, request, pk):
+        rec = self._get(pk)
+        if not rec:
+            return Response({"detail": "not found"}, status=404)
+        rec.delete()
+        return Response(status=204)
+
+
+class NvidiaKeyTestView(AdminRequiredMixin, APIView):
+    def post(self, request, pk):
+        try:
+            rec = NvidiaApiKey.objects.get(pk=pk)
+        except NvidiaApiKey.DoesNotExist:
+            return Response({"detail": "not found"}, status=404)
+        return Response(key_service.test_key(rec))
+
+
+# ---------------------------------------------------------------- proxies
+
+class ProxyGroupListView(AdminRequiredMixin, APIView):
+    def get(self, request):
+        qs = ProxyGroup.objects.annotate(proxy_count=Count("proxies")).order_by("id")
+        return Response(ProxyGroupSerializer(qs, many=True).data)
+
+    def post(self, request):
+        name = (request.data.get("name") or "").strip()
+        if not name:
+            return Response({"error": {"message": "name required", "code": "bad_request"}}, status=400)
+        if ProxyGroup.objects.filter(name=name).exists():
+            return Response({"error": {"message": "duplicate group", "code": "duplicate"}}, status=400)
+        g = ProxyGroup.objects.create(
+            name=name,
+            description=request.data.get("description", ""),
+            country=request.data.get("country", ""),
+            enabled=request.data.get("enabled", True),
+        )
+        data = ProxyGroupSerializer(g).data
+        data["proxy_count"] = 0
+        return Response(data, status=201)
+
+
+class ProxyGroupDetailView(AdminRequiredMixin, APIView):
+    def _get(self, pk):
+        try:
+            return ProxyGroup.objects.get(pk=pk)
+        except ProxyGroup.DoesNotExist:
+            return None
+
+    def patch(self, request, pk):
+        g = self._get(pk)
+        if not g:
+            return Response({"detail": "not found"}, status=404)
+        for f in ("name", "description", "country", "enabled"):
+            if f in request.data:
+                setattr(g, f, request.data[f])
+        g.save()
+        data = ProxyGroupSerializer(g).data
+        data["proxy_count"] = Proxy.objects.filter(group=g).count()
+        return Response(data)
+
+    def delete(self, request, pk):
+        g = self._get(pk)
+        if not g:
+            return Response({"detail": "not found"}, status=404)
+        Proxy.objects.filter(group=g).update(group=None)
+        g.delete()
+        return Response(status=204)
+
+
+class ProxyListView(AdminRequiredMixin, APIView):
+    def get(self, request):
+        qs = Proxy.objects.select_related("group").order_by("id")
+        n_keys = NvidiaApiKey.objects.exclude(status=NvidiaApiKeyStatus.DISABLED).count()
+        max_allowed = max(n_keys - 1, 0)
+        enabled = qs.filter(enabled=True).count()
+        return Response({
+            "results": ProxySerializer(qs, many=True).data,
+            "summary": {
+                "nvidia_keys": n_keys,
+                "max_enabled_proxies": max_allowed,
+                "enabled_proxies": enabled,
+                "direct_routes": 1 if n_keys else 0,
+                "total_routes": enabled + (1 if n_keys else 0),
+            },
+        })
+
+    def post(self, request):
+        ser = ProxyWriteSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        if not request.data.get("name"):
+            ser.validated_data["name"] = f"代理 {Proxy.objects.count() + 1:03d}"
+        p = Proxy.objects.create(**ser.validated_data)
+        return Response(ProxySerializer(p).data, status=201)
+
+
+class ProxyImportView(AdminRequiredMixin, APIView):
+    def post(self, request):
+        text = request.data.get("text", "")
+        if not text.strip():
+            return Response({"error": {"message": "text required", "code": "bad_request"}}, status=400)
+        return Response(proxy_service.bulk_import_proxies(text))
+
+
+class ProxyDetailView(AdminRequiredMixin, APIView):
+    def _get(self, pk):
+        try:
+            return Proxy.objects.select_related("group").get(pk=pk)
+        except Proxy.DoesNotExist:
+            return None
+
+    def patch(self, request, pk):
+        p = self._get(pk)
+        if not p:
+            return Response({"detail": "not found"}, status=404)
+        if "enabled" in request.data:
+            ok, msg = proxy_service.set_enabled(p, bool(request.data["enabled"]))
+            if not ok:
+                return Response(
+                    {"error": {"message": msg, "code": "proxy_limit_exceeded"}}, status=400
+                )
+        for f in ("name", "protocol", "host", "port", "username", "password", "group"):
+            if f in request.data:
+                setattr(p, f, request.data[f])
+        p.save()
+        return Response(ProxySerializer(p).data)
+
+    def delete(self, request, pk):
+        p = self._get(pk)
+        if not p:
+            return Response({"detail": "not found"}, status=404)
+        p.delete()
+        return Response(status=204)
+
+
+class ProxyTestView(AdminRequiredMixin, APIView):
+    def post(self, request, pk):
+        try:
+            p = Proxy.objects.get(pk=pk)
+        except Proxy.DoesNotExist:
+            return Response({"detail": "not found"}, status=404)
+        return Response(proxy_service.run_async(check_proxy(p)))
+
+
+class ProxyFetchIpView(ProxyTestView):
+    pass  # check_proxy already performs IP + geo lookup
+
+
+class ProxyTestAllView(AdminRequiredMixin, APIView):
+    def post(self, request):
+        return Response(proxy_service.run_async(check_all()))
+
+
+# ---------------------------------------------------------------- models
+
+class ModelListView(AdminRequiredMixin, APIView):
+    def get(self, request):
+        qs = AIModel.objects.order_by("model_name")
+        q = request.query_params.get("q")
+        if q:
+            qs = qs.filter(model_name__icontains=q)
+        return Response(ModelSerializer(qs, many=True).data)
+
+    def post(self, request):
+        name = (request.data.get("model_name") or "").strip()
+        if not name:
+            return Response({"error": {"message": "model_name required", "code": "bad_request"}}, status=400)
+        rec, created = AIModel.objects.get_or_create(model_name=name, defaults={
+            "display_name": request.data.get("display_name", ""),
+            "description": request.data.get("description", ""),
+            "enabled": request.data.get("enabled", False),
+        })
+        return Response(ModelSerializer(rec).data, status=201 if created else 200)
+
+
+class ModelSyncView(AdminRequiredMixin, APIView):
+    def post(self, request):
+        try:
+            return Response(nvidia_service.sync_models())
+        except ValueError as exc:
+            msg = str(exc)
+            code = "no_available_key" if msg == "no_available_nvidia_key" else "upstream_error"
+            status = 503 if code == "no_available_key" else 502
+            return Response({"error": {"message": msg, "code": code}}, status=status)
+
+
+class ModelDetailView(AdminRequiredMixin, APIView):
+    def _get(self, pk):
+        try:
+            return AIModel.objects.get(pk=pk)
+        except AIModel.DoesNotExist:
+            return None
+
+    def patch(self, request, pk):
+        rec = self._get(pk)
+        if not rec:
+            return Response({"detail": "not found"}, status=404)
+        for f in ("display_name", "description", "enabled", "status"):
+            if f in request.data:
+                setattr(rec, f, request.data[f])
+        rec.save()
+        return Response(ModelSerializer(rec).data)
+
+    def delete(self, request, pk):
+        rec = self._get(pk)
+        if not rec:
+            return Response({"detail": "not found"}, status=404)
+        rec.delete()
+        return Response(status=204)
+
+
+# ---------------------------------------------------------------- user api keys
+
+class UserApiKeyListView(AdminRequiredMixin, APIView):
+    def get(self, request):
+        return Response(UserApiKeySerializer(UserApiKey.objects.order_by("-id"), many=True).data)
+
+    def post(self, request):
+        name = (request.data.get("name") or "").strip()
+        if not name:
+            return Response({"error": {"message": "name required", "code": "bad_request"}}, status=400)
+        rec, raw = api_key_service.create_key(
+            name, rate_limit=int(request.data.get("rate_limit") or 120)
+        )
+        data = UserApiKeySerializer(rec).data
+        data["key"] = raw  # full key shown once at creation only
+        return Response(data, status=201)
+
+
+class UserApiKeyDetailView(AdminRequiredMixin, APIView):
+    def _get(self, pk):
+        try:
+            return UserApiKey.objects.get(pk=pk)
+        except UserApiKey.DoesNotExist:
+            return None
+
+    def patch(self, request, pk):
+        rec = self._get(pk)
+        if not rec:
+            return Response({"detail": "not found"}, status=404)
+        if "enabled" in request.data:
+            rec.enabled = bool(request.data["enabled"])
+        if "rate_limit" in request.data:
+            rec.rate_limit = int(request.data["rate_limit"])
+        if "name" in request.data:
+            rec.name = request.data["name"]
+        rec.save()
+        return Response(UserApiKeySerializer(rec).data)
+
+    def delete(self, request, pk):
+        rec = self._get(pk)
+        if not rec:
+            return Response({"detail": "not found"}, status=404)
+        rec.delete()
+        return Response(status=204)
+
+
+# ---------------------------------------------------------------- logs / dashboard / settings
+
+class LogListView(AdminRequiredMixin, APIView):
+    def get(self, request):
+        qs = RequestLog.objects.order_by("-id")
+        model = request.query_params.get("model")
+        status = request.query_params.get("status")
+        if model:
+            qs = qs.filter(model=model)
+        if status:
+            qs = qs.filter(status=status)
+        qs = qs[:200]
+        return Response({"results": RequestLogSerializer(qs, many=True).data})
+
+
+class DashboardView(AdminRequiredMixin, APIView):
+    def get(self, request):
+        today = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        keys = NvidiaApiKey.objects.all()
+        proxies = Proxy.objects.all()
+        logs_today = RequestLog.objects.filter(created_at__gte=today)
+
+        key_status = {s: keys.filter(status=s).count() for s, _ in NvidiaApiKeyStatus.choices}
+        proxy_status = {s: proxies.filter(status=s).count() for s, _ in ProxyStatus.choices}
+        today_count = logs_today.count()
+        success_count = logs_today.filter(status="success").count()
+        success_durations = logs_today.filter(duration_ms__gt=0)
+        avg = 0.0
+        if success_durations.exists():
+            avg = round(sum(l.duration_ms for l in success_durations) / success_durations.count() / 1000, 2)
+
+        n_active_keys = keys.exclude(status=NvidiaApiKeyStatus.DISABLED).count()
+        enabled_proxies = proxies.filter(enabled=True).count()
+        return Response({
+            "nvidia_keys": keys.count(),
+            "enabled_keys": keys.exclude(
+                status__in=[NvidiaApiKeyStatus.DISABLED, NvidiaApiKeyStatus.INVALID]).count(),
+            "proxies": proxies.count(),
+            "enabled_proxies": enabled_proxies,
+            "max_enabled_proxies": max(n_active_keys - 1, 0),
+            "models": AIModel.objects.count(),
+            "enabled_models": AIModel.objects.filter(enabled=True).count(),
+            "requests_today": today_count,
+            "success_rate": round(success_count / today_count * 100, 1) if today_count else 0.0,
+            "avg_latency_s": avg,
+            "key_status": key_status,
+            "proxy_status": proxy_status,
+        })
+
+
+class SettingsView(AdminRequiredMixin, APIView):
+    def get(self, request):
+        return Response(SettingSerializer(SystemSetting.objects.order_by("key"), many=True).data)
+
+    def patch(self, request):
+        key = request.data.get("key")
+        value = request.data.get("value")
+        if not key:
+            return Response({"detail": "key required"}, status=400)
+        rec, _ = SystemSetting.objects.get_or_create(key=key)
+        rec.value = "" if value is None else str(value)
+        rec.save()
+        return Response(SettingSerializer(rec).data)
