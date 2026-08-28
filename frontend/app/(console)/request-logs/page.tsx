@@ -86,7 +86,8 @@ export default function RequestLogsPage() {
             <Th>Request ID</Th>
             <Th>时间</Th>
             <Th>模型</Th>
-            <Th>耗时</Th>
+            <Th>总耗时</Th>
+            <Th>首字</Th>
             <Th>胜出线路 (Winner)</Th>
             <Th>Stream</Th>
             <Th>状态</Th>
@@ -111,6 +112,7 @@ export default function RequestLogsPage() {
                   {l.model}
                 </Td>
                 <Td>{fmtLatency(l.duration_ms)}</Td>
+            <Td>{l.first_token_ms != null ? fmtLatency(l.first_token_ms) : "—"}</Td>
                 <Td className="text-xs text-gray-400">
                   <span className="font-mono">{l.winner_proxy_name || l.winner_key_name ? `${l.winner_proxy_name || "直连"} + ${l.winner_key_name}` : "—"}</span>
                 </Td>
@@ -126,6 +128,17 @@ export default function RequestLogsPage() {
                 <tr className="bg-white/[0.02]">
                   <Td colSpan={9} className="!py-3">
                     <div className="space-y-1.5">
+                      <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-400">
+                        <span className="font-medium text-gray-300">请求明细</span>
+                        <span>耗时 {l.duration_ms ?? 0}ms</span>
+                        <span>首字 {l.first_token_ms ?? "—"}ms</span>
+                        <span>输入 {l.prompt_tokens ?? 0}</span>
+                        <span>输出 {l.completion_tokens ?? 0}</span>
+                        <span>缓存 {l.cached_tokens ?? 0}</span>
+                        <span>合计 {l.total_tokens ?? 0}</span>
+                        {l.proxy_public_ip && <span>代理出口 IP {l.proxy_public_ip}</span>}
+                        {l.error_type && <span className="text-red-400">错误 {l.error_type}</span>}
+                      </div>
                       <div className="mb-2 text-xs font-medium text-gray-400">线路竞速明细</div>
                       {(l.routes ?? []).length === 0 ? (
                         <p className="text-xs text-gray-600">该请求未记录线路明细（早期日志）</p>

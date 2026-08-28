@@ -194,11 +194,13 @@ export interface RequestLog {
   winner_key_name?: string;
   winner_proxy_name?: string;
   winner_route_type?: string;
-  proxy_ip?: string;
+  proxy_public_ip?: string;
   error_type?: string;
-  input_tokens?: number;
-  output_tokens?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
   total_tokens?: number;
+  cached_tokens?: number;
+  first_token_ms?: number;
   created_at: string;
 }
 
