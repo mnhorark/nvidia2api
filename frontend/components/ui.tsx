@@ -4,6 +4,24 @@ import React from "react";
 import { Loader2, X } from "lucide-react";
 
 /* ---------- helpers ---------- */
+export function NvidiaLogo({ size = 20, className }: { size?: number; className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 15"
+      width={size}
+      height={(size * 15) / 24}
+      className={className}
+      aria-label="NVIDIA"
+    >
+      <path
+        fill="#76B900"
+        d="M12 0.5C5.9 0.5 1.4 4.3.1 7.5c1.3 3.2 5.8 7 11.9 7s10.6-3.8 11.9-7C22.6 4.3 18.1.5 12 .5zM12 12c-2.6 0-4.6-2-4.6-4.5S9.4 3 12 3s4.6 2 4.6 4.5S14.6 12 12 12z"
+      />
+      <circle cx="12" cy="7.5" r="2.1" fill="#76B900" />
+    </svg>
+  );
+}
+
 export function cx(...parts: Array<string | false | null | undefined>) {
   return parts.filter(Boolean).join(" ");
 }

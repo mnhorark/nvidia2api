@@ -2,7 +2,8 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { KeyRound, Zap } from "lucide-react";
+import { KeyRound } from "lucide-react";
+import { NvidiaLogo } from "@/components/ui";
 import { api, setToken } from "@/lib/api";
 import { Button, Input } from "@/components/ui";
 
@@ -36,9 +37,9 @@ export default function LoginPage() {
       <div className="w-full max-w-sm">
         <div className="mb-8 text-center">
           <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-accent/15 text-accent">
-            <Zap size={24} />
+            <NvidiaLogo size={30} />
           </div>
-          <h1 className="text-2xl font-semibold text-gray-100">nvidia2api</h1>
+          <h1 className="text-2xl font-semibold tracking-wide text-gray-100">NVIDIA2API</h1>
           <p className="mt-1 text-sm text-gray-500">AI API Infrastructure Console</p>
         </div>
 

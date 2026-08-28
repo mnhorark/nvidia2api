@@ -14,10 +14,9 @@ import {
   LogOut,
   Network,
   Settings,
-  Zap,
 } from "lucide-react";
 import { clearToken, getToken } from "@/lib/api";
-import { cx } from "@/components/ui";
+import { cx, NvidiaLogo } from "@/components/ui";
 
 const NAV = [
   { href: "/dashboard", label: "仪表盘", icon: LayoutDashboard },
@@ -50,12 +49,12 @@ export default function ConsoleLayout({ children }: { children: React.ReactNode 
     <div className="flex min-h-screen">
       <aside className="fixed inset-y-0 left-0 z-40 flex w-56 flex-col border-r border-white/5 bg-[#0c0c12]/90 backdrop-blur-xl">
         <div className="flex items-center gap-2.5 border-b border-white/5 px-5 py-5">
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent/15 text-accent">
-            <Zap size={17} />
+          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#76B900]/10">
+            <NvidiaLogo size={20} />
           </div>
           <div>
-            <div className="text-sm font-semibold text-gray-100">nvidia2api</div>
-            <div className="text-[11px] text-gray-500">AI API Infrastructure</div>
+            <div className="text-sm font-semibold tracking-wide text-gray-100">NVIDIA2API</div>
+            <div className="text-[10px] text-gray-500">AI API Infrastructure</div>
           </div>
         </div>
 

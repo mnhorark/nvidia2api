@@ -3,7 +3,7 @@ import { Toaster } from "@/components/toaster";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "nvidia2api · AI API Infrastructure",
+  title: "NVIDIA2API · AI API Infrastructure",
   description: "NVIDIA AI API aggregation, proxy acceleration and OpenAI-compatible gateway.",
 };
 
