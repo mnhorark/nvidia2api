@@ -165,6 +165,8 @@ class RequestLog(models.Model):
     prompt_tokens = models.IntegerField(default=0)
     completion_tokens = models.IntegerField(default=0)
     total_tokens = models.IntegerField(default=0)
+    # Full per-route outcome of the race: winner / failed / cancelled
+    routes = models.JSONField(default=list, blank=True)
 
     class Meta:
         db_table = "request_log"

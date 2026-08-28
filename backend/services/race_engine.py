@@ -31,6 +31,22 @@ class RaceResult:
     http_status: int = 0
     error_type: str = ""
     error_message: str = ""
+    latency_ms: float = 0.0
+    report: list[dict] | None = None  # per-route outcomes of the whole race
+
+
+def route_info(route: Route, status: str, latency_ms: float = 0.0,
+               error: str = "", http_status: int = 0) -> dict:
+    return {
+        "name": route.name,
+        "kind": route.kind,
+        "key_name": route.key.name,
+        "proxy_name": route.proxy.name if route.proxy else "",
+        "status": status,                     # winner / failed / cancelled
+        "latency_ms": round(latency_ms, 1),
+        "error": error,
+        "http_status": http_status,
+    }
 
 
 class NoRouteAvailable(Exception):
@@ -38,8 +54,9 @@ class NoRouteAvailable(Exception):
 
 
 class AllRoutesFailed(Exception):
-    def __init__(self, errors: list[str]):
+    def __init__(self, errors: list[str], report: list[dict] | None = None):
         self.errors = errors
+        self.report = report or []
         super().__init__("; ".join(errors[:5]))
 
 
@@ -111,7 +128,14 @@ def _classify_error(exc: Exception) -> tuple[str, int]:
     return "network_error", 0
 
 
-async def _do_request(route: Route, body: dict, base_url: str) -> RaceResult:
+async def _do_request(route: Route, body: dict, base_url: str,
+                      started: float | None = None) -> RaceResult:
+    import time as _time
+    t0 = started if started is not None else _time.monotonic()
+
+    def _elapsed() -> float:
+        return (_time.monotonic() - t0) * 1000
+
     headers = {
         "Authorization": f"Bearer {route.key.api_key}",
         "Content-Type": "application/json",
@@ -127,22 +151,23 @@ async def _do_request(route: Route, body: dict, base_url: str) -> RaceResult:
             except Exception:  # noqa: BLE001
                 _mark_failure(route, "invalid_json", resp.status_code)
                 return RaceResult(ok=False, route=route, http_status=resp.status_code,
-                                  error_type="invalid_json")
+                                  error_type="invalid_json", latency_ms=_elapsed())
             if not is_valid_response(resp.status_code, data):
                 typ = _classify_status(resp.status_code, data)
                 _mark_failure(route, typ, resp.status_code)
                 return RaceResult(ok=False, route=route, http_status=resp.status_code,
-                                  error_type=typ,
+                                  error_type=typ, latency_ms=_elapsed(),
                                   error_message=str(data.get("error", ""))[:256])
             _mark_success(route)
             return RaceResult(ok=True, route=route, payload=data,
-                              http_status=resp.status_code)
+                              http_status=resp.status_code, latency_ms=_elapsed())
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001
         typ, _ = _classify_error(exc)
         _mark_failure(route, typ, 0)
-        return RaceResult(ok=False, route=route, error_type=typ, error_message=str(exc))
+        return RaceResult(ok=False, route=route, error_type=typ, error_message=str(exc),
+                          latency_ms=_elapsed())
 
 
 def _classify_status(code: int, data: dict) -> str:
@@ -173,11 +198,14 @@ def _mark_failure(route: Route, error_type: str, http_status: int):
 # ---------------------------------------------------------------------------
 
 async def _race(routes: list[Route], body: dict, base_url: str) -> RaceResult:
+    import time as _time
     if not routes:
         raise NoRouteAvailable()
+    t0 = _time.monotonic()
     tasks: dict[asyncio.Task, Route] = {
-        asyncio.ensure_future(_do_request(r, body, base_url)): r for r in routes
+        asyncio.ensure_future(_do_request(r, body, base_url, t0)): r for r in routes
     }
+    report: list[dict] = []
     errors: list[str] = []
     try:
         pending = set(tasks.keys())
@@ -186,16 +214,26 @@ async def _race(routes: list[Route], body: dict, base_url: str) -> RaceResult:
             for t in done:
                 result = t.result()
                 if result.ok:
+                    report.append(route_info(result.route, "winner",
+                                             result.latency_ms, "", result.http_status))
                     for p in pending:
                         p.cancel()
                     await asyncio.gather(*pending, return_exceptions=True)
+                    for p in pending:
+                        r = tasks[p]
+                        report.append(route_info(
+                            r, "cancelled",
+                            (_time.monotonic() - t0) * 1000, "winner decided"))
+                    result.report = report
                     return result
                 errors.append(f"{result.route.name}:{result.error_type}")
+                report.append(route_info(result.route, "failed", result.latency_ms,
+                                         result.error_type, result.http_status))
     finally:
         for t in tasks:
             if not t.done():
                 t.cancel()
-    raise AllRoutesFailed(errors)
+    raise AllRoutesFailed(errors, report)
 
 
 async def _stream_first_valid(route: Route, body: dict, base_url: str):

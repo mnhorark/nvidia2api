@@ -211,13 +211,15 @@ export function Td({
   children,
   className,
   title,
+  colSpan,
 }: {
   children?: React.ReactNode;
   className?: string;
   title?: string;
+  colSpan?: number;
 }) {
   return (
-    <td title={title} className={cx("px-3 py-2.5 text-sm text-gray-300", className)}>
+    <td colSpan={colSpan} title={title} className={cx("px-3 py-2.5 text-sm text-gray-300", className)}>
       {children}
     </td>
   );

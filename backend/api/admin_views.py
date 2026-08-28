@@ -496,12 +496,20 @@ class AdminChatView(AdminRequiredMixin, APIView):
         t0 = time.monotonic()
         try:
             result = race_chat(routes, body, settings.NVIDIA_BASE_URL)
-        except (NoRouteAvailable, AllRoutesFailed) as exc:
+        except AllRoutesFailed as exc:
             log.status, log.error_type = "error", "all_routes_failed"
             log.http_status = 502
+            log.routes = exc.report
             log.save()
             return Response({"error": {"message": f"所有线路均失败: {exc}",
-                                       "code": "upstream_error"}}, status=502)
+                                       "code": "upstream_error"},
+                             "routes": exc.report}, status=502)
+        except NoRouteAvailable:
+            log.status, log.error_type = "error", "no_available_route"
+            log.http_status = 503
+            log.save()
+            return Response({"error": {"message": "当前没有可用线路",
+                                       "code": "no_available_route"}}, status=503)
         duration = round((time.monotonic() - t0) * 1000, 1)
         r = result.route
         usage = (result.payload or {}).get("usage") or {}
@@ -514,6 +522,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
         log.prompt_tokens = usage.get("prompt_tokens", 0) or 0
         log.completion_tokens = usage.get("completion_tokens", 0) or 0
         log.total_tokens = usage.get("total_tokens", 0) or 0
+        log.routes = result.report or []
         log.save()
         return Response({
             "request_id": request_id,
@@ -524,5 +533,6 @@ class AdminChatView(AdminRequiredMixin, APIView):
                 "proxy_name": r.proxy.name if r.proxy else "",
                 "duration_ms": duration,
                 "usage": usage,
+                "routes": result.report or [],
             },
         })

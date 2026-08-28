@@ -170,6 +170,17 @@ export interface UserApiKey {
   updated_at: string;
 }
 
+export interface LogRoute {
+  name: string;
+  kind: "direct" | "proxy";
+  key_name: string;
+  proxy_name: string;
+  status: string;
+  latency_ms: number;
+  error: string;
+  http_status: number;
+}
+
 export interface RequestLog {
   id: number;
   request_id: string;
@@ -177,10 +188,12 @@ export interface RequestLog {
   status: string;
   http_status?: number;
   duration_ms?: number;
+  routes?: LogRoute[];
   is_winner?: boolean;
   is_stream?: boolean;
-  nvidia_key?: string;
-  proxy?: string;
+  winner_key_name?: string;
+  winner_proxy_name?: string;
+  winner_route_type?: string;
   proxy_ip?: string;
   error_type?: string;
   input_tokens?: number;
@@ -229,18 +242,36 @@ export interface TokenUsageDay {
   success: number;
 }
 
+export interface AdminChatRoute {
+  name: string;
+  kind: "direct" | "proxy";
+  key_name: string;
+  proxy_name: string;
+  status: "winner" | "failed" | "cancelled" | string;
+  latency_ms: number;
+  error: string;
+  http_status: number;
+}
+
 export interface AdminChatMeta {
   route_type: string;
   key_name: string;
   proxy_name: string;
   duration_ms: number;
   usage: Record<string, number>;
+  routes: AdminChatRoute[];
 }
 
 export interface AdminChatResponse {
   request_id: string;
   payload: {
-    choices?: { message?: { role?: string; content?: string } }[];
+    choices?: {
+      message?: {
+        role?: string;
+        content?: string;
+        reasoning_content?: string;
+      };
+    }[];
   };
   meta: AdminChatMeta;
 }

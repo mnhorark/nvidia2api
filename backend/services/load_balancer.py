@@ -34,21 +34,31 @@ class Route:
 
 
 def build_routes(max_routes: int | None = None) -> list[Route]:
-    """Pick keys + proxies, claim RPM slots, return routes (0..N)."""
+    """Build race routes.
+
+    Route count = min(启用代理数 + 1 直连, 可用 Key 数, max_routes_per_request)。
+    每个代理占一条线路，再加上恰好 1 条直连；每条线路分配不同的 Key。
+    多出来的 Key 由调度层（LRU/成功率/RPM）留给后续请求轮换，不产生冗余直连。
+    """
     cfg_max = sysconfig.get("max_routes_per_request")
     max_routes = min(max_routes or cfg_max, cfg_max)
-    keys = key_service.available_keys()[:max_routes]
-    proxies = proxy_service.schedulable_proxies()[: max(len(keys) - 1, 0)]
+
+    proxies = proxy_service.schedulable_proxies()
+    keys = key_service.available_keys()
+
+    route_count = min(len(proxies) + 1, len(keys), max_routes)
+    if route_count <= 0:
+        return []
+    proxies = proxies[: route_count - 1]
 
     routes: list[Route] = []
-    for i, key in enumerate(keys):
+    for i in range(route_count):
+        key = keys[i]
         if not key_service.claim_rpm_slot(key.id):
             continue
         proxy = proxies[i] if i < len(proxies) else None
-        routes.append(Route(kind="proxy" if proxy else "direct", key=key, proxy=proxy, claimed=True))
+        routes.append(Route(kind="proxy" if proxy else "direct", key=key, proxy=proxy))
 
-    # Guarantee at least one direct route if there are keys and no route ended direct.
-    if routes and all(r.proxy is not None for r in routes) and len(routes) > 1:
-        last = routes.pop()
-        routes.append(Route(kind="direct", key=last.key, claimed=True))
+    # 保证恰好 1 条直连：若最后一条恰好也是直连（即 proxies 已全部用完），无需额外处理
+    # 由于 proxies 被裁剪到 route_count-1，最后一条必然是 direct。
     return routes

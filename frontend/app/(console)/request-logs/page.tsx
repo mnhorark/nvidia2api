@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { RefreshCw, Search } from "lucide-react";
+import { ChevronDown, ChevronRight, RefreshCw, Search } from "lucide-react";
 import { api, asList, RequestLog } from "@/lib/api";
 import {
   Badge,
@@ -22,6 +22,7 @@ export default function RequestLogsPage() {
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [expanded, setExpanded] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -81,37 +82,89 @@ export default function RequestLogsPage() {
         empty="暂无日志"
         head={
           <>
+            <Th></Th>
             <Th>Request ID</Th>
             <Th>时间</Th>
             <Th>模型</Th>
             <Th>耗时</Th>
-            <Th>NVIDIA Key</Th>
-            <Th>代理</Th>
+            <Th>胜出线路 (Winner)</Th>
             <Th>Stream</Th>
             <Th>状态</Th>
             <Th>Tokens</Th>
           </>
         }
       >
-        {logs.map((l) => (
-          <tr key={l.id ?? l.request_id} className="hover:bg-white/[0.02]">
-            <Td className="font-mono text-xs text-gray-400">{l.request_id}</Td>
-            <Td className="text-xs text-gray-500">{fmtTime(l.created_at)}</Td>
-            <Td className="max-w-[220px] truncate font-mono text-xs text-gray-300" title={l.model}>
-              {l.model}
-            </Td>
-            <Td>{fmtLatency(l.duration_ms)}</Td>
-            <Td className="font-mono text-xs text-gray-500">{l.nvidia_key || "—"}</Td>
-            <Td className="text-xs text-gray-500">{l.proxy || "直连"}</Td>
-            <Td className="text-xs text-gray-500">{l.is_stream ? "是" : "否"}</Td>
-            <Td>
-              <Badge status={l.status} />
-            </Td>
-            <Td className="text-xs text-gray-500">
-              {l.total_tokens ?? "—"}
-            </Td>
-          </tr>
-        ))}
+        {logs.map((l) => {
+          const open = expanded === l.request_id;
+          return (
+            <>
+              <tr
+                key={l.id ?? l.request_id}
+                onClick={() => setExpanded(open ? null : l.request_id)}
+                className="cursor-pointer hover:bg-white/[0.02]"
+              >
+                <Td className="w-6 text-gray-600">
+                  {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                </Td>
+                <Td className="font-mono text-xs text-gray-400">{l.request_id}</Td>
+                <Td className="text-xs text-gray-500">{fmtTime(l.created_at)}</Td>
+                <Td className="max-w-[220px] truncate font-mono text-xs text-gray-300" title={l.model}>
+                  {l.model}
+                </Td>
+                <Td>{fmtLatency(l.duration_ms)}</Td>
+                <Td className="text-xs text-gray-400">
+                  <span className="font-mono">{l.winner_proxy_name || l.winner_key_name ? `${l.winner_proxy_name || "直连"} + ${l.winner_key_name}` : "—"}</span>
+                </Td>
+                <Td className="text-xs text-gray-500">{l.is_stream ? "是" : "否"}</Td>
+                <Td>
+                  <Badge status={l.status} />
+                </Td>
+                <Td className="text-xs text-gray-500">
+                  {l.total_tokens ?? "—"}
+                </Td>
+              </tr>
+              {open && (
+                <tr key={`${l.request_id}-detail`} className="bg-white/[0.02]">
+                  <Td colSpan={9} className="!py-3">
+                    <div className="space-y-1.5">
+                      <div className="mb-2 text-xs font-medium text-gray-400">线路竞速明细</div>
+                      {(l.routes ?? []).length === 0 ? (
+                        <p className="text-xs text-gray-600">该请求未记录线路明细（早期日志）</p>
+                      ) : (
+                        l.routes!.map((r, i) => (
+                          <div key={i} className="flex items-center gap-2.5 text-xs">
+                            <span
+                              className={
+                                r.status === "winner"
+                                  ? "text-emerald-400"
+                                  : r.status === "failed"
+                                    ? "text-red-400"
+                                    : "text-gray-600"
+                              }
+                            >
+                              {r.status === "winner" ? "●" : r.status === "failed" ? "✕" : "○"}
+                            </span>
+                            <span className="w-28 text-gray-300">
+                              {r.kind === "direct" ? "直连" : r.proxy_name}
+                            </span>
+                            <span className="w-36 font-mono text-gray-500">{r.key_name}</span>
+                            <span className="text-gray-500">
+                              {r.status === "winner"
+                                ? `${r.latency_ms}ms · 胜出`
+                                : r.status === "cancelled"
+                                  ? "已取消"
+                                  : `${r.error}${r.http_status ? ` (${r.http_status})` : ""}`}
+                            </span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </Td>
+                </tr>
+              )}
+            </>
+          );
+        })}
       </DataTable>
     </div>
   );

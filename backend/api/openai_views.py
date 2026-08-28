@@ -128,7 +128,7 @@ def chat_completions(request):
             _finish_log(log, started, False, 503, "no_available_route")
             return openai_error("当前没有可用线路", "no_available_route", 503)
         except AllRoutesFailed as exc:
-            _finish_log(log, started, False, 502, "all_routes_failed")
+            _finish_log(log, started, False, 502, "all_routes_failed", routes=exc.report)
             return openai_error(f"所有线路均失败: {exc}", "upstream_error", 502)
 
         r = result.route
@@ -136,7 +136,7 @@ def chat_completions(request):
         _finish_log(log, started, True, result.http_status, "", route_kind=r.kind,
                     key_name=r.key.name, proxy_name=r.proxy.name if r.proxy else "",
                     proxy_ip=(r.proxy.public_ip if r.proxy else ""),
-                    usage=usage)
+                    usage=usage, routes=result.report or [])
         api_key_service.record_result(user_key, True)
         return JsonResponse(result.payload, status=200)
     finally:
@@ -214,7 +214,8 @@ def _drain(loop, winner):
 
 def _finish_log(log: RequestLog, started: float, success: bool, http_status: int,
                 error_type: str = "", route_kind: str = "", key_name: str = "",
-                proxy_name: str = "", proxy_ip: str = "", usage: dict | None = None):
+                proxy_name: str = "", proxy_ip: str = "", usage: dict | None = None,
+                routes: list | None = None):
     log.status = "success" if success else "error"
     log.http_status = http_status
     log.error_type = error_type
@@ -228,4 +229,6 @@ def _finish_log(log: RequestLog, started: float, success: bool, http_status: int
         log.prompt_tokens = usage.get("prompt_tokens", 0) or 0
         log.completion_tokens = usage.get("completion_tokens", 0) or 0
         log.total_tokens = usage.get("total_tokens", 0) or 0
+    if routes:
+        log.routes = routes
     log.save()

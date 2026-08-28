@@ -46,7 +46,7 @@ class RaceTests(TestCase):
         cancelled = [False] * len(behaviors)
         delay_slow = 60.0
 
-        async def fake_do_request(route, body, base_url):
+        async def fake_do_request(route, body, base_url, started=None):
             idx = int(route.key.name.split("-")[-1])
             delay, ok = behaviors[idx]
             try:

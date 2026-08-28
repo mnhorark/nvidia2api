@@ -86,7 +86,7 @@ class RequestLogSerializer(serializers.ModelSerializer):
         fields = ["id", "request_id", "model", "created_at", "duration_ms", "status",
                   "http_status", "error_type", "winner_route_type", "winner_key_name",
                   "winner_proxy_name", "proxy_public_ip", "is_stream", "routes_count",
-                  "prompt_tokens", "completion_tokens", "total_tokens"]
+                  "prompt_tokens", "completion_tokens", "total_tokens", "routes"]
 
 
 class SettingSerializer(serializers.ModelSerializer):
