@@ -120,8 +120,19 @@ export default function RequestLogsPage() {
                 <Td>
                   <Badge status={l.status} />
                 </Td>
-                <Td className="text-xs text-gray-500">
-                  {l.total_tokens ?? "—"}
+                <Td className="text-xs leading-snug">
+                  {l.total_tokens != null && l.total_tokens > 0 ? (
+                    <>
+                      <span className="text-gray-300">{l.prompt_tokens ?? 0}</span>
+                      <span className="text-gray-600">/</span>
+                      <span className="text-gray-300">{l.completion_tokens ?? 0}</span>
+                      {(l.cached_tokens ?? 0) > 0 && (
+                        <div className="text-[11px] text-gray-600">缓存↓{l.cached_tokens}</div>
+                      )}
+                    </>
+                  ) : (
+                    <span className="text-gray-600">—</span>
+                  )}
                 </Td>
               </tr>
               {open && (
