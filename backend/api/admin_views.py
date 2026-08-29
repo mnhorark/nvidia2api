@@ -85,11 +85,21 @@ class LoginView(APIView):
 
 class ChannelListView(AdminRequiredMixin, APIView):
     def get(self, request):
-        channels = channel_service.list_channels()
-        current = current_channel(request)
+        from django.db.models import Count, Q
+        qs = Channel.objects.order_by("id").annotate(
+            key_count=Count("keys", distinct=True),
+            enabled_key_count=Count("keys", filter=~Q(keys__status__in=[
+                ChannelKeyStatus.DISABLED, ChannelKeyStatus.INVALID]), distinct=True),
+            proxy_count=Count("proxies", distinct=True),
+            enabled_proxy_count=Count("proxies", filter=Q(proxies__enabled=True),
+                                      distinct=True),
+            model_count=Count("models", distinct=True),
+            enabled_model_count=Count("models", filter=Q(models__enabled=True),
+                                      distinct=True),
+        )
         return Response({
-            "results": ChannelSerializer(channels, many=True).data,
-            "current": current.slug,
+            "results": ChannelSerializer(qs, many=True).data,
+            "current": current_channel(request).slug,
         })
 
     def post(self, request):
@@ -116,6 +126,7 @@ class ChannelListView(AdminRequiredMixin, APIView):
             enabled=bool(request.data.get("enabled", True)),
             is_default=make_default,
             notes=request.data.get("notes") or "",
+            allow_duplicate_keys=bool(request.data.get("allow_duplicate_keys", False)),
         )
         channel.save()
         return Response(ChannelSerializer(channel).data, status=201)
@@ -137,6 +148,8 @@ class ChannelDetailView(AdminRequiredMixin, APIView):
             if f in request.data:
                 setattr(channel, f, (request.data[f] or "").strip()
                         if isinstance(request.data[f], str) else request.data[f])
+        if "allow_duplicate_keys" in request.data:
+            channel.allow_duplicate_keys = bool(request.data["allow_duplicate_keys"])
         if "default_rpm" in request.data:
             channel.default_rpm = int(request.data["default_rpm"])
         if "enabled" in request.data:

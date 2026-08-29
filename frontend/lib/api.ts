@@ -124,6 +124,7 @@ export interface Channel {
   key_prefix: string;
   auth_scheme: string;
   default_rpm: number;
+  allow_duplicate_keys: boolean;
   enabled: boolean;
   is_default: boolean;
   notes: string;

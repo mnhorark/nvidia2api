@@ -37,6 +37,21 @@ def list_models_raw(channel: Channel, api_key: str, timeout: float = 30) -> tupl
             except Exception:  # noqa: BLE001
                 return resp.status_code, {}
     except Exception as exc:  # noqa: BLE001
+        logger.warning("list models via httpx failed channel=%s err=%s, trying curl_cffi",
+                       channel.slug, exc)
+
+    # 某些环境（Windows/Cloudflare/TLS）下 httpx 会卡在 TLS 握手；curl_cffi 走
+    # 浏览器兼容 TLS 指纹，用它兜底。curl_cffi 不可用时保持原 0/{} 失败语义。
+    try:
+        from curl_cffi import requests as curl_requests
+
+        resp = curl_requests.get(channel.models_url, headers=headers,
+                                 timeout=timeout, impersonate="chrome")
+        try:
+            return resp.status_code, resp.json()
+        except Exception:  # noqa: BLE001
+            return resp.status_code, {}
+    except Exception as exc:  # noqa: BLE001
         logger.warning("list models failed channel=%s err=%s", channel.slug, exc)
         return 0, {}
 

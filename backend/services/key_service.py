@@ -61,9 +61,14 @@ def bulk_import_keys(text: str, channel: Channel) -> dict:
             result["invalid"] += 1
             result["errors"].append({"line": ln, "reason": "invalid_format"})
             continue
-        if key in seen_in_batch or channel.keys.filter(api_key=key).exists():
+        allow_dup = bool(getattr(channel, "allow_duplicate_keys", False))
+        if not allow_dup and (
+            key in seen_in_batch or channel.keys.filter(api_key=key).exists()
+        ):
             result["duplicate"] += 1
             continue
+        if allow_dup:
+            seen_in_batch.add(key)
         try:
             ChannelKey.objects.create(
                 channel=channel, name=name, api_key=key,

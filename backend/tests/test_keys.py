@@ -31,6 +31,14 @@ class KeyImportTests(TestCase):
         self.assertEqual(res["invalid"], 1)
         self.assertEqual(res["success"], 1)
 
+    def test_allow_duplicate_keys_channel_imports_duplicates(self):
+        channel = Channel.objects.create(
+            name="Zen", slug="zen", base_url="https://z.test/v1",
+            allow_duplicate_keys=True)
+        res = key_service.bulk_import_keys("public\npublic", channel)
+        self.assertEqual(res["success"], 2)
+        self.assertEqual(channel.keys.filter(api_key="public").count(), 2)
+
     def test_mask(self):
         masked = key_service.mask_key("nvapi-0123456789abcdef")
         self.assertNotIn("23456789", masked)

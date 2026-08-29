@@ -311,7 +311,7 @@ function TokenUsageSection({
                 const p = Math.min(100, ((d.prompt_tokens || 0) / max) * 100);
                 const c = Math.min(100, ((d.completion_tokens || 0) / max) * 100);
                 return (
-                  <div key={d.date} className="group relative flex-1">
+                  <div key={d.date} className="group relative h-full flex-1">
                     <div className="pointer-events-none absolute -top-9 left-1/2 z-10 hidden -translate-x-1/2 whitespace-nowrap rounded-md border border-white/10 bg-[#14141d] px-2 py-1 text-[11px] text-gray-300 shadow-xl group-hover:block">
                       {d.date} · 总计 {d.total_tokens.toLocaleString()}
                       {(d.cached_tokens ?? 0) > 0 && ` · 缓存 ${d.cached_tokens.toLocaleString()}`}
@@ -339,7 +339,7 @@ function TokenUsageSection({
                 const ok = Math.min(100, ((d.success || 0) / maxReq) * 100);
                 const fail = Math.min(100, ((d.requests - d.success) / maxReq) * 100);
                 return (
-                  <div key={d.date} className="group relative flex-1">
+                  <div key={d.date} className="group relative h-full flex-1">
                     <div className="pointer-events-none absolute -top-9 left-1/2 z-10 hidden -translate-x-1/2 whitespace-nowrap rounded-md border border-white/10 bg-[#14141d] px-2 py-1 text-[11px] text-gray-300 shadow-xl group-hover:block">
                       {d.date} · {d.requests} 次 · 失败 {d.requests - d.success}
                     </div>

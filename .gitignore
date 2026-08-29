@@ -2,7 +2,9 @@ __pycache__/
 *.pyc
 .venv/
 .env
+.env.local
 data/*.sqlite3
+data/*.bak*
 node_modules/
 .next/
 *.tsbuildinfo

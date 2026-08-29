@@ -75,6 +75,8 @@ class Channel(Timestamped):
     enabled = models.BooleanField(default=True, db_index=True)
     is_default = models.BooleanField(default=False, db_index=True)
     notes = models.TextField(blank=True, default="")
+    # 公共 Key 渠道（如 Zen/Kilo）允许同渠道内复用同一 key 导入多条名额
+    allow_duplicate_keys = models.BooleanField(default=False)
 
     class Meta:
         db_table = "channel"
@@ -138,11 +140,8 @@ class ChannelKey(Timestamped):
 
     class Meta:
         db_table = "channel_key"
-        constraints = [
-            models.UniqueConstraint(
-                fields=["channel", "api_key"], name="unique_channel_key"
-            )
-        ]
+        # 不建数据库层唯一约束:zen / kilo 等渠道允许导入重复 key,交由应用层控制
+        constraints = []
         indexes = [models.Index(fields=["status", "last_used_at"])]
 
     def __str__(self):

@@ -77,6 +77,17 @@ class AdminChannelApiTests(TestCase):
         self.assertEqual(resp.data["base_url"], "https://opencode.ai/zen/v1")
         self.assertEqual(resp.data["chat_url"], "https://opencode.ai/zen/v1/chat/completions")
 
+    def test_channel_list_counts(self):
+        c = Channel.objects.create(name="A", slug="a", base_url="https://a.test/v1")
+        ChannelKey.objects.create(channel=c, name="k1", api_key="k1")
+        AIModel.objects.create(channel=c, model_name="m1", enabled=True)
+        resp = self._get(admin_views.ChannelListView.as_view(), "/api/admin/channels")
+        row = next(x for x in resp.data["results"] if x["slug"] == "a")
+        self.assertEqual(row["key_count"], 1)
+        self.assertEqual(row["enabled_key_count"], 1)
+        self.assertEqual(row["model_count"], 1)
+        self.assertEqual(row["enabled_model_count"], 1)
+
     def test_duplicate_slug_rejected(self):
         Channel.objects.create(name="A", slug="a", base_url="https://a.test/v1")
         resp = self._post(admin_views.ChannelListView.as_view(), "/api/admin/channels",

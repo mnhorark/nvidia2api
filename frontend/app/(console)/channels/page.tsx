@@ -120,6 +120,7 @@ function ChannelsInner() {
       key_prefix: edit.key_prefix,
       auth_scheme: edit.auth_scheme,
       default_rpm: Number(edit.default_rpm ?? 40),
+      allow_duplicate_keys: edit.allow_duplicate_keys ?? false,
       enabled: edit.enabled ?? true,
       is_default: edit.is_default ?? false,
       notes: edit.notes ?? "",
@@ -190,7 +191,7 @@ function ChannelsInner() {
     try {
       setChannel(c.slug);
       const res = await api.post<{ created?: number; total?: number }>(
-        "/api/admin/models/sync", {}
+        `/api/admin/models/sync?channel=${encodeURIComponent(c.slug)}`, {}
       );
       toast.success(`同步完成：新增 ${res.created ?? 0} 个，共 ${res.total ?? 0} 个`);
       await load();
@@ -501,8 +502,15 @@ function ChannelsInner() {
               />
               设为默认渠道（/v1/* 走它）
             </label>
+            <label className="flex items-center gap-2 text-sm text-gray-300">
+              <Checkbox
+                checked={edit?.allow_duplicate_keys ?? false}
+                onChange={(v) => setEdit((s) => ({ ...s, allow_duplicate_keys: v }))}
+                ariaLabel="允许重复 Key"
+              />
+              允许导入重复 Key（公共 Key 渠道）
+            </label>
           </div>
-
           <div className="flex justify-end gap-2 pt-2">
             <Button type="button" onClick={() => setEdit(null)}>
               取消

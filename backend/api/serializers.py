@@ -22,6 +22,7 @@ class ChannelSerializer(serializers.ModelSerializer):
         fields = [
             "id", "name", "slug", "base_url", "chat_path", "models_path",
             "chat_url", "models_url", "key_prefix", "auth_scheme", "default_rpm",
+            "allow_duplicate_keys",
             "enabled", "is_default", "notes",
             "key_count", "enabled_key_count", "proxy_count", "enabled_proxy_count",
             "model_count", "enabled_model_count", "created_at", "updated_at",
