@@ -83,6 +83,8 @@ class ProxySerializer(serializers.ModelSerializer):
 
 
 class ProxyWriteSerializer(serializers.ModelSerializer):
+    protocol = serializers.ChoiceField(choices=["socks5", "socks5h", "http", "https"])
+
     class Meta:
         model = Proxy
         fields = ["name", "protocol", "host", "port", "username", "password", "group"]

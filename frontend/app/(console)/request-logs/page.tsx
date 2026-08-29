@@ -18,7 +18,8 @@ import {
 
 export default function RequestLogsPage() {
   const [logs, setLogs] = useState<RequestLog[]>([]);
-  const [model, setModel] = useState("");
+  const [modelInput, setModelInput] = useState(""); // 输入框即时值
+  const [model, setModel] = useState(""); // 300ms 防抖后真正参与查询的值
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -39,6 +40,12 @@ export default function RequestLogsPage() {
       setLoading(false);
     }
   }, [model, status]);
+
+  // 模型关键字防抖：停止输入 300ms 后才应用到查询条件
+  useEffect(() => {
+    const t = window.setTimeout(() => setModel(modelInput), 300);
+    return () => window.clearTimeout(t);
+  }, [modelInput]);
 
   useEffect(() => {
     load();
@@ -62,8 +69,8 @@ export default function RequestLogsPage() {
           <Input
             className="pl-9"
             placeholder="按模型筛选…"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
+            value={modelInput}
+            onChange={(e) => setModelInput(e.target.value)}
           />
         </div>
         <div className="w-40">

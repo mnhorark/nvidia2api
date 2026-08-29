@@ -1,6 +1,8 @@
 """Admin API：所有资源按渠道隔离，渠道由 `X-Channel` 头或 `?channel=` 决定。"""
 from __future__ import annotations
 
+import threading
+import time
 from datetime import timedelta
 
 from django.db.models import Avg, Count, Q, Sum
@@ -30,6 +32,38 @@ def current_channel(request) -> Channel:
     return channel_service.resolve_from_request(request)
 
 
+def _parse_int(value):
+    """宽松转 int；非法值返回 None（由调用方决定返回 400）。"""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _bad_param(name: str) -> Response:
+    return Response({"error": {"message": f"参数 {name} 必须是整数",
+                               "code": "bad_request"}}, status=400)
+
+
+# 登录接口内存限流：每 IP 每分钟最多 10 次失败
+_LOGIN_FAIL_LIMIT = 10
+_LOGIN_FAIL_WINDOW = 60.0
+_login_fail_lock = threading.Lock()
+_login_fail_bucket: dict[str, list[float]] = {}
+
+
+def _login_fail_exceeded(ip: str) -> bool:
+    now = time.monotonic()
+    with _login_fail_lock:
+        bucket = [t for t in _login_fail_bucket.get(ip, []) if now - t < _LOGIN_FAIL_WINDOW]
+        if len(bucket) >= _LOGIN_FAIL_LIMIT:
+            _login_fail_bucket[ip] = bucket
+            return True
+        bucket.append(now)
+        _login_fail_bucket[ip] = bucket
+        return False
+
+
 class LoginView(APIView):
     authentication_classes = []
     permission_classes = []
@@ -40,6 +74,10 @@ class LoginView(APIView):
         from django.conf import settings
         if u == settings.ADMIN_USERNAME and p == settings.ADMIN_PASSWORD:
             return Response({"token": settings.ADMIN_TOKEN})
+        ip = request.META.get("REMOTE_ADDR", "")
+        if _login_fail_exceeded(ip):
+            return Response({"detail": "Too many failed attempts, try again later"},
+                            status=429)
         return Response({"detail": "Invalid credentials"}, status=401)
 
 
@@ -151,7 +189,11 @@ class ChannelKeyListView(AdminRequiredMixin, APIView):
         channel = current_channel(request)
         name = (request.data.get("name") or "").strip()
         key = (request.data.get("api_key") or "").strip()
-        rpm = int(request.data.get("rpm_limit") or channel.default_rpm or 40)
+        rpm_raw = request.data.get("rpm_limit")
+        rpm = (_parse_int(rpm_raw) if rpm_raw not in (None, "")
+               else (channel.default_rpm or 40))
+        if rpm is None:
+            return _bad_param("rpm_limit")
         if not key:
             return Response({"error": {"message": "api_key required", "code": "bad_request"}},
                             status=400)
@@ -198,7 +240,10 @@ class ChannelKeyDetailView(AdminRequiredMixin, APIView):
         if name:
             rec.name = name.strip()
         if "rpm_limit" in request.data:
-            rec.rpm_limit = int(request.data["rpm_limit"])
+            rpm = _parse_int(request.data["rpm_limit"])
+            if rpm is None:
+                return _bad_param("rpm_limit")
+            rec.rpm_limit = rpm
         action = request.data.get("action")
         enabled = request.data.get("enabled")
         if enabled is False or action == "disable":
@@ -341,7 +386,20 @@ class ProxyDetailView(AdminRequiredMixin, APIView):
                 return Response(
                     {"error": {"message": msg, "code": "proxy_limit_exceeded"}}, status=400
                 )
-        for f in ("name", "protocol", "host", "port", "username", "password", "group"):
+        if "group" in request.data:
+            gid = request.data["group"]
+            if gid in (None, ""):
+                p.group = None
+            else:
+                g = ProxyGroup.objects.filter(pk=gid).first()
+                if g is None:
+                    return Response({"error": {"message": "分组不存在",
+                                               "code": "bad_request"}}, status=400)
+                if g.channel_id != p.channel_id:
+                    return Response({"error": {"message": "分组不属于该代理所在渠道",
+                                               "code": "bad_request"}}, status=400)
+                p.group = g
+        for f in ("name", "protocol", "host", "port", "username", "password"):
             if f in request.data:
                 setattr(p, f, request.data[f])
         p.save()
@@ -509,9 +567,11 @@ class UserApiKeyListView(AdminRequiredMixin, APIView):
         if not name:
             return Response({"error": {"message": "name required", "code": "bad_request"}},
                             status=400)
-        rec, raw = api_key_service.create_key(
-            name, rate_limit=int(request.data.get("rate_limit") or 0)
-        )
+        rl_raw = request.data.get("rate_limit")
+        rate_limit = _parse_int(rl_raw) if rl_raw not in (None, "") else 0
+        if rate_limit is None:
+            return _bad_param("rate_limit")
+        rec, raw = api_key_service.create_key(name, rate_limit=rate_limit)
         data = UserApiKeySerializer(rec).data
         data["key"] = raw  # full key shown once at creation only
         return Response(data, status=201)
@@ -531,7 +591,10 @@ class UserApiKeyDetailView(AdminRequiredMixin, APIView):
         if "enabled" in request.data:
             rec.enabled = bool(request.data["enabled"])
         if "rate_limit" in request.data:
-            rec.rate_limit = int(request.data["rate_limit"])
+            rl = _parse_int(request.data["rate_limit"])
+            if rl is None:
+                return _bad_param("rate_limit")
+            rec.rate_limit = rl
         if "name" in request.data:
             rec.name = request.data["name"]
         rec.save()
@@ -622,7 +685,11 @@ class DashboardUsageView(AdminRequiredMixin, APIView):
     """
 
     def get(self, request):
-        days = max(1, min(int(request.query_params.get("days", 7)), 30))
+        days_raw = request.query_params.get("days", 7)
+        days = _parse_int(days_raw)
+        if days is None:
+            return _bad_param("days")
+        days = max(1, min(days, 30))
         now = timezone.localtime(timezone.now())
         today = now.replace(hour=0, minute=0, second=0, microsecond=0)
         # days=1 时为“今日”视图，按小时分桶（只到当前小时）

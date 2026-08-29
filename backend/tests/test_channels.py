@@ -172,6 +172,20 @@ class AdminChannelApiTests(TestCase):
         self.assertEqual(p.status_code, 201)
         self.assertEqual(Proxy.objects.get(pk=p.data["id"]).channel_id, zen.id)
 
+    def test_proxy_patch_rejects_group_from_other_channel(self):
+        zen = Channel.objects.create(name="Zen", slug="zen", base_url="https://z.test/v1")
+        other = Channel.objects.create(name="Other", slug="other",
+                                       base_url="https://o.test/v1")
+        g = other.proxy_groups.create(name="海外")
+        p = zen.proxies.create(name="p1", protocol="socks5", host="1.1.1.1", port=1080)
+        request = self.factory.patch(
+            f"/api/admin/proxies/{p.id}", data=json.dumps({"group": g.id}),
+            content_type="application/json", **self.headers)
+        resp = admin_views.ProxyDetailView.as_view()(request, pk=p.id)
+        self.assertEqual(resp.status_code, 400)
+        p.refresh_from_db()
+        self.assertIsNone(p.group)
+
     def test_user_api_keys_are_global(self):
         """用户 Key 是平台级的，不随渠道切换。"""
         api_key_service.create_key("global")
@@ -368,6 +382,12 @@ class DashboardUsageAggregateTests(TestCase):
         resp2 = admin_views.DashboardUsageView.as_view()(
             self.factory.get("/api/admin/dashboard/usage?days=7", **self.headers))
         self.assertEqual(resp2.data["granularity"], "day")
+
+    def test_invalid_days_returns_400(self):
+        request = self.factory.get("/api/admin/dashboard/usage?days=abc",
+                                   **self.headers)
+        resp = admin_views.DashboardUsageView.as_view()(request)
+        self.assertEqual(resp.status_code, 400)
 
 
 class BatchApiTests(TestCase):

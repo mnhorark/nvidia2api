@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from django.db import models
+from django.db import models, transaction
 
 
 class Timestamped(models.Model):
@@ -87,10 +87,11 @@ class Channel(Timestamped):
             self.base_url, detected = split_endpoint(self.base_url)
             if detected and not self.chat_path:
                 self.chat_path = detected
-        if self.is_default:
-            Channel.objects.exclude(pk=self.pk).filter(is_default=True).update(
-                is_default=False)
-        super().save(*args, **kwargs)
+        with transaction.atomic():
+            if self.is_default:
+                Channel.objects.exclude(pk=self.pk).filter(is_default=True).update(
+                    is_default=False)
+            super().save(*args, **kwargs)
 
     @property
     def chat_url(self) -> str:

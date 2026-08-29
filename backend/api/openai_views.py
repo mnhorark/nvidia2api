@@ -117,6 +117,8 @@ def chat_completions(request, channel_slug: str | None = None):
         return openai_error("Server busy, too many concurrent requests",
                             "server_overloaded", 429)
     log = None
+    # 流式响应由 _stream_response 生成器在结束时释放信号量（覆盖客户端断开）。
+    semaphore_released_by_stream = False
     try:
         try:
             body = json.loads(request.body.decode("utf-8") or "{}")
@@ -158,6 +160,7 @@ def chat_completions(request, channel_slug: str | None = None):
 
         if stream:
             log_id_holder = {"log": log, "started": started}
+            semaphore_released_by_stream = True
             resp = _stream_response(routes, upstream_body, log_id_holder, user_key)
             response = StreamingHttpResponse(resp, content_type="text/event-stream")
             response["Cache-Control"] = "no-cache"
@@ -170,8 +173,9 @@ def chat_completions(request, channel_slug: str | None = None):
             _finish_log(log, started, False, 503, "no_available_route")
             return openai_error("当前没有可用线路", "no_available_route", 503)
         except AllRoutesFailed as exc:
+            logger.warning("all routes failed: %s", exc)
             _finish_log(log, started, False, 502, "all_routes_failed", routes=exc.report)
-            return openai_error(f"所有线路均失败: {exc}", "upstream_error", 502)
+            return openai_error("上游服务暂时不可用，请稍后重试", "upstream_error", 502)
 
         r = result.route
         usage = (result.payload or {}).get("usage") or {}
@@ -182,7 +186,8 @@ def chat_completions(request, channel_slug: str | None = None):
         api_key_service.record_result(user_key, True)
         return JsonResponse(result.payload, status=200)
     finally:
-        _request_semaphore.release()
+        if not semaphore_released_by_stream:
+            _request_semaphore.release()
 
 
 def _stream_response(routes, upstream_body, holder, user_key):
@@ -233,17 +238,23 @@ def _stream_response(routes, upstream_body, holder, user_key):
                        "param": None, "code": "no_available_route"}
         }) + "\n\n"
         yield "data: [DONE]\n\n"
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         logger.exception("stream failed")
         _finish_log(holder["log"], holder["started"], False, 502, "stream_error")
         api_key_service.record_result(user_key, False)
         yield "data: " + json.dumps({
-            "error": {"message": f"stream error: {exc}", "type": "api_error",
+            "error": {"message": "上游服务暂时不可用，请稍后重试", "type": "api_error",
                        "param": None, "code": "stream_error"}
         }) + "\n\n"
         yield "data: [DONE]\n\n"
     finally:
+        try:
+            if winner is not None:
+                loop.run_until_complete(winner.close())
+        except Exception:  # noqa: BLE001
+            pass
         loop.close()
+        _request_semaphore.release()
 
 
 def _drain(loop, winner):
@@ -267,7 +278,6 @@ def _drain(loop, winner):
         if chunk is None:
             break
         yield chunk
-    loop.run_until_complete(winner.close())
 
 
 def _finish_log(log: RequestLog, started: float, success: bool, http_status: int,

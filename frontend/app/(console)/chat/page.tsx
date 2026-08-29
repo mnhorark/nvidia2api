@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Bot, Brain, ChevronDown, ChevronRight, CornerDownLeft, Loader2, Trash2, Zap } from "lucide-react";
-import { AdminChatResponse, API_BASE_URL, api, asList, getToken, Model } from "@/lib/api";
+import { AdminChatResponse, API_BASE_URL, api, asList, clearToken, getChannel, getToken, Model } from "@/lib/api";
 import { Button, Card, PageHeader, Select } from "@/components/ui";
 import { toast } from "@/components/toaster";
 
@@ -87,6 +87,8 @@ export default function ChatPage() {
         headers: {
           "Content-Type": "application/json",
           Authorization: `Token ${getToken() ?? ""}`,
+          // 与 lib/api 的 request 一致：带上当前渠道作用域
+          ...(getChannel() ? { "X-Channel": getChannel() } : {}),
         },
         body: JSON.stringify({
           model,

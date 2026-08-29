@@ -56,6 +56,15 @@ class RateLimitTests(TestCase):
             cooldown_until=timezone.now() + timedelta(seconds=30))
         self.assertFalse(key_service.claim_rpm_slot(self.key.id))
 
+    def test_rpm_zero_means_unlimited(self):
+        """rpm_limit=0 视为不限流：直接成功且不计数。"""
+        key = ChannelKey.objects.create(channel=_ch(), name="k0", api_key="nvapi-0",
+                                        rpm_limit=0)
+        for _ in range(20):
+            self.assertTrue(key_service.claim_rpm_slot(key.id))
+        key.refresh_from_db()
+        self.assertEqual(key.minute_request_count, 0)
+
     def test_concurrent_claims_do_not_exceed_rpm(self):
         pass
 

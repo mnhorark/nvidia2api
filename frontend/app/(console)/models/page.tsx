@@ -197,6 +197,7 @@ export default function ModelsPage() {
               />
             </Th>
             <Th>模型名称</Th>
+            <Th>对外名称</Th>
             <Th>显示名称</Th>
             <Th>Provider</Th>
             <Th>状态</Th>

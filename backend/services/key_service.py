@@ -113,6 +113,13 @@ def _score(k: ChannelKey):
 def claim_rpm_slot(key_id: int) -> bool:
     """Atomically claim one RPM slot. Uses conditional UPDATEs (no SELECT ... FOR UPDATE)
     so it is safe under SQLite's serialized write locking across threads."""
+    limit = ChannelKey.objects.filter(pk=key_id).values_list(
+        "rpm_limit", flat=True).first()
+    if limit is None:
+        return False
+    if limit <= 0:
+        # rpm_limit <= 0 视为不限流：直接成功且不计数。
+        return True
     now = timezone.now()
     window_cutoff = now - timedelta(seconds=MINUTE_SECONDS)
     ok_states = [ChannelKeyStatus.AVAILABLE, ChannelKeyStatus.RATE_LIMITED,

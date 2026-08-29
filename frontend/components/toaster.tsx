@@ -50,7 +50,11 @@ export function Toaster() {
   }, []);
 
   return (
-    <div className="pointer-events-none fixed bottom-5 right-5 z-[100] flex w-80 flex-col gap-2">
+    <div
+      role="status"
+      aria-live="polite"
+      className="pointer-events-none fixed bottom-5 right-5 z-[100] flex w-80 flex-col gap-2"
+    >
       {items.map((t) => {
         const s = STYLES[t.type];
         const Icon = s.icon;

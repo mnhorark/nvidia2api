@@ -66,6 +66,23 @@ export default function ConsoleLayout({ children }: { children: React.ReactNode 
     }
   }, [router, loadChannels]);
 
+  // 监听全局渠道变更事件（渠道页 switchTo / lib setChannel 派发）：
+  // 更新本地 state 使 <main key={channel}> 重挂载刷新页面，并重拉渠道列表保持侧边栏名称同步。
+  // 注意与 lib/api 的 setChannel 区别：事件由 setChannel 内部派出，此处一般不重复写入 localStorage，
+  // 仅当 detail 与当前存储不一致（手动派发场景）时补写，避免事件回环。
+  useEffect(() => {
+    const onChannelChange = (e: Event) => {
+      const slug = (e as CustomEvent<string | undefined>).detail;
+      if (typeof slug === "string" && slug) {
+        if (slug !== getChannel()) setChannel(slug);
+        setChannelSlug(slug);
+      }
+      void loadChannels();
+    };
+    window.addEventListener("nvidia2api:channel-change", onChannelChange);
+    return () => window.removeEventListener("nvidia2api:channel-change", onChannelChange);
+  }, [loadChannels]);
+
   if (!ready) return null;
 
   function pick(slug: string) {

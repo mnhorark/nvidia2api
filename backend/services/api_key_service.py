@@ -5,6 +5,7 @@ import hashlib
 import secrets
 
 from django.db import transaction
+from django.db.models import F
 from django.utils import timezone
 
 from apps.core.models import UserApiKey
@@ -64,4 +65,7 @@ def record_result(rec: UserApiKey | None, success: bool):
     if rec is None:
         return
     field = "success_requests" if success else "failed_requests"
-    UserApiKey.objects.filter(pk=rec.pk).update(**{field: getattr(rec, field, 0) + 1})
+    UserApiKey.objects.filter(pk=rec.pk).update(
+        total_requests=F("total_requests") + 1,
+        **{field: F(field) + 1},
+    )

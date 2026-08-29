@@ -128,6 +128,8 @@ function ChannelsInner() {
       else await api.post("/api/admin/channels", body);
       setEdit(null);
       await load();
+      // 通知 layout 重拉渠道列表，侧边栏名称等信息保持同步（不带 slug，不切换全局渠道）
+      window.dispatchEvent(new CustomEvent("nvidia2api:channel-change"));
       toast.success("渠道已保存");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "保存失败");
