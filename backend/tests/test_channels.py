@@ -1,5 +1,6 @@
 """多渠道：端点解析、渠道隔离、按渠道路由。"""
 import json
+import types
 from unittest.mock import patch
 
 import httpx
@@ -458,6 +459,183 @@ class RetryTests(TransactionTestCase):
             resp = self._call()
         self.assertEqual(resp.status_code, 502)
         self.assertEqual(m.call_count, 3)
+
+
+class StreamRetryTests(TransactionTestCase):
+    """流式请求：首字节发出前的一切失败都纳入 retry_count 自动重试。"""
+
+    def setUp(self):
+        self.channel = Channel.objects.create(
+            name="NVIDIA", slug="nvidia", base_url="https://n.test/v1",
+            is_default=True)
+        ChannelKey.objects.create(channel=self.channel, name="k1", api_key="k1")
+        AIModel.objects.create(channel=self.channel, model_name="m1", enabled=True)
+        _user, self.raw_key = api_key_service.create_key("tester")
+
+    def _call(self):
+        request = RequestFactory().post(
+            "/v1/chat/completions",
+            data=json.dumps({"model": "m1",
+                             "messages": [{"role": "user", "content": "hi"}],
+                             "stream": True}),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {self.raw_key}")
+        return openai_views.chat_completions(request)
+
+    def test_stream_retries_when_breaks_before_first_byte(self):
+        from services import sysconfig
+        sysconfig.set_params({"retry_count": 2}, self.channel)
+        ok_chunk = 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        behaviors = [
+            _FakeStreamWinner(error=httpx.ReadError("stream broke")),
+            _FakeStreamWinner(chunks=[ok_chunk, "data: [DONE]\n\n"]),
+        ]
+        calls = {"n": 0}
+
+        async def fake_race_stream(*args, **kwargs):
+            calls["n"] += 1
+            return behaviors.pop(0)
+
+        with patch.object(openai_views, "race_stream", new=fake_race_stream):
+            resp = self._call()
+            body = b"".join(list(resp.streaming_content)).decode()
+        self.assertEqual(calls["n"], 2)
+        self.assertIn('data: {"choices"', body)
+        self.assertIn("data: [DONE]", body)
+        self.assertNotIn("stream_error", body)
+
+    def test_stream_retries_when_breaks_after_heartbeat_only(self):
+        # 首字节只是心跳（choices 为空），未交付任何实际内容 → 中断后应重试
+        from services import sysconfig
+        sysconfig.set_params({"retry_count": 2}, self.channel)
+        heartbeat = 'data: {"id":"chatcmpl-a","object":"chat.completion.chunk",' \
+                    '"choices":[]}\n\n'
+        ok_chunk = 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        behaviors = [
+            _FakeStreamWinner(chunks=[heartbeat], error_after=1),
+            _FakeStreamWinner(chunks=[ok_chunk, "data: [DONE]\n\n"]),
+        ]
+        calls = {"n": 0}
+
+        async def fake_race_stream(*args, **kwargs):
+            calls["n"] += 1
+            return behaviors.pop(0)
+
+        with patch.object(openai_views, "race_stream", new=fake_race_stream):
+            resp = self._call()
+            body = b"".join(list(resp.streaming_content)).decode()
+        self.assertEqual(calls["n"], 2)
+        self.assertIn('data: {"choices"', body)
+        self.assertIn("data: [DONE]", body)
+        self.assertNotIn("stream_error", body)
+
+    def test_stream_retries_when_breaks_after_reasoning_only(self):
+        # 思考模型：只输出了 reasoning_content（思考过程），尚未产出正文
+        # → 思考阶段断流不算"已提交内容"，应重建线路自动重试
+        from services import sysconfig
+        sysconfig.set_params({"retry_count": 2}, self.channel)
+        reasoning = 'data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}\n\n'
+        ok_chunk = 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        behaviors = [
+            _FakeStreamWinner(chunks=[reasoning], error_after=1),
+            _FakeStreamWinner(chunks=[ok_chunk, "data: [DONE]\n\n"]),
+        ]
+        calls = {"n": 0}
+
+        async def fake_race_stream(*args, **kwargs):
+            calls["n"] += 1
+            return behaviors.pop(0)
+
+        with patch.object(openai_views, "race_stream", new=fake_race_stream):
+            resp = self._call()
+            body = b"".join(list(resp.streaming_content)).decode()
+        self.assertEqual(calls["n"], 2)
+        self.assertIn("thinking...", body)
+        self.assertIn('data: {"choices"', body)
+        self.assertIn("data: [DONE]", body)
+        self.assertNotIn("stream_error", body)
+
+    def test_stream_no_retry_after_answer_content(self):
+        # 已交付正文 content 后才断流 → 响应已提交，不能重试
+        from services import sysconfig
+        sysconfig.set_params({"retry_count": 3}, self.channel)
+        answer = 'data: {"choices":[{"delta":{"content":"ans"}}]}\n\n'
+        behaviors = [
+            _FakeStreamWinner(chunks=[answer], error_after=1),
+        ]
+        calls = {"n": 0}
+
+        async def fake_race_stream(*args, **kwargs):
+            calls["n"] += 1
+            return behaviors.pop(0)
+
+        with patch.object(openai_views, "race_stream", new=fake_race_stream):
+            resp = self._call()
+            body = b"".join(list(resp.streaming_content)).decode()
+        self.assertEqual(calls["n"], 1)
+        self.assertIn("stream_error", body)
+
+    def test_stream_no_retry_after_first_byte_sent(self):
+        from services import sysconfig
+        sysconfig.set_params({"retry_count": 3}, self.channel)
+        ok_chunk = 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        behaviors = [
+            # 先吐出首字节，随后流中断 → 响应已提交，不能重试
+            _FakeStreamWinner(chunks=[ok_chunk], error_after=1),
+        ]
+        calls = {"n": 0}
+
+        async def fake_race_stream(*args, **kwargs):
+            calls["n"] += 1
+            return behaviors.pop(0)
+
+        with patch.object(openai_views, "race_stream", new=fake_race_stream):
+            resp = self._call()
+            body = b"".join(list(resp.streaming_content)).decode()
+        self.assertEqual(calls["n"], 1)
+        self.assertIn("stream_error", body)
+
+    def test_stream_retry_exhausted_returns_stream_error(self):
+        from services import sysconfig
+        sysconfig.set_params({"retry_count": 2}, self.channel)
+        behaviors = [_FakeStreamWinner(error=httpx.ReadError("boom")) for _ in range(3)]
+        calls = {"n": 0}
+
+        async def fake_race_stream(*args, **kwargs):
+            calls["n"] += 1
+            return behaviors.pop(0)
+
+        with patch.object(openai_views, "race_stream", new=fake_race_stream):
+            resp = self._call()
+            body = b"".join(list(resp.streaming_content)).decode()
+        self.assertEqual(calls["n"], 3)
+        self.assertIn("stream_error", body)
+
+
+class _FakeStreamWinner:
+    """模拟 race_stream 返回的 winner：可按行产出 SSE，或在指定位置抛错。"""
+
+    def __init__(self, error=None, chunks=None, error_after=None):
+        self.route = types.SimpleNamespace(
+            kind="direct", key=types.SimpleNamespace(name="k1"), proxy=None)
+        self.report = []
+        self._error = error
+        self._chunks = list(chunks or [])
+        self._error_after = error_after
+
+    async def lines(self):
+        if self._error:
+            raise self._error
+        for i, chunk in enumerate(self._chunks):
+            if self._error_after is not None and i >= self._error_after:
+                raise httpx.ReadError("mid-stream broke")
+            yield chunk
+        if self._error_after is not None:
+            # 全部 chunk 已吐完后再补一次中断，模拟"先出数据、随后流断开"
+            raise httpx.ReadError("mid-stream broke")
+
+    async def close(self):
+        pass
 
 
 class BatchApiTests(TestCase):

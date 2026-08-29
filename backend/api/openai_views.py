@@ -223,57 +223,136 @@ def chat_completions(request, channel_slug: str | None = None):
             _request_semaphore.release()
 
 
+# 只有"最终答案内容"才算已提交：content（正文）与 tool_calls（已承诺的
+# 工具调用）。reasoning_content / reasoning 是思考过程，不属于最终答案——
+# 思考阶段流中断（用户还没收到任何正文）应允许重建线路自动重试。
+_CONTENT_DELTA_KEYS = ("content", "tool_calls")
+
+
+def _chunk_has_content(line: str) -> bool:
+    """该 SSE 行是否已向客户端交付"最终答案"级别的实际内容。
+
+    纯心跳（choices 为空、delta 全空、无 finish_reason、无 usage）以及
+    思考类 delta（reasoning_content / reasoning）不算——流在此阶段中断时
+    客户端还未收到正文，可以安全重建线路重试。
+    """
+    if not line.startswith("data:"):
+        return False
+    payload = line[5:].strip()
+    if payload == "[DONE]":
+        return True
+    try:
+        data = json.loads(payload)
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(data, dict):
+        return False
+    if data.get("usage"):
+        return True
+    choices = data.get("choices")
+    if not choices or not isinstance(choices, list):
+        return False
+    first = choices[0]
+    if not isinstance(first, dict):
+        return False
+    if first.get("finish_reason"):
+        return True
+    delta = first.get("delta")
+    if isinstance(delta, dict):
+        for key in _CONTENT_DELTA_KEYS:
+            if delta.get(key):
+                return True
+    return False
+
+
 def _stream_response(routes, upstream_body, holder, user_key, channel,
-                     max_attempts: int = 1):
+                     max_attempts: int = 1, proxy_group: int | None = None,
+                     endpoint: str | None = None):
     import asyncio
 
-    async def produce():
-        from services.race_engine import race_stream
-        last: Exception | None = None
+    loop = asyncio.new_event_loop()
+    winner = None
+    sent_content = False
+    last_exc: Exception | None = None
+    try:
         for attempt in range(max_attempts):
-            rs = routes if attempt == 0 else build_routes(channel)
+            rs = routes if attempt == 0 else build_routes(
+                channel, proxy_group=proxy_group, endpoint=endpoint)
             if not rs:
-                last = NoRouteAvailable()
+                last_exc = NoRouteAvailable()
                 continue
+            w = None
             try:
-                return await race_stream(rs, upstream_body)
+                w = loop.run_until_complete(race_stream(rs, upstream_body))
+                winner = w
+                log = holder["log"]
+                log.winner_route_type = w.route.kind
+                log.winner_key_name = w.route.key.name
+                log.winner_proxy_name = w.route.proxy.name if w.route.proxy else ""
+                log.proxy_public_ip = w.route.proxy.public_ip if w.route.proxy else ""
+                log.status = "success"
+                log.http_status = 200
+                log.first_token_ms = round((time.monotonic() - holder["started"]) * 1000, 1)
+                log.routes = w.report or []
+                log.save()
+                api_key_service.record_result(user_key, True)
+                usage: dict = {}
+                for chunk in _drain(loop, w):
+                    if _chunk_has_content(chunk):
+                        sent_content = True
+                    try:
+                        if chunk.startswith("data:"):
+                            payload = json.loads(chunk[5:].strip())
+                            if isinstance(payload, dict) and payload.get("usage"):
+                                usage = payload["usage"]
+                    except Exception:  # noqa: BLE001
+                        pass
+                    yield chunk
+                log.duration_ms = round((time.monotonic() - holder["started"]) * 1000, 1)
+                log.prompt_tokens = usage.get("prompt_tokens", 0) or 0
+                log.completion_tokens = usage.get("completion_tokens", 0) or 0
+                log.total_tokens = usage.get("total_tokens", 0) or 0
+                log.cached_tokens = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
+                log.save()
+                return
             except (NoRouteAvailable, AllRoutesFailed) as exc:
-                last = exc
+                # 竞速阶段全部失败（超时/401/403/429/5xx/无效响应等）：重建线路重试
+                last_exc = exc
                 logger.info("stream attempt %d failed, retrying: %s",
                             attempt + 1, exc)
-        raise last or NoRouteAvailable()
-
-    winner = None
-    loop = asyncio.new_event_loop()
-    try:
-        winner = loop.run_until_complete(produce())
-        log = holder["log"]
-        log.winner_route_type = winner.route.kind
-        log.winner_key_name = winner.route.key.name
-        log.winner_proxy_name = winner.route.proxy.name if winner.route.proxy else ""
-        log.proxy_public_ip = winner.route.proxy.public_ip if winner.route.proxy else ""
-        log.status = "success"
-        log.http_status = 200
-        log.first_token_ms = round((time.monotonic() - holder["started"]) * 1000, 1)
-        log.routes = winner.report or []
-        log.save()
-        api_key_service.record_result(user_key, True)
-        usage: dict = {}
-        for chunk in _drain(loop, winner):
-            try:
-                if chunk.startswith("data:"):
-                    payload = json.loads(chunk[5:].strip())
-                    if isinstance(payload, dict) and payload.get("usage"):
-                        usage = payload["usage"]
-            except Exception:  # noqa: BLE001
-                pass
-            yield chunk
-        log.duration_ms = round((time.monotonic() - holder["started"]) * 1000, 1)
-        log.prompt_tokens = usage.get("prompt_tokens", 0) or 0
-        log.completion_tokens = usage.get("completion_tokens", 0) or 0
-        log.total_tokens = usage.get("total_tokens", 0) or 0
-        log.cached_tokens = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
-        log.save()
+            except Exception as exc:  # noqa: BLE001
+                # 已向客户端输出过实际内容（delta 有 content/reasoning/tool_calls、
+                # 出现 finish_reason 或 [DONE]）则响应已提交、无法干净重试；
+                # 仅收到过心跳/空 delta 则本次线路视为失败，纳入自动重试。
+                if sent_content:
+                    raise
+                last_exc = exc
+                logger.info("stream attempt %d failed before any content, retrying: %s",
+                            attempt + 1, exc)
+            finally:
+                if w is not None:
+                    try:
+                        loop.run_until_complete(w.close())
+                    except Exception:  # noqa: BLE001
+                        pass
+        # 所有尝试均失败：竞速失败重建线路也无济于事，直接回上游错误
+        if isinstance(last_exc, NoRouteAvailable):
+            _finish_log(holder["log"], holder["started"], False, 503, "no_available_route")
+            api_key_service.record_result(user_key, False)
+            yield "data: " + json.dumps({
+                "error": {"message": "当前没有可用线路或所有线路均失败", "type": "api_error",
+                           "param": None, "code": "no_available_route"}
+            }) + "\n\n"
+        else:
+            report = getattr(last_exc, "report", None)
+            _finish_log(holder["log"], holder["started"], False, 502,
+                        "stream_error", routes=report)
+            api_key_service.record_result(user_key, False)
+            yield "data: " + json.dumps({
+                "error": {"message": "上游服务暂时不可用，请稍后重试", "type": "api_error",
+                           "param": None, "code": "stream_error"}
+            }) + "\n\n"
+        yield "data: [DONE]\n\n"
     except (NoRouteAvailable, AllRoutesFailed) as exc:
         report = exc.report if isinstance(exc, AllRoutesFailed) else None
         _finish_log(holder["log"], holder["started"], False, 503, "no_available_route",
