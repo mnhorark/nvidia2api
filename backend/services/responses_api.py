@@ -4,19 +4,25 @@
 请求体用 `input` 而非 `messages`、`max_output_tokens` 而非 `max_tokens`；
 流式事件是 `response.output_text.delta` 一类的对象事件，与 chat SSE 完全不同。
 
-本模块把平台内部的 chat 格式转成 Responses 请求，再把 Responses 的响应/流式
-事件转回 chat 格式，使上游差异对整个调用链（竞速、重试、日志）完全透明。
+本模块同时提供两个方向的转换：
+
+- 上游方向（平台内部 chat 格式 <-> 上游 Responses 端点）：竞速引擎统一以
+  chat 格式处理，路由端点若为 /responses 则自动转换请求/响应/SSE 事件；
+- 客户端方向（`/v1/responses` 入口）：把客户端 Responses 请求体转成内部
+  chat 请求体，再把内部 chat 结果转回 Responses 响应/SSE 事件流。
+
+这样上游差异与客户端协议差异对整个调用链（竞速、重试、日志）完全透明。
 """
 from __future__ import annotations
 
 import json
 import time
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Iterator
 
-# Responses API 支持并需透传的顶层参数白名单（chat 独有参数不下发，避免 400）
+# Responses API 支持并需透传的顶层参数白名单（chat 独有参数不下发，避免 400；
+# 实测某些上游会拒绝 seed/stop/tools 等，故只保留通用参数）
 _RESPONSES_ALLOWED = frozenset({
-    "model", "stream", "temperature", "top_p", "stop", "seed",
-    "tools", "tool_choice", "response_format", "reasoning",
+    "model", "stream", "temperature", "top_p",
 })
 
 
@@ -69,24 +75,27 @@ def _message_to_item(msg) -> dict:
                 "output": _content_to_text(content)}
     if role == "developer":
         role = "system"
+    # 上游 Responses 端点只接受 assistant 消息使用 output_text 内容类型
+    # （input_text 会 400：content type is not valid on assistant messages）
+    text_type = "output_text" if role == "assistant" else "input_text"
     if isinstance(content, str):
         return {"type": "message", "role": role,
-                "content": [{"type": "input_text", "text": content}]}
+                "content": [{"type": text_type, "text": content}]}
     if isinstance(content, list):
         parts = []
         for part in content:
             if not isinstance(part, dict):
                 continue
             ptype = part.get("type")
-            if ptype == "text":
-                parts.append({"type": "input_text", "text": str(part.get("text") or "")})
+            if ptype in ("text", "output_text", "input_text"):
+                parts.append({"type": text_type, "text": str(part.get("text") or "")})
             elif ptype == "image_url":
                 img = part.get("image_url") or {}
                 parts.append({"type": "input_image",
                               "image_url": str(img.get("url") or "")})
         return {"type": "message", "role": role, "content": parts}
     return {"type": "message", "role": role,
-            "content": [{"type": "input_text", "text": _content_to_text(content)}]}
+            "content": [{"type": text_type, "text": _content_to_text(content)}]}
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +141,85 @@ def responses_payload_to_chat(payload: dict) -> dict:
             "finish_reason": "tool_calls" if tool_calls else "stop",
         }],
         "usage": usage,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 客户端方向：/v1/responses 入口
+# ---------------------------------------------------------------------------
+
+def responses_to_chat_body(rb: dict) -> dict:
+    """把客户端 Responses API 请求体转成内部 chat/completions 请求体。
+
+    `/v1/responses` 入口用它归一化后复用整套竞速/重试/日志链路。
+    """
+    out: dict[str, Any] = {}
+    for key in ("model", "stream", "temperature", "top_p"):
+        if key in rb and rb[key] is not None:
+            out[key] = rb[key]
+    if rb.get("max_output_tokens") is not None:
+        out["max_tokens"] = rb["max_output_tokens"]
+    inp = rb.get("input")
+    if isinstance(inp, str):
+        out["messages"] = [{"role": "user", "content": inp}]
+    elif isinstance(inp, list):
+        out["messages"] = [_input_item_to_message(it) for it in inp]
+    return out
+
+
+def _input_item_to_message(item) -> dict:
+    """把一条 Responses input 条目转成 chat 消息。"""
+    if not isinstance(item, dict):
+        return {"role": "user", "content": str(item)}
+    itype = item.get("type")
+    if itype == "function_call_output":
+        return {"role": "tool", "tool_call_id": str(item.get("call_id") or ""),
+                "content": str(item.get("output") or "")}
+    if itype == "message" or itype is None:
+        role = str(item.get("role") or "user")
+        content = item.get("content")
+        if isinstance(content, list):
+            parts = []
+            for p in content:
+                if isinstance(p, dict) and p.get("type") in ("input_text", "output_text"):
+                    parts.append({"type": "text", "text": str(p.get("text") or "")})
+                elif isinstance(p, dict) and p.get("type") == "input_image":
+                    parts.append({"type": "image_url", "image_url": {
+                        "url": str(p.get("image_url") or "")}})
+            content = parts
+        return {"role": role, "content": content}
+    return {"role": "user", "content": str(item)}
+
+
+def chat_to_responses_payload(chat: dict) -> dict:
+    """把内部 chat.completion 非流式响应转成 Responses API 响应。"""
+    choices = chat.get("choices") or []
+    output: list[dict] = []
+    if choices:
+        ch = choices[0]
+        msg = ch.get("message") or {}
+        text = _content_to_text(msg.get("content"))
+        tool_calls = msg.get("tool_calls") or []
+        if text or not tool_calls:
+            output.append({"type": "message", "role": "assistant",
+                           "content": [{"type": "output_text", "text": text}]})
+        for tc in tool_calls:
+            fn = tc.get("function") or {}
+            output.append({"type": "function_call",
+                           "call_id": str(tc.get("id") or ""),
+                           "name": str(fn.get("name") or ""),
+                           "arguments": str(fn.get("arguments") or "")})
+    status = "incomplete"
+    if choices and choices[0].get("finish_reason") == "stop":
+        status = "completed"
+    return {
+        "id": str(chat.get("id") or "resp_x"),
+        "object": "response",
+        "created_at": int(chat.get("created", 0) or time.time()),
+        "status": status,
+        "model": str(chat.get("model") or ""),
+        "output": output,
+        "usage": chat.get("usage") or {},
     }
 
 
@@ -244,4 +332,77 @@ async def iter_responses_sse(first_line: str, aiter,
         else:
             yield "data: " + translated + "\n\n"
     if not saw_done:
+        yield "data: [DONE]\n\n"
+
+
+# ---------------------------------------------------------------------------
+# 流式事件：chat SSE -> responses SSE（/v1/responses 出口）
+# ---------------------------------------------------------------------------
+
+def _sse_event(name: str, obj: dict) -> str:
+    return f"event: {name}\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+def iter_chat_sse_as_responses(chat_iter: Iterator[str]) -> Iterator[str]:
+    """把内部 chat 格式的 SSE 行流转成 Responses API SSE 事件流。"""
+    emitted_created = False
+    done_sent = False
+    usage: dict = {}
+    for chunk in chat_iter:
+        if not chunk.startswith("data:"):
+            continue
+        payload = chunk[5:].strip().rstrip("\n")
+        if payload == "[DONE]":
+            if not done_sent:
+                yield "data: [DONE]\n\n"
+                done_sent = True
+            return
+        try:
+            data = json.loads(payload)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("error"):
+            yield _sse_event("response.failed",
+                             {"type": "response.failed", "error": data["error"]})
+            continue
+        choices = data.get("choices") or []
+        if not choices:
+            continue
+        ch = choices[0]
+        if not emitted_created:
+            emitted_created = True
+            yield _sse_event("response.created", {
+                "type": "response.created",
+                "response": {"id": data.get("id") or "resp_x", "object": "response",
+                             "status": "in_progress", "model": data.get("model") or ""},
+            })
+        delta = ch.get("delta") or {}
+        if delta.get("content"):
+            yield _sse_event("response.output_text.delta", {
+                "type": "response.output_text.delta", "output_index": 0,
+                "delta": str(delta["content"]),
+            })
+        tool_calls = delta.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                fn = tc.get("function") or {}
+                yield _sse_event("response.function_call_arguments.delta", {
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": 0, "item_id": str(tc.get("id") or ""),
+                    "delta": str(fn.get("arguments") or ""),
+                })
+        if data.get("usage"):
+            usage = data["usage"]
+        finish = ch.get("finish_reason")
+        if finish:
+            status = "completed" if finish == "stop" else "incomplete"
+            yield _sse_event("response.completed", {
+                "type": "response.completed",
+                "response": {"id": data.get("id") or "resp_x", "object": "response",
+                             "status": status, "model": data.get("model") or "",
+                             "usage": usage},
+            })
+    if not done_sent:
         yield "data: [DONE]\n\n"

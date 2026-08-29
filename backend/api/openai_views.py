@@ -12,7 +12,7 @@ from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.core.models import AIModel, RequestLog
-from services import api_key_service, channel_service, key_service, model_registry, sysconfig, thinking
+from services import api_key_service, channel_service, key_service, model_registry, responses_api, sysconfig, thinking
 from services.load_balancer import build_routes
 from services.race_engine import (
     AllRoutesFailed, NoRouteAvailable, race_chat, race_stream,
@@ -96,23 +96,36 @@ def _build_upstream_body(body: dict, model_name: str) -> dict:
     return upstream
 
 
-@csrf_exempt
-def chat_completions(request, channel_slug: str | None = None):
-    if request.method != "POST":
-        return openai_error("Method not allowed", "method_not_allowed", 405)
-
+def _authorize(request):
+    """校验用户 API Key 与限流；返回 (user_key, error_response)。"""
     user_key = _authenticate(request)
     if user_key is None:
-        return openai_error("Invalid API key", "invalid_api_key", 401, "authentication_error")
+        return None, openai_error("Invalid API key", "invalid_api_key", 401, "authentication_error")
     if not user_key.enabled:
-        return openai_error("API key disabled", "key_disabled", 403, "authentication_error")
-
+        return None, openai_error("API key disabled", "key_disabled", 403, "authentication_error")
     ok, reason = api_key_service.check_and_count(user_key)
     if not ok:
         if reason == "rate_limited":
-            return openai_error("Rate limit exceeded", "rate_limit_exceeded", 429)
-        return openai_error("API key disabled", "key_disabled", 403, "authentication_error")
+            return None, openai_error("Rate limit exceeded", "rate_limit_exceeded", 429)
+        return None, openai_error("API key disabled", "key_disabled", 403, "authentication_error")
+    return user_key, None
 
+
+def _parse_body(request):
+    try:
+        return json.loads(request.body.decode("utf-8") or "{}")
+    except json.JSONDecodeError:
+        return None
+
+
+def _run_authed(user_key, body, channel_slug, protocol):
+    """核心执行：校验 -> 建路由 -> 竞速(带重试) -> 按协议返回结果。
+
+    `protocol`: "chat" | "responses"。内部一律以 chat 格式处理，
+    responses 协议在入口(responses_to_chat_body)与出口(响应/SSE 转换)
+    做格式转换，其余（竞速、重试、日志、限流）完全复用。
+    调用方已持有 _request_semaphore，此处负责释放。
+    """
     if not _request_semaphore.acquire(blocking=False):
         return openai_error("Server busy, too many concurrent requests",
                             "server_overloaded", 429)
@@ -120,14 +133,6 @@ def chat_completions(request, channel_slug: str | None = None):
     # 流式响应由 _stream_response 生成器在结束时释放信号量（覆盖客户端断开）。
     semaphore_released_by_stream = False
     try:
-        try:
-            body = json.loads(request.body.decode("utf-8") or "{}")
-        except json.JSONDecodeError:
-            return openai_error("Invalid JSON body", "invalid_request", 400, "invalid_request_error")
-
-        if len(request.body) > 4 * 1024 * 1024:
-            return openai_error("Request body too large", "payload_too_large", 413)
-
         # 渠道优先级：URL 前缀 > 请求体里的 channel 字段 > 按 model 名跨渠道解析
         requested_name = body.get("model", "")
         messages = body.get("messages")
@@ -175,11 +180,13 @@ def chat_completions(request, channel_slug: str | None = None):
         if stream:
             log_id_holder = {"log": log, "started": started}
             semaphore_released_by_stream = True
-            resp = _stream_response(routes, upstream_body, log_id_holder,
-                                    user_key, channel, max_attempts,
-                                    proxy_group=model.proxy_group_id,
-                                    endpoint=model.endpoint)
-            response = StreamingHttpResponse(resp, content_type="text/event-stream")
+            gen = _stream_response(routes, upstream_body, log_id_holder,
+                                   user_key, channel, max_attempts,
+                                   proxy_group=model.proxy_group_id,
+                                   endpoint=model.endpoint)
+            if protocol == "responses":
+                gen = responses_api.iter_chat_sse_as_responses(gen)
+            response = StreamingHttpResponse(gen, content_type="text/event-stream")
             response["Cache-Control"] = "no-cache"
             response["X-Accel-Buffering"] = "no"
             return response
@@ -217,10 +224,52 @@ def chat_completions(request, channel_slug: str | None = None):
                     proxy_ip=(r.proxy.public_ip if r.proxy else ""),
                     usage=usage, routes=result.report or [])
         api_key_service.record_result(user_key, True)
-        return JsonResponse(result.payload, status=200)
+        payload = result.payload
+        if protocol == "responses":
+            payload = responses_api.chat_to_responses_payload(payload)
+        return JsonResponse(payload, status=200)
     finally:
         if not semaphore_released_by_stream:
             _request_semaphore.release()
+
+
+@csrf_exempt
+def chat_completions(request, channel_slug: str | None = None):
+    """POST /v1/chat/completions —— Chat Completions 协议。"""
+    if request.method != "POST":
+        return openai_error("Method not allowed", "method_not_allowed", 405)
+    user_key, err = _authorize(request)
+    if err:
+        return err
+    body = _parse_body(request)
+    if body is None:
+        return openai_error("Invalid JSON body", "invalid_request", 400, "invalid_request_error")
+    if len(request.body) > 4 * 1024 * 1024:
+        return openai_error("Request body too large", "payload_too_large", 413)
+    return _run_authed(user_key, body, channel_slug, "chat")
+
+
+@csrf_exempt
+def responses(request, channel_slug: str | None = None):
+    """POST /v1/responses —— Responses API 协议。
+
+    客户端请求体(input/max_output_tokens)转成内部 chat 后复用整套链路，
+    出口再转回 Responses 响应/SSE 事件流。
+    """
+    if request.method != "POST":
+        return openai_error("Method not allowed", "method_not_allowed", 405)
+    user_key, err = _authorize(request)
+    if err:
+        return err
+    body = _parse_body(request)
+    if body is None:
+        return openai_error("Invalid JSON body", "invalid_request", 400, "invalid_request_error")
+    if len(request.body) > 4 * 1024 * 1024:
+        return openai_error("Request body too large", "payload_too_large", 413)
+    chat_body = responses_api.responses_to_chat_body(body)
+    if not isinstance(chat_body.get("messages"), list) or not chat_body.get("messages"):
+        return openai_error("input is required", "invalid_request", 400, "invalid_request_error")
+    return _run_authed(user_key, chat_body, channel_slug, "responses")
 
 
 # 只有"最终答案内容"才算已提交：content（正文）与 tool_calls（已承诺的

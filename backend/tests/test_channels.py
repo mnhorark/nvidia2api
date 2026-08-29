@@ -638,6 +638,127 @@ class _FakeStreamWinner:
         pass
 
 
+class ResponsesEndpointTests(TransactionTestCase):
+    """/v1/responses —— Responses API 协议入口（非流式/流式、格式转换）。"""
+
+    def setUp(self):
+        self.channel = Channel.objects.create(
+            name="NVIDIA", slug="nvidia", base_url="https://n.test/v1",
+            is_default=True)
+        ChannelKey.objects.create(channel=self.channel, name="k1", api_key="k1")
+        AIModel.objects.create(channel=self.channel, model_name="m1", enabled=True)
+        _user, self.raw_key = api_key_service.create_key("tester")
+
+    def _call(self, body):
+        request = RequestFactory().post(
+            "/v1/responses",
+            data=json.dumps(body),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {self.raw_key}")
+        return openai_views.responses(request)
+
+    @staticmethod
+    def _ok_result():
+        from unittest.mock import MagicMock
+        r = MagicMock()
+        r.route.kind = "direct"
+        r.route.key.name = "k1"
+        r.route.proxy = None
+        r.http_status = 200
+        r.payload = {
+            "id": "chatcmpl-1", "object": "chat.completion", "created": 123,
+            "model": "m1",
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": "hi there"},
+                         "finish_reason": "stop"}],
+            "usage": {"total_tokens": 3},
+        }
+        r.report = []
+        return r
+
+    def test_non_stream_returns_responses_format(self):
+        with patch.object(openai_views, "race_chat", return_value=self._ok_result()):
+            resp = self._call({"model": "m1", "input": "hi", "stream": False})
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.content)
+        self.assertEqual(data["object"], "response")
+        self.assertEqual(data["status"], "completed")
+        self.assertEqual(data["output"][0]["type"], "message")
+        self.assertEqual(data["output"][0]["content"][0]["text"], "hi there")
+
+    def test_string_input_becomes_user_message(self):
+        with patch.object(openai_views, "race_chat", return_value=self._ok_result()) as m:
+            resp = self._call({"model": "m1", "input": "hello", "stream": False})
+        self.assertEqual(resp.status_code, 200)
+        sent = m.call_args[0][1]
+        self.assertEqual(sent["messages"], [{"role": "user", "content": "hello"}])
+
+    def test_max_output_tokens_maps_to_max_tokens(self):
+        with patch.object(openai_views, "race_chat", return_value=self._ok_result()) as m:
+            resp = self._call({"model": "m1", "input": "hi",
+                               "max_output_tokens": 512, "stream": False})
+        self.assertEqual(resp.status_code, 200)
+        sent = m.call_args[0][1]
+        self.assertEqual(sent["max_tokens"], 512)
+        self.assertNotIn("seed", sent)
+
+    def test_missing_input_returns_400(self):
+        resp = self._call({"model": "m1"})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_stream_returns_responses_sse(self):
+        ok_chunk = ('data: {"id":"c1","choices":[{"delta":{"role":"assistant",'
+                    '"content":"he"}}]}\n\n')
+        done_chunk = "data: [DONE]\n\n"
+        fake = _FakeStreamWinner(chunks=[ok_chunk, done_chunk])
+
+        async def fake_race_stream(*args, **kwargs):
+            return fake
+
+        with patch.object(openai_views, "race_stream", new=fake_race_stream):
+            resp = self._call({"model": "m1", "input": "hi", "stream": True})
+            # streaming_content 是惰性生成器，必须在 patch 生效期间消费
+            body = b"".join(list(resp.streaming_content)).decode()
+        self.assertIn("event: response.created", body)
+        self.assertIn("event: response.output_text.delta", body)
+        self.assertIn('"delta": "he"', body)
+        self.assertIn("data: [DONE]", body)
+
+
+class ResponsesTranslateTests(TestCase):
+    """responses_api 双向转换：assistant 消息 / 参数过滤 / 请求-响应互转。"""
+
+    def test_assistant_message_uses_output_text(self):
+        from services import responses_api
+        out = responses_api.chat_to_responses_body({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"},
+                         {"role": "assistant", "content": "yo"}]})
+        self.assertEqual(out["input"][0]["content"][0]["type"], "input_text")
+        self.assertEqual(out["input"][1]["content"][0]["type"], "output_text")
+
+    def test_unsupported_params_dropped(self):
+        from services import responses_api
+        out = responses_api.chat_to_responses_body({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "seed": 1, "stop": ["x"], "temperature": 0.5, "max_tokens": 100})
+        self.assertNotIn("seed", out)
+        self.assertNotIn("stop", out)
+        self.assertEqual(out["temperature"], 0.5)
+        self.assertEqual(out["max_output_tokens"], 100)
+
+    def test_responses_input_to_messages_roundtrip(self):
+        from services import responses_api
+        chat = responses_api.responses_to_chat_body({
+            "model": "m",
+            "input": [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": "hi"}]},
+                      {"type": "function_call_output", "call_id": "c1", "output": "42"}]})
+        self.assertEqual(chat["messages"][0]["role"], "user")
+        self.assertEqual(chat["messages"][1]["role"], "tool")
+        self.assertEqual(chat["messages"][1]["tool_call_id"], "c1")
+
+
 class BatchApiTests(TestCase):
     """模型/代理批量操作接口。"""
 

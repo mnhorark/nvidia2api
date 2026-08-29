@@ -26,10 +26,12 @@ class ParseTests(TestCase):
     def test_top_level_thinking_bool(self):
         spec = parse({"thinking": True})
         self.assertTrue(spec.enabled)
+        out = to_upstream(spec, "deepseek-ai/deepseek-r1")
         self.assertEqual(
-            to_upstream(spec, "deepseek-ai/deepseek-r1"),
-            {"chat_template_kwargs": {"thinking": True, "enable_thinking": True}},
+            out["chat_template_kwargs"], {"thinking": True, "enable_thinking": True},
         )
+        # 客户端只开启思考未指定档位时，自动映射默认档位(default_thinking_effort)
+        self.assertEqual(out["reasoning_effort"], "max")
 
     def test_top_level_enable_thinking(self):
         spec = parse({"enable_thinking": False})

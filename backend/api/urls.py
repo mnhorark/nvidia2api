@@ -8,8 +8,10 @@ urlpatterns = [
     # /c/<slug>/v1/*             -> 指定渠道，例如 /c/zen/v1/chat/completions
     path("v1/models", openai_views.list_models),
     path("v1/chat/completions", openai_views.chat_completions),
+    path("v1/responses", openai_views.responses),
     path("c/<slug:channel_slug>/v1/models", openai_views.list_models),
     path("c/<slug:channel_slug>/v1/chat/completions", openai_views.chat_completions),
+    path("c/<slug:channel_slug>/v1/responses", openai_views.responses),
 
     # Admin
     path("api/admin/login", admin_views.LoginView.as_view()),
