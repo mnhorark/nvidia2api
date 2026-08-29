@@ -138,11 +138,17 @@ def report_proxy_result(proxy_id: int, success: bool, latency_ms: float | None =
             ])
 
 
-def schedulable_proxies(channel: Channel) -> list[Proxy]:
-    """Enabled, not in cooldown, healthy-ish proxies, best first."""
+def schedulable_proxies(channel: Channel, group: int | None = None) -> list[Proxy]:
+    """Enabled, not in cooldown, healthy-ish proxies, best first.
+
+    `group` 非空时仅返回该分组内的代理；分组内无代理时返回空列表。
+    """
     now = timezone.now()
     out = []
-    for p in channel.proxies.filter(enabled=True).select_related("group"):
+    qs = channel.proxies.filter(enabled=True).select_related("group")
+    if group is not None:
+        qs = qs.filter(group_id=group)
+    for p in qs:
         if p.cooldown_until and p.cooldown_until > now:
             continue
         if p.status == ProxyStatus.UNHEALTHY:
