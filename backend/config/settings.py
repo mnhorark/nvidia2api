@@ -2,11 +2,47 @@ import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = BASE_DIR.parent
+
+
+def _load_env_file(path: Path) -> None:
+    """Load KEY=VALUE pairs from a .env file into os.environ (stdlib only).
+
+    Existing environment variables take precedence, so .env only supplies
+    values that were not already set by the shell / launcher.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        pass
+
+
+_load_env_file(PROJECT_ROOT / ".env")
+
+
+def _resolve_path(path) -> Path:
+    """Resolve a possibly-relative path against the project root.
+
+    Keeps .env values like DATA_DIR=./data stable no matter where the
+    server process is launched from.
+    """
+    p = Path(path)
+    return p if p.is_absolute() else PROJECT_ROOT / p
+
 
 # The race engine performs short, serialized SQLite writes from an asyncio
 # (single-thread) event loop. DB calls are brief and safe here.
 os.environ.setdefault("DJANGO_ALLOW_ASYNC_UNSAFE", "true")
-DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR.parent / "data"))
+DATA_DIR = _resolve_path(os.environ.get("DATA_DIR", "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-insecure-secret-change-me")
@@ -31,7 +67,7 @@ ROOT_URLCONF = "config.urls"
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
-        "NAME": os.environ.get("DATABASE_PATH", str(DATA_DIR / "db.sqlite3")),
+        "NAME": str(_resolve_path(os.environ.get("DATABASE_PATH", DATA_DIR / "db.sqlite3"))),
         # Serialize writers & allow lock waits: protects per-key RPM counters under concurrency.
         "OPTIONS": {"timeout": 30},
         "TEST": {"NAME": str(DATA_DIR / "test_db.sqlite3")},
