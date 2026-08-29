@@ -126,7 +126,8 @@ class RequestLogSerializer(serializers.ModelSerializer):
                   "status", "http_status", "error_type", "winner_route_type",
                   "winner_key_name", "winner_proxy_name", "proxy_public_ip", "is_stream",
                   "routes_count", "prompt_tokens", "completion_tokens", "total_tokens",
-                  "cached_tokens", "first_token_ms", "routes"]
+                  "cached_tokens", "first_token_ms", "routes", "client_thinking",
+                  "upstream_thinking"]
 
 
 class SettingSerializer(serializers.ModelSerializer):

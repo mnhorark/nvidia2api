@@ -86,6 +86,24 @@ def _as_bool(value) -> bool | None:
     return None
 
 
+def _thinking_from_value(value) -> tuple[bool | None, int | None]:
+    """把 thinking 参数的各种客户端形态解析为 (enabled, budget)。
+
+    - 布尔 / "enabled" / "on" ...
+    - Anthropic 风格 dict: {"type": "enabled"|"disabled", "budget_tokens": N}
+    - 数字：>0 视为开启（保留原数字档位语义由调用方处理）
+    """
+    if isinstance(value, dict):
+        t = str(value.get("type") or "").strip().lower()
+        if t == "enabled":
+            return True, _as_int(value.get("budget_tokens"))
+        if t == "disabled":
+            return False, None
+        return None, None
+    flag = _as_bool(value)
+    return flag, None
+
+
 def _as_int(value) -> int | None:
     if value is None or isinstance(value, bool):
         return None
@@ -149,9 +167,11 @@ def parse(payload) -> ThinkingSpec:
     if isinstance(kwargs, dict):
         for key, value in kwargs.items():
             if key in _KWARG_SWITCH_KEYS:
-                flag = _as_bool(value)
+                flag, budget = _thinking_from_value(value)
                 if flag is not None and spec.enabled is None:
                     spec.enabled = flag
+                    if budget is not None and spec.budget is None:
+                        spec.budget = budget
             elif key in _KWARG_EFFORT_KEYS:
                 effort = _normalize_effort(value)
                 if effort and spec.effort is None:
@@ -165,9 +185,11 @@ def parse(payload) -> ThinkingSpec:
 
     # 2) 顶层开关
     for key in _TOP_SWITCH_KEYS:
-        flag = _as_bool(src.get(key))
+        flag, budget = _thinking_from_value(src.get(key))
         if flag is not None and spec.enabled is None:
             spec.enabled = flag
+            if budget is not None and spec.budget is None:
+                spec.budget = budget
 
     # 3) 顶层档位与预算
     effort = _normalize_effort(src.get("reasoning_effort"))
@@ -217,6 +239,12 @@ def _is_stripped(model_name: str) -> bool:
     return False
 
 
+def _default_effort() -> str:
+    """客户端只开启思考但未指定档位时使用的默认档位。"""
+    from services import sysconfig
+    return str(sysconfig.get("default_thinking_effort") or "medium").strip().lower()
+
+
 def to_upstream(spec: ThinkingSpec, model_name: str = "") -> dict:
     """把思考意图转成上游 body 片段；无需下发时返回空 dict。"""
     if not spec.is_set():
@@ -238,6 +266,11 @@ def to_upstream(spec: ThinkingSpec, model_name: str = "") -> dict:
         out["chat_template_kwargs"] = kwargs
     if spec.effort:
         out["reasoning_effort"] = spec.effort
+    elif spec.enabled is True:
+        # 客户端只开启思考未指定档位时，自动映射默认档位（如 Trae 只传 {"type":"enabled"}）
+        effort = _default_effort()
+        if effort and effort != "off":
+            out["reasoning_effort"] = effort
     if spec.budget is not None:
         out["reasoning_budget"] = spec.budget
     return out

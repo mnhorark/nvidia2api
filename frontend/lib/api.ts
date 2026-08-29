@@ -254,6 +254,10 @@ export interface RequestLog {
   cached_tokens?: number;
   first_token_ms?: number;
   created_at: string;
+  // 客户端实际传入的思考参数
+  client_thinking?: Record<string, unknown>;
+  // 实际下发到上游的思考强度参数
+  upstream_thinking?: Record<string, unknown>;
 }
 
 export interface DashboardStats {

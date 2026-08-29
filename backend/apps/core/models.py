@@ -346,6 +346,10 @@ class RequestLog(models.Model):
     first_token_ms = models.FloatField(null=True, blank=True)  # 首 chunk 耗时（TTFT）
     # Full per-route outcome of the race: winner / failed / cancelled
     routes = models.JSONField(default=list, blank=True)
+    # 客户端实际传入的思考参数（原始形态，含 extra_body 透传）
+    client_thinking = models.JSONField(default=dict, blank=True)
+    # 实际下发到上游的思考强度参数（reasoning_effort / reasoning_budget / chat_template_kwargs）
+    upstream_thinking = models.JSONField(default=dict, blank=True)
 
     class Meta:
         db_table = "request_log"

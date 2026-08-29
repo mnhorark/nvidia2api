@@ -1004,10 +1004,12 @@ class AdminChatView(AdminRequiredMixin, APIView):
         from services.race_engine import AllRoutesFailed, NoRouteAvailable, race_chat
         from services import key_service as ks
 
-        channel = channel_service.resolve(
-            (request.data.get("channel") or "").strip() or None)
-        if channel is None:
-            channel = current_channel(request)
+        channel_param = (request.data.get("channel") or "").strip()
+        # 优先请求体里的 channel 字段，其次 X-Channel 头（当前渠道作用域）
+        channel = (
+            channel_service.resolve(channel_param) if channel_param
+            else current_channel(request)
+        )
 
         model = (request.data.get("model") or "").strip()
         prompt = request.data.get("prompt")
@@ -1017,7 +1019,8 @@ class AdminChatView(AdminRequiredMixin, APIView):
         if not model or not messages:
             return Response({"error": {"message": "model and prompt/messages required",
                                        "code": "bad_request"}}, status=400)
-        if not channel.models.filter(model_name=model, enabled=True).exists():
+        model_rec = channel.models.filter(model_name=model).first()
+        if not model_rec or not model_rec.enabled:
             return Response({"error": {"message": f"模型 {model} 不存在或未启用",
                                        "code": "model_not_found"}}, status=404)
 
@@ -1029,14 +1032,26 @@ class AdminChatView(AdminRequiredMixin, APIView):
         body["messages"] = messages
         body.update(thinking.build_upstream(request.data, model))
 
-        if request.data.get("stream"):
-            return self._stream(body, model, channel)
+        # 记录思考参数：客户端原始传入 + 实际下发到上游，供日志页排查
+        client_thinking = {
+            k: request.data.get(k) for k in thinking.THINKING_PARAM_KEYS
+            if k in request.data and request.data.get(k) is not None
+        }
+        upstream_thinking = thinking.build_upstream(request.data, model)
+        proxy_group = model_rec.proxy_group_id if model_rec else None
 
-        routes = build_routes(channel)
+        if request.data.get("stream"):
+            return self._stream(body, model, channel, proxy_group=proxy_group,
+                                client_thinking=client_thinking,
+                                upstream_thinking=upstream_thinking)
+
+        routes = build_routes(channel, proxy_group=proxy_group)
         started = timezone.now().timestamp()
         request_id = ks.new_request_id()
         log = RequestLog.objects.create(channel=channel, request_id=request_id, model=model,
-                                        routes_count=len(routes))
+                                        routes_count=len(routes),
+                                        client_thinking=client_thinking,
+                                        upstream_thinking=upstream_thinking)
         if not routes:
             log.status, log.http_status, log.error_type = "error", 503, "no_available_route"
             log.save()
@@ -1089,7 +1104,8 @@ class AdminChatView(AdminRequiredMixin, APIView):
             },
         })
 
-    def _stream(self, body, model, channel):
+    def _stream(self, body, model, channel, proxy_group=None,
+                client_thinking=None, upstream_thinking=None):
         """SSE: race streaming connections, first valid chunk wins, rest cancelled.
 
         Emits a leading `data: {"meta": {...}}` event describing the winning route,
@@ -1104,11 +1120,12 @@ class AdminChatView(AdminRequiredMixin, APIView):
         from services.load_balancer import build_routes
         from services.race_engine import AllRoutesFailed, NoRouteAvailable, race_stream
 
-        routes = build_routes(channel)
+        routes = build_routes(channel, proxy_group=proxy_group)
         request_id = ks.new_request_id()
         log = RequestLog.objects.create(
             channel=channel, request_id=request_id, model=model,
-            routes_count=len(routes), is_stream=True
+            routes_count=len(routes), is_stream=True,
+            client_thinking=client_thinking or {}, upstream_thinking=upstream_thinking or {},
         )
         # Ask upstream for usage in the last SSE chunk so we can record tokens.
         body = dict(body)

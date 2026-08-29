@@ -28,6 +28,7 @@ RUNTIME_PARAMS: dict[str, tuple[str, object, str]] = {
     "key_cooldown_seconds": ("int", 60, "渠道 Key 失败后冷却时间（秒）"),
     "thinking_passthrough": ("bool", True, "透传客户端的思考强度参数（reasoning_effort / chat_template_kwargs 等）"),
     "thinking_strip_models": ("str", "", "不支持思考参数的模型名子串，英文逗号分隔；命中时剥离思考参数"),
+    "default_thinking_effort": ("str", "max", "客户端只开启思考但未指定档位时，自动映射的思考强度（off/low/medium/high/max）"),
 }
 
 # 兼容旧库里已经写入的 key
