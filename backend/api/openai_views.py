@@ -12,7 +12,7 @@ from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.core.models import AIModel, RequestLog
-from services import api_key_service, channel_service, key_service, model_registry, thinking
+from services import api_key_service, channel_service, key_service, model_registry, sysconfig, thinking
 from services.load_balancer import build_routes
 from services.race_engine import (
     AllRoutesFailed, NoRouteAvailable, race_chat, race_stream,
@@ -158,23 +158,43 @@ def chat_completions(request, channel_slug: str | None = None):
             return openai_error("当前没有可用线路（该渠道没有可用的 Key）",
                                 "no_available_route", 503)
 
+        # 自动重试:竞速失败时重建线路再试(retry_count 系统参数,上限 5)
+        retries = max(0, min(int(sysconfig.get("retry_count", channel) or 0), 5))
+        max_attempts = 1 + retries
+
         if stream:
             log_id_holder = {"log": log, "started": started}
             semaphore_released_by_stream = True
-            resp = _stream_response(routes, upstream_body, log_id_holder, user_key)
+            resp = _stream_response(routes, upstream_body, log_id_holder,
+                                    user_key, channel, max_attempts)
             response = StreamingHttpResponse(resp, content_type="text/event-stream")
             response["Cache-Control"] = "no-cache"
             response["X-Accel-Buffering"] = "no"
             return response
 
-        try:
-            result = race_chat(routes, upstream_body)
-        except NoRouteAvailable:
-            _finish_log(log, started, False, 503, "no_available_route")
-            return openai_error("当前没有可用线路", "no_available_route", 503)
-        except AllRoutesFailed as exc:
-            logger.warning("all routes failed: %s", exc)
-            _finish_log(log, started, False, 502, "all_routes_failed", routes=exc.report)
+        result = None
+        last_exc: Exception | None = None
+        for attempt in range(max_attempts):
+            attempt_routes = routes if attempt == 0 else build_routes(channel)
+            if not attempt_routes:
+                last_exc = NoRouteAvailable()
+                continue
+            try:
+                result = race_chat(attempt_routes, upstream_body)
+                break
+            except (NoRouteAvailable, AllRoutesFailed) as exc:
+                last_exc = exc
+                if attempt + 1 < max_attempts:
+                    logger.info("request %s attempt %d failed, retrying: %s",
+                                request_id, attempt + 1, exc)
+        if result is None:
+            if isinstance(last_exc, NoRouteAvailable):
+                _finish_log(log, started, False, 503, "no_available_route")
+                return openai_error("当前没有可用线路", "no_available_route", 503)
+            report = getattr(last_exc, "report", None) or []
+            logger.warning("all routes failed after %d attempt(s): %s",
+                           max_attempts, last_exc)
+            _finish_log(log, started, False, 502, "all_routes_failed", routes=report)
             return openai_error("上游服务暂时不可用，请稍后重试", "upstream_error", 502)
 
         r = result.route
@@ -190,12 +210,25 @@ def chat_completions(request, channel_slug: str | None = None):
             _request_semaphore.release()
 
 
-def _stream_response(routes, upstream_body, holder, user_key):
+def _stream_response(routes, upstream_body, holder, user_key, channel,
+                     max_attempts: int = 1):
     import asyncio
 
     async def produce():
         from services.race_engine import race_stream
-        return await race_stream(routes, upstream_body)
+        last: Exception | None = None
+        for attempt in range(max_attempts):
+            rs = routes if attempt == 0 else build_routes(channel)
+            if not rs:
+                last = NoRouteAvailable()
+                continue
+            try:
+                return await race_stream(rs, upstream_body)
+            except (NoRouteAvailable, AllRoutesFailed) as exc:
+                last = exc
+                logger.info("stream attempt %d failed, retrying: %s",
+                            attempt + 1, exc)
+        raise last or NoRouteAvailable()
 
     winner = None
     loop = asyncio.new_event_loop()

@@ -390,6 +390,65 @@ class DashboardUsageAggregateTests(TestCase):
         self.assertEqual(resp.status_code, 400)
 
 
+class RetryTests(TransactionTestCase):
+    """retry_count 系统参数:竞速全部失败后自动重建线路重试。"""
+
+    def setUp(self):
+        self.channel = Channel.objects.create(
+            name="NVIDIA", slug="nvidia", base_url="https://n.test/v1",
+            is_default=True)
+        ChannelKey.objects.create(channel=self.channel, name="k1", api_key="k1")
+        AIModel.objects.create(channel=self.channel, model_name="m1", enabled=True)
+        _user, self.raw_key = api_key_service.create_key("tester")
+
+    def _call(self):
+        request = RequestFactory().post(
+            "/v1/chat/completions",
+            data=json.dumps({"model": "m1",
+                             "messages": [{"role": "user", "content": "hi"}]}),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {self.raw_key}")
+        return openai_views.chat_completions(request)
+
+    @staticmethod
+    def _ok_result():
+        from unittest.mock import MagicMock
+        r = MagicMock()
+        r.route.kind = "direct"
+        r.route.key.name = "k1"
+        r.route.proxy = None
+        r.http_status = 200
+        r.payload = {"choices": [], "usage": {}}
+        r.report = []
+        return r
+
+    def test_retry_succeeds_on_second_attempt(self):
+        from services import sysconfig
+        sysconfig.set_params({"retry_count": 2}, self.channel)
+        with patch.object(openai_views, "race_chat",
+                          side_effect=[race_engine_module.AllRoutesFailed(["boom"]),
+                                       self._ok_result()]) as m:
+            resp = self._call()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(m.call_count, 2)
+
+    def test_no_retry_by_default(self):
+        with patch.object(openai_views, "race_chat",
+                          side_effect=race_engine_module.AllRoutesFailed(["boom"])) as m:
+            resp = self._call()
+        self.assertEqual(resp.status_code, 502)
+        self.assertEqual(m.call_count, 1)
+
+    def test_retry_exhausted_returns_502(self):
+        from services import sysconfig
+        sysconfig.set_params({"retry_count": 2}, self.channel)
+        with patch.object(openai_views, "race_chat",
+                          side_effect=race_engine_module.AllRoutesFailed(["boom"])) as m:
+            resp = self._call()
+        self.assertEqual(resp.status_code, 502)
+        self.assertEqual(m.call_count, 3)
+
+
 class BatchApiTests(TestCase):
     """模型/代理批量操作接口。"""
 

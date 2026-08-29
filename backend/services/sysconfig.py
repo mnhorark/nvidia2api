@@ -18,6 +18,7 @@ from apps.core.models import SystemSetting
 RUNTIME_PARAMS: dict[str, tuple[str, object, str]] = {
     "default_upstream_rpm": ("int", lambda: settings.DEFAULT_NVIDIA_RPM, "渠道 Key 默认每分钟请求数"),
     "max_routes_per_request": ("int", lambda: settings.MAX_ROUTES_PER_REQUEST, "单次请求最大并行线路数"),
+    "retry_count": ("int", 0, "请求失败后的自动重试次数（竞速全部失败后重试，上限 5，0=不重试）"),
     "proxy_timeout": ("float", lambda: settings.PROXY_TIMEOUT, "代理测速超时（秒）"),
     "upstream_connect_timeout": ("float", lambda: settings.UPSTREAM_CONNECT_TIMEOUT, "上游连接超时（秒）"),
     "upstream_read_timeout": ("float", lambda: settings.UPSTREAM_READ_TIMEOUT, "上游读超时（秒）"),
