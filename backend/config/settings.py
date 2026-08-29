@@ -47,6 +47,11 @@ REST_FRAMEWORK = {
 }
 
 CORS_ALLOW_ALL_ORIGINS = True
+# 前端统一携带 X-Channel 头；django-cors-headers 默认列表不含它，需显式放行
+CORS_ALLOW_HEADERS = [
+    "accept", "accept-encoding", "authorization", "content-type", "dnt",
+    "origin", "user-agent", "x-csrftoken", "x-requested-with", "x-channel",
+]
 
 # --- nvidia2api settings ---
 NVIDIA_BASE_URL = os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
