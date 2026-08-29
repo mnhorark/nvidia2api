@@ -138,6 +138,17 @@ export default function ProxiesPage() {
     );
   }
 
+  /** 反选：选中当前未选中的行 */
+  function invertSelection() {
+    setSelected((prev) => {
+      const next = new Set<number>();
+      for (const p of proxies) {
+        if (!prev.has(p.id)) next.add(p.id);
+      }
+      return next;
+    });
+  }
+
   async function batch(action: "enable" | "disable" | "delete" | "test") {
     if (selected.size === 0) return;
     if (action === "delete" && !confirm(`确认删除选中的 ${selected.size} 个代理？`)) return;
@@ -257,6 +268,7 @@ export default function ProxiesPage() {
           <Button disabled={batchBusy} onClick={() => batch("delete")}>
             <Trash2 size={14} /> 批量删除
           </Button>
+          <Button disabled={selected.size === 0} onClick={invertSelection}>反选</Button>
           <Button onClick={() => setSelected(new Set())}>取消选择</Button>
         </div>
       )}

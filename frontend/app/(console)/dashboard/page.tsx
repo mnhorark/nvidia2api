@@ -78,7 +78,7 @@ function SectionTitle({ children }: { children: React.ReactNode }) {
 export default function DashboardPage() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [usage, setUsage] = useState<UsageResponse | null>(null);
-  const [days, setDays] = useState(7);
+  const [days, setDays] = useState(1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -86,9 +86,13 @@ export default function DashboardPage() {
     setLoading(true);
     setError("");
     try {
+      // 按浏览器时区请求，今日小时视图与本地时间对齐
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone ?? "";
       const [s, u] = await Promise.all([
         api.get<DashboardStats>("/api/admin/dashboard"),
-        api.get<UsageResponse>(`/api/admin/dashboard/usage?days=${d}`),
+        api.get<UsageResponse>(
+          `/api/admin/dashboard/usage?days=${d}&tz=${encodeURIComponent(tz)}`
+        ),
       ]);
       setStats(s);
       setUsage(u);
@@ -317,7 +321,10 @@ function TokenUsageSection({
                       {(d.cached_tokens ?? 0) > 0 && ` · 缓存 ${d.cached_tokens.toLocaleString()}`}
                     </div>
                     <div className="flex h-full flex-col justify-end overflow-hidden rounded-md">
-                      <div style={{ height: `${c}%` }} className="w-full bg-sky-400/80" />
+                      <div
+                        style={{ height: `${c}%`, minHeight: c > 0 ? 3 : 0 }}
+                        className="w-full bg-sky-400/80"
+                      />
                       <div style={{ height: `${p}%` }} className="w-full bg-accent/80" />
                     </div>
                   </div>

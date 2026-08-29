@@ -103,6 +103,17 @@ export default function ModelsPage() {
     );
   }
 
+  /** 反选：选中当前未选中的行 */
+  function invertSelection() {
+    setSelected((prev) => {
+      const next = new Set<number>();
+      for (const m of filtered) {
+        if (!prev.has(m.id)) next.add(m.id);
+      }
+      return next;
+    });
+  }
+
   async function batch(action: "enable" | "disable" | "delete") {
     if (selected.size === 0) return;
     if (action === "delete" && !confirm(`确认删除选中的 ${selected.size} 个模型？`)) return;
@@ -179,6 +190,7 @@ export default function ModelsPage() {
           <Button disabled={batchBusy} onClick={() => batch("delete")}>
             <Trash2 size={14} /> 批量删除
           </Button>
+          <Button disabled={selected.size === 0} onClick={invertSelection}>反选</Button>
           <Button onClick={() => setSelected(new Set())}>取消选择</Button>
         </div>
       )}

@@ -597,6 +597,44 @@ class ProxyBatchView(AdminRequiredMixin, APIView):
 
 # ---------------------------------------------------------------- user api keys
 
+class KeyBatchView(AdminRequiredMixin, APIView):
+    """POST {ids: [...], action: "enable"|"disable"|"delete"|"test"}"""
+
+    def post(self, request):
+        channel = current_channel(request)
+        ids = _parse_ids(request)
+        action = request.data.get("action")
+        if not ids or action not in ("enable", "disable", "delete", "test"):
+            return Response({"error": {"message": "ids 与合法 action 必填",
+                                       "code": "bad_request"}}, status=400)
+        qs = list(channel.keys.filter(id__in=ids))
+        if action == "delete":
+            channel.keys.filter(id__in=ids).delete()
+            return Response({"matched": len(qs), "action": action})
+        if action == "test":
+            results = []
+            for k in qs:
+                results.append({"id": k.id, "name": k.name,
+                                **key_service.test_key(k)})
+            return Response({"matched": len(qs), "action": action,
+                             "results": results})
+        # enable / disable：仅对非目标状态的行生效，避免反复打状态
+        if action == "enable":
+            status = ChannelKeyStatus.AVAILABLE
+            qs = [k for k in qs if k.status != ChannelKeyStatus.AVAILABLE]
+        else:
+            status = ChannelKeyStatus.DISABLED
+            qs = [k for k in qs if k.status != ChannelKeyStatus.DISABLED]
+        changed = 0
+        for k in qs:
+            k.status = status
+            k.cooldown_until = None
+            k.save(update_fields=["status", "cooldown_until", "updated_at"])
+            changed += 1
+        return Response({"matched": len(qs) + changed, "action": action,
+                         "succeeded": changed})
+
+
 class UserApiKeyListView(AdminRequiredMixin, APIView):
     """用户 Key 是平台级的，跨渠道共享。"""
 
@@ -719,7 +757,11 @@ class DashboardUsageView(AdminRequiredMixin, APIView):
         if days is None:
             return _bad_param("days")
         days = max(1, min(days, 30))
-        now = timezone.localtime(timezone.now())
+        # 按浏览器时区分桶，避免"今日"在服务器时区下显示成凌晨时段
+        tz = request.query_params.get("tz", "") or None
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tz) if tz else timezone.get_current_timezone()
+        now = timezone.localtime(timezone.now(), tz)
         today = now.replace(hour=0, minute=0, second=0, microsecond=0)
         # days=1 时为“今日”视图，按小时分桶（只到当前小时）
         hourly = days == 1
@@ -759,7 +801,7 @@ class DashboardUsageView(AdminRequiredMixin, APIView):
 
         for row in logs:
             ok = row["status"] == "success"
-            ts = timezone.localtime(row["created_at"])
+            ts = timezone.localtime(row["created_at"], tz)
             key = ts.strftime("%H:00") if hourly else ts.strftime("%Y-%m-%d")
             b = buckets.get(key)
             if b:

@@ -25,6 +25,7 @@ urlpatterns = [
 
     # 渠道 Keys（兼容旧路径 /api/admin/nvidia-keys/*）
     path("api/admin/keys", admin_views.ChannelKeyListView.as_view()),
+    path("api/admin/keys/batch", admin_views.KeyBatchView.as_view()),
     path("api/admin/keys/import", admin_views.ChannelKeyImportView.as_view()),
     path("api/admin/keys/<int:pk>", admin_views.ChannelKeyDetailView.as_view()),
     path("api/admin/keys/<int:pk>/test", admin_views.ChannelKeyTestView.as_view()),
@@ -34,6 +35,7 @@ urlpatterns = [
     path("api/admin/nvidia-keys/<int:pk>/test", admin_views.ChannelKeyTestView.as_view()),
 
     path("api/admin/proxies", admin_views.ProxyListView.as_view()),
+    path("api/admin/proxies/batch", admin_views.ProxyBatchView.as_view()),
     path("api/admin/proxies/import", admin_views.ProxyImportView.as_view()),
     path("api/admin/proxies/test-all", admin_views.ProxyTestAllView.as_view()),
     path("api/admin/proxies/<int:pk>", admin_views.ProxyDetailView.as_view()),
