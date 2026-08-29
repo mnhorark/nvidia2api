@@ -85,20 +85,48 @@ class LoginView(APIView):
 
 class ChannelListView(AdminRequiredMixin, APIView):
     def get(self, request):
-        from django.db.models import Count, Q
-        qs = Channel.objects.order_by("id").annotate(
-            key_count=Count("keys", distinct=True),
-            enabled_key_count=Count("keys", filter=~Q(keys__status__in=[
-                ChannelKeyStatus.DISABLED, ChannelKeyStatus.INVALID]), distinct=True),
-            proxy_count=Count("proxies", distinct=True),
-            enabled_proxy_count=Count("proxies", filter=Q(proxies__enabled=True),
-                                      distinct=True),
-            model_count=Count("models", distinct=True),
-            enabled_model_count=Count("models", filter=Q(models__enabled=True),
-                                      distinct=True),
-        )
+        # 分组计数代替多 join 的 annotate：SQLite 上多表 join+distinct 很慢
+        from django.db.models import Count
+        k_agg = {cid: (n, ok) for cid, n, ok in
+                 ChannelKey.objects.values("channel_id").annotate(
+                     n=Count("id"),
+                     ok=Count("id", filter=~Q(status__in=[
+                         ChannelKeyStatus.DISABLED, ChannelKeyStatus.INVALID])),
+                 ).values_list("channel_id", "n", "ok")}
+        p_agg = {cid: (n, ok) for cid, n, ok in
+                 Proxy.objects.values("channel_id").annotate(
+                     n=Count("id"),
+                     ok=Count("id", filter=Q(enabled=True)),
+                 ).values_list("channel_id", "n", "ok")}
+        m_agg = {cid: (n, ok) for cid, n, ok in
+                 AIModel.objects.values("channel_id").annotate(
+                     n=Count("id"),
+                     ok=Count("id", filter=Q(enabled=True)),
+                 ).values_list("channel_id", "n", "ok")}
+
+        counts = {}
+        for cid, (n, ok) in k_agg.items():
+            counts.setdefault(cid, {})["key_count"] = n
+            counts[cid]["enabled_key_count"] = ok
+        for cid, (n, ok) in p_agg.items():
+            counts.setdefault(cid, {})["proxy_count"] = n
+            counts[cid]["enabled_proxy_count"] = ok
+        for cid, (n, ok) in m_agg.items():
+            counts.setdefault(cid, {})["model_count"] = n
+            counts[cid]["enabled_model_count"] = ok
+
+        channels = []
+        for c in Channel.objects.order_by("id"):
+            cc = counts.get(c.id, {})
+            setattr(c, "key_count", cc.get("key_count", 0))
+            setattr(c, "enabled_key_count", cc.get("enabled_key_count", 0))
+            setattr(c, "proxy_count", cc.get("proxy_count", 0))
+            setattr(c, "enabled_proxy_count", cc.get("enabled_proxy_count", 0))
+            setattr(c, "model_count", cc.get("model_count", 0))
+            setattr(c, "enabled_model_count", cc.get("enabled_model_count", 0))
+            channels.append(c)
         return Response({
-            "results": ChannelSerializer(qs, many=True).data,
+            "results": ChannelSerializer(channels, many=True).data,
             "current": current_channel(request).slug,
         })
 
@@ -639,52 +667,40 @@ class LogListView(AdminRequiredMixin, APIView):
 
 
 class DashboardView(AdminRequiredMixin, APIView):
-    """全渠道汇总的仪表盘指标（不限于当前渠道）。"""
+    """当前渠道的运行指标（随顶部渠道切换变化；token 汇总在 usage 接口）。"""
 
     def get(self, request):
+        channel = current_channel(request)
         today = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        keys = ChannelKey.objects.all()
-        proxies = Proxy.objects.all()
-        logs_today = RequestLog.objects.filter(created_at__gte=today)
+        keys = channel.keys.all()
+        proxies = channel.proxies.all()
+        logs_today = channel.logs.filter(created_at__gte=today)
 
         key_status = {s: keys.filter(status=s).count() for s, _ in ChannelKeyStatus.choices}
         proxy_status = {s: proxies.filter(status=s).count() for s, _ in ProxyStatus.choices}
-        today_count = logs_today.count()
-        success_count = logs_today.filter(status="success").count()
-        agg = logs_today.filter(duration_ms__gt=0).aggregate(
-            avg=Avg("duration_ms"), tokens=Sum("total_tokens"))
-
-        per_channel = []
-        for c in Channel.objects.order_by("id"):
-            cl = logs_today.filter(channel=c)
-            n = cl.count()
-            ok = cl.filter(status="success").count()
-            per_channel.append({
-                "slug": c.slug, "name": c.name,
-                "requests_today": n,
-                "success_rate": round(ok / n * 100, 1) if n else 0.0,
-                "tokens_today": cl.aggregate(t=Sum("total_tokens"))["t"] or 0,
-                "enabled_keys": c.keys.exclude(
-                    status__in=[ChannelKeyStatus.DISABLED,
-                                ChannelKeyStatus.INVALID]).count(),
-                "enabled_models": c.models.filter(enabled=True).count(),
-            })
+        # 一次聚合取今日请求数 / 成功数 / 平均耗时
+        agg = logs_today.aggregate(
+            n=Count("id"),
+            ok=Count("id", filter=Q(status="success")),
+            avg=Avg("duration_ms"),
+        )
+        today_count = agg["n"] or 0
 
         n_active_keys = keys.exclude(status=ChannelKeyStatus.DISABLED).count()
         return Response({
-            "channels": per_channel,
-            "channel_count": len(per_channel),
+            "channel": channel.slug,
+            "channel_name": channel.name,
             "nvidia_keys": keys.count(),
             "enabled_keys": keys.exclude(
                 status__in=[ChannelKeyStatus.DISABLED, ChannelKeyStatus.INVALID]).count(),
             "proxies": proxies.count(),
             "enabled_proxies": proxies.filter(enabled=True).count(),
             "max_enabled_proxies": max(n_active_keys - 1, 0),
-            "models": AIModel.objects.count(),
-            "enabled_models": AIModel.objects.filter(enabled=True).count(),
+            "models": channel.models.count(),
+            "enabled_models": channel.models.filter(enabled=True).count(),
             "requests_today": today_count,
-            "tokens_today": agg["tokens"] or 0,
-            "success_rate": round(success_count / today_count * 100, 1) if today_count else 0.0,
+            "success_rate": round((agg["ok"] or 0) / today_count * 100, 1)
+            if today_count else 0.0,
             "avg_latency_s": round((agg["avg"] or 0) / 1000, 2),
             "key_status": key_status,
             "proxy_status": proxy_status,
@@ -743,7 +759,8 @@ class DashboardUsageView(AdminRequiredMixin, APIView):
 
         for row in logs:
             ok = row["status"] == "success"
-            key = timezone.localtime(row["created_at"]).strftime("%Y-%m-%d")
+            ts = timezone.localtime(row["created_at"])
+            key = ts.strftime("%H:00") if hourly else ts.strftime("%Y-%m-%d")
             b = buckets.get(key)
             if b:
                 b["prompt_tokens"] += row["prompt_tokens"] or 0
