@@ -1042,10 +1042,12 @@ class AdminChatView(AdminRequiredMixin, APIView):
 
         if request.data.get("stream"):
             return self._stream(body, model, channel, proxy_group=proxy_group,
+                                endpoint=model_rec.endpoint,
                                 client_thinking=client_thinking,
                                 upstream_thinking=upstream_thinking)
 
-        routes = build_routes(channel, proxy_group=proxy_group)
+        routes = build_routes(channel, proxy_group=proxy_group,
+                              endpoint=model_rec.endpoint)
         started = timezone.now().timestamp()
         request_id = ks.new_request_id()
         log = RequestLog.objects.create(channel=channel, request_id=request_id, model=model,
@@ -1105,7 +1107,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
         })
 
     def _stream(self, body, model, channel, proxy_group=None,
-                client_thinking=None, upstream_thinking=None):
+                endpoint=None, client_thinking=None, upstream_thinking=None):
         """SSE: race streaming connections, first valid chunk wins, rest cancelled.
 
         Emits a leading `data: {"meta": {...}}` event describing the winning route,
@@ -1120,7 +1122,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
         from services.load_balancer import build_routes
         from services.race_engine import AllRoutesFailed, NoRouteAvailable, race_stream
 
-        routes = build_routes(channel, proxy_group=proxy_group)
+        routes = build_routes(channel, proxy_group=proxy_group, endpoint=endpoint)
         request_id = ks.new_request_id()
         log = RequestLog.objects.create(
             channel=channel, request_id=request_id, model=model,
