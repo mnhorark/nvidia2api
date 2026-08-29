@@ -150,7 +150,7 @@ export default function ModelsPage() {
             <Button variant="primary" onClick={() => setEdit({ model_name: "" })}>
               <Plus size={14} /> 添加模型
             </Button>
-            <Button onClick={load} loading={loading}>
+            <Button onClick={load} loading={loading} aria-label="刷新">
               <RefreshCw size={14} />
             </Button>
           </>
@@ -199,7 +199,7 @@ export default function ModelsPage() {
             <Th>模型名称</Th>
             <Th>对外名称</Th>
             <Th>显示名称</Th>
-            <Th>Provider</Th>
+            <Th>来源</Th>
             <Th>状态</Th>
             <Th>启用</Th>
             <Th>更新时间</Th>
@@ -234,12 +234,15 @@ export default function ModelsPage() {
             <Td>
               <div className="flex items-center gap-1">
                 <button
+                  title="编辑"
+                  aria-label="编辑"
                   onClick={() => setEdit(m)}
                   className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
                 >
                   <Pencil size={14} />
                 </button>
                 <button
+                  aria-label="删除"
                   onClick={() => remove(m)}
                   className="rounded p-1.5 text-gray-500 hover:bg-red-500/15 hover:text-red-400"
                 >

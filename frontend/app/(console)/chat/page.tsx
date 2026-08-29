@@ -159,7 +159,8 @@ export default function ChatPage() {
   }, [input, messages, model, effort, sending]);
 
   return (
-    <div className="flex h-[calc(100vh-7rem)] flex-col">
+    <div className="flex h-[calc(100vh-3rem)] flex-col">
+      <div className="shrink-0">
       <PageHeader title="对话" subtitle="通过竞速引擎直接测试已启用的模型" actions={
         <>
           <Select
@@ -196,12 +197,13 @@ export default function ChatPage() {
           </Button>
         </>
       } />
+      </div>
 
       <Card className="flex-1 overflow-y-auto p-4">
         {messages.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-gray-600">
             <Bot size={30} />
-            <p className="text-sm">选择模型并开始对话。请求会经过代理竞速引擎转发到 NVIDIA。</p>
+            <p className="text-sm">选择模型并开始对话。请求会经过代理竞速引擎转发到当前渠道。</p>
           </div>
         ) : (
           <div className="space-y-4">

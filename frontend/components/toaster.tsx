@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { CheckCircle2, Info, XCircle } from "lucide-react";
+import { CheckCircle2, Info, X, XCircle } from "lucide-react";
 
 export type ToastType = "success" | "error" | "info";
 
@@ -64,7 +64,15 @@ export function Toaster() {
             className={`pointer-events-auto flex items-start gap-2.5 rounded-xl border bg-[#12121a]/95 px-3.5 py-3 text-sm shadow-2xl backdrop-blur-md ${s.cls}`}
           >
             <Icon size={16} className="mt-0.5 shrink-0" />
-            <span className="text-zinc-200">{t.message}</span>
+            <span className="flex-1 text-zinc-200">{t.message}</span>
+            <button
+              type="button"
+              aria-label="关闭"
+              onClick={() => setItems((prev) => prev.filter((x) => x.id !== t.id))}
+              className="mt-0.5 shrink-0 rounded p-0.5 text-zinc-500 transition-colors hover:bg-white/10 hover:text-zinc-200"
+            >
+              <X size={13} />
+            </button>
           </div>
         );
       })}

@@ -354,13 +354,13 @@ function TokenUsageSection({
           </div>
 
           <div className="col-span-full flex justify-between text-[11px] text-gray-600">
-            {list.map((d) => (
+            {list.map((d, i) => (
               <span key={d.date} className="flex-1 text-center">
                 {days === 1
                   ? parseInt(d.date, 10) % 3 === 0 ? d.date : ""
-                  : days === 7 || list.length <= 14
-                    ? d.date.slice(5)
-                    : d.date.slice(8)}
+                  : list.length > 14
+                    ? i % 5 === 0 ? d.date.slice(5) : ""
+                    : d.date.slice(5)}
               </span>
             ))}
           </div>

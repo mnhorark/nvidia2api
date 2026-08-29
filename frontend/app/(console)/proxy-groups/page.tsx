@@ -77,7 +77,7 @@ export default function ProxyGroupsPage() {
             <Button variant="primary" onClick={() => setEdit({ name: "" })}>
               <Plus size={14} /> 新建分组
             </Button>
-            <Button onClick={load} loading={loading}>
+            <Button onClick={load} loading={loading} aria-label="刷新">
               <RefreshCw size={14} />
             </Button>
           </>
@@ -114,12 +114,15 @@ export default function ProxyGroupsPage() {
             <Td>
               <div className="flex items-center gap-1">
                 <button
+                  title="编辑"
+                  aria-label="编辑"
                   onClick={() => setEdit(g)}
                   className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
                 >
                   <Pencil size={14} />
                 </button>
                 <button
+                  aria-label="删除"
                   onClick={() => remove(g)}
                   className="rounded p-1.5 text-gray-500 hover:bg-red-500/15 hover:text-red-400"
                 >

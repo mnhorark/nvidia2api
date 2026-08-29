@@ -41,8 +41,18 @@ export default function SettingsPage() {
     try {
       const settings: Record<string, string | number> = {};
       for (const p of params) {
-        const raw = draft[p.key] ?? String(p.value);
-        settings[p.key] = p.type === "int" || p.type === "float" ? Number(raw) : raw;
+        const raw = (draft[p.key] ?? String(p.value)).trim();
+        if (p.type === "int" || p.type === "float") {
+          const n = Number(raw);
+          if (raw === "" || Number.isNaN(n)) {
+            toast.error(`参数 ${p.key} 需要合法的数字`);
+            setSaving(false);
+            return;
+          }
+          settings[p.key] = n;
+        } else {
+          settings[p.key] = raw;
+        }
       }
       const updated = await api.patch<{ channel: string; settings: RuntimeParam[] }>(
         "/api/admin/settings", { settings });
@@ -73,7 +83,7 @@ export default function SettingsPage() {
         }
         actions={
           <>
-            <Button onClick={load} loading={loading}>
+            <Button onClick={load} loading={loading} aria-label="刷新">
               <RefreshCw size={14} />
             </Button>
             <Button variant="primary" onClick={save} loading={saving} disabled={!params.length}>
@@ -91,9 +101,9 @@ export default function SettingsPage() {
         ) : (
           <div className="divide-y divide-white/5">
             {params.map((p) => (
-              <div key={p.key} className="flex items-center gap-4 py-3.5 first:pt-0 last:pb-0">
-                <div className="w-72 shrink-0">
-                  <code className="text-xs text-accent/90">{p.key}</code>
+              <div key={p.key} className="flex flex-wrap items-center gap-x-4 gap-y-2 py-3.5 first:pt-0 last:pb-0">
+                <div className="w-72 min-w-0 shrink-0">
+                  <code className="break-all text-xs text-accent/90">{p.key}</code>
                   {p.overridden && (
                     <span className="ml-1.5 rounded bg-accent/15 px-1 py-px text-[9px] text-accent">
                       已覆盖
@@ -124,6 +134,7 @@ export default function SettingsPage() {
                   <button
                     onClick={() => reset(p.key)}
                     title="恢复默认"
+                    aria-label="恢复默认"
                     className="rounded p-1.5 text-gray-600 hover:bg-white/5 hover:text-gray-300"
                   >
                     <RotateCcw size={13} />

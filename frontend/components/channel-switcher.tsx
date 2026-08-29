@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Check, ChevronsUpDown, Layers, Plus, Settings2 } from "lucide-react";
+import { useRouter } from "next/navigation";
 import { Channel } from "@/lib/api";
 import { Button, cx } from "@/components/ui";
 
@@ -15,6 +16,7 @@ export function ChannelSwitcher({
   current: string;
   onPick: (slug: string) => void;
 }) {
+  const router = useRouter();
   const [open, setOpen] = useState(false);
   const boxRef = useRef<HTMLDivElement>(null);
 
@@ -57,7 +59,16 @@ export function ChannelSwitcher({
         <div className="absolute left-3 right-3 z-50 mt-1 overflow-hidden rounded-lg border border-white/10 bg-[#14141d] shadow-2xl">
           <div className="max-h-72 overflow-y-auto py-1">
             {channels.length === 0 && (
-              <p className="px-3 py-2 text-xs text-gray-600">暂无渠道</p>
+              <button
+                type="button"
+                onClick={() => {
+                  setOpen(false);
+                  router.push("/channels");
+                }}
+                className="block w-full px-3 py-2 text-left text-xs text-gray-500 hover:bg-white/5 hover:text-gray-300"
+              >
+                暂无渠道，点击添加
+              </button>
             )}
             {channels.map((c) => (
               <button
@@ -105,7 +116,7 @@ export function ChannelSwitcher({
               className="flex-1 justify-center !px-2 !py-1.5 !text-[11px]"
               onClick={() => {
                 setOpen(false);
-                window.location.href = "/channels";
+                router.push("/channels");
               }}
             >
               <Settings2 size={12} /> 管理渠道
@@ -115,7 +126,7 @@ export function ChannelSwitcher({
               className="flex-1 justify-center !px-2 !py-1.5 !text-[11px]"
               onClick={() => {
                 setOpen(false);
-                window.location.href = "/channels?new=1";
+                router.push("/channels?new=1");
               }}
             >
               <Plus size={12} /> 新增

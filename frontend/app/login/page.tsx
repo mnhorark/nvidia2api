@@ -46,6 +46,7 @@ export default function LoginPage() {
         <form onSubmit={submit} className="glass space-y-4 p-6">
           <Input
             placeholder="用户名"
+            autoComplete="username"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
             autoFocus
@@ -53,10 +54,11 @@ export default function LoginPage() {
           <Input
             type="password"
             placeholder="密码"
+            autoComplete="current-password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
           />
-          {error && <p className="text-sm text-red-400">{error}</p>}
+          {error && <p role="alert" className="text-sm text-red-400">{error}</p>}
           <Button
             variant="primary"
             className="w-full justify-center py-2.5"

@@ -137,15 +137,28 @@ export function Modal({
   children: React.ReactNode;
   wide?: boolean;
 }) {
+  // Esc 关闭
+  React.useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
   if (!open) return null;
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fade"
       onClick={onClose}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
         className={cx(
-          "glass w-full shadow-glass p-6",
+          "glass w-full max-h-[85vh] overflow-y-auto shadow-glass p-6 animate-modal",
           wide ? "max-w-2xl" : "max-w-md"
         )}
         onClick={(e) => e.stopPropagation()}
@@ -154,7 +167,8 @@ export function Modal({
           <h3 className="text-base font-semibold text-gray-100">{title}</h3>
           <button
             onClick={onClose}
-            className="text-gray-500 hover:text-gray-200 transition-colors"
+            aria-label="关闭"
+            className="-m-1.5 rounded-md p-1.5 text-gray-500 transition-colors hover:bg-white/10 hover:text-gray-200"
           >
             <X size={18} />
           </button>
@@ -215,6 +229,7 @@ export function Select(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
 export function Th({ children, className }: { children?: React.ReactNode; className?: string }) {
   return (
     <th
+      scope="col"
       className={cx(
         "px-3 py-2.5 text-left text-xs font-medium uppercase tracking-wider text-gray-500",
         className
@@ -237,7 +252,7 @@ export function Td({
   colSpan?: number;
 }) {
   return (
-    <td colSpan={colSpan} title={title} className={cx("px-3 py-2.5 text-sm text-gray-300", className)}>
+    <td colSpan={colSpan} title={title} className={cx("px-3 py-2.5 text-sm text-gray-300 [font-variant-numeric:tabular-nums]", className)}>
       {children}
     </td>
   );
@@ -271,7 +286,7 @@ export function DataTable({
           )}
           {loading && (
             <tr>
-              <td colSpan={50} className="px-3 py-10 text-center text-sm text-gray-500">
+              <td colSpan={100} className="px-3 py-10 text-center text-sm text-gray-500">
                 <Loader2 className="mx-auto animate-spin text-gray-500" size={20} />
               </td>
             </tr>

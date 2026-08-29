@@ -181,7 +181,9 @@ export default function ChannelKeysPage() {
             <tr key={k.id} className="hover:bg-white/[0.02]">
               <Td className="font-medium text-gray-200">{k.name}</Td>
               <Td>
-                <code className="font-mono text-xs text-gray-500">{k.api_key}</code>
+                <code className="block max-w-[220px] truncate font-mono text-xs text-gray-500" title={k.api_key}>
+                  {k.api_key}
+                </code>
               </Td>
               <Td>
                 <Badge status={k.status} />
@@ -199,6 +201,7 @@ export default function ChannelKeysPage() {
                 <div className="flex items-center gap-1">
                   <button
                     title={enabled ? "禁用" : "启用"}
+                    aria-label={enabled ? "禁用" : "启用"}
                     disabled={busyId === k.id}
                     onClick={() => toggle(k)}
                     className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
@@ -207,6 +210,7 @@ export default function ChannelKeysPage() {
                   </button>
                   <button
                     title="测试"
+                    aria-label="测试"
                     disabled={busyId === k.id}
                     onClick={() => test(k)}
                     className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
@@ -215,6 +219,7 @@ export default function ChannelKeysPage() {
                   </button>
                   <button
                     title="编辑"
+                    aria-label="编辑"
                     onClick={() => setEditItem(k)}
                     className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
                   >
@@ -222,6 +227,7 @@ export default function ChannelKeysPage() {
                   </button>
                   <button
                     title="删除"
+                    aria-label="删除"
                     onClick={() => remove(k)}
                     className="rounded p-1.5 text-gray-500 hover:bg-red-500/15 hover:text-red-400"
                   >

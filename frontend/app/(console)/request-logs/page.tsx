@@ -95,8 +95,8 @@ export default function RequestLogsPage() {
             <Th>模型</Th>
             <Th>总耗时</Th>
             <Th>首字</Th>
-            <Th>胜出线路 (Winner)</Th>
-            <Th>Stream</Th>
+            <Th>胜出线路</Th>
+            <Th>流式</Th>
             <Th>状态</Th>
             <Th>Tokens</Th>
           </>

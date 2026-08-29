@@ -19,6 +19,7 @@ import {
   Badge,
   Button,
   Card,
+  Checkbox,
   DataTable,
   Field,
   fmtTime,
@@ -240,7 +241,7 @@ function ChannelsInner() {
             <Th>Key</Th>
             <Th>代理</Th>
             <Th>模型</Th>
-            <Th>状态</Th>
+            <Th>启用</Th>
             <Th>默认</Th>
             <Th>更新时间</Th>
             <Th>操作</Th>
@@ -261,7 +262,9 @@ function ChannelsInner() {
               </div>
             </Td>
             <Td>
-              <code className="font-mono text-[11px] text-gray-400">{c.chat_url}</code>
+              <code className="block max-w-[260px] truncate font-mono text-[11px] text-gray-400" title={c.chat_url}>
+                {c.chat_url}
+              </code>
             </Td>
             <Td className="text-xs text-gray-400">
               {c.auth_scheme === "bearer"
@@ -292,6 +295,7 @@ function ChannelsInner() {
               ) : (
                 <button
                   title="设为默认"
+                  aria-label="设为默认"
                   onClick={() => makeDefault(c)}
                   className="rounded p-1 text-gray-600 hover:bg-white/10 hover:text-gray-200"
                 >
@@ -304,6 +308,7 @@ function ChannelsInner() {
               <div className="flex items-center gap-1">
                 <button
                   title={c.slug === current ? "当前渠道" : "切换到此渠道"}
+                  aria-label={c.slug === current ? "当前渠道" : "切换到此渠道"}
                   disabled={c.slug === current}
                   onClick={() => switchTo(c)}
                   className={c.slug === current
@@ -314,6 +319,7 @@ function ChannelsInner() {
                 </button>
                 <button
                   title="测试连通性"
+                  aria-label="测试连通性"
                   disabled={busyId === c.id}
                   onClick={() => test(c)}
                   className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
@@ -322,6 +328,7 @@ function ChannelsInner() {
                 </button>
                 <button
                   title="同步该渠道模型"
+                  aria-label="同步该渠道模型"
                   disabled={busyId === c.id}
                   onClick={() => syncModels(c)}
                   className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
@@ -330,6 +337,7 @@ function ChannelsInner() {
                 </button>
                 <button
                   title="编辑"
+                  aria-label="编辑"
                   onClick={() => setEdit(c)}
                   className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
                 >
@@ -337,6 +345,7 @@ function ChannelsInner() {
                 </button>
                 <button
                   title="删除"
+                  aria-label="删除"
                   onClick={() => remove(c)}
                   className="rounded p-1.5 text-gray-500 hover:bg-red-500/15 hover:text-red-400"
                 >
@@ -477,18 +486,18 @@ function ChannelsInner() {
 
           <div className="flex items-center gap-5 pt-1">
             <label className="flex items-center gap-2 text-sm text-gray-300">
-              <input
-                type="checkbox"
+              <Checkbox
                 checked={edit?.enabled ?? true}
-                onChange={(e) => setEdit((v) => ({ ...v, enabled: e.target.checked }))}
+                onChange={(v) => setEdit((s) => ({ ...s, enabled: v }))}
+                ariaLabel="启用"
               />
               启用
             </label>
             <label className="flex items-center gap-2 text-sm text-gray-300">
-              <input
-                type="checkbox"
+              <Checkbox
                 checked={edit?.is_default ?? false}
-                onChange={(e) => setEdit((v) => ({ ...v, is_default: e.target.checked }))}
+                onChange={(v) => setEdit((s) => ({ ...s, is_default: v }))}
+                ariaLabel="设为默认渠道"
               />
               设为默认渠道（/v1/* 走它）
             </label>

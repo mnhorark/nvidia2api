@@ -217,7 +217,7 @@ export default function ProxiesPage() {
             >
               <Plus size={14} /> 添加代理
             </Button>
-            <Button onClick={load} loading={loading}>
+            <Button onClick={load} loading={loading} aria-label="刷新">
               <RefreshCw size={14} />
             </Button>
           </>
@@ -309,7 +309,7 @@ export default function ProxiesPage() {
             <Td className="text-gray-400">{p.group_name || "—"}</Td>
             <Td className="font-mono text-xs text-gray-400">{p.public_ip || "—"}</Td>
             <Td className="text-gray-400">{p.country || "—"}</Td>
-            <Td>{fmtLatency(p.latency)}</Td>
+            <Td title={p.latency != null ? `${p.latency} ms` : undefined}>{fmtLatency(p.latency)}</Td>
             <Td>
               <Badge status={p.status} />
             </Td>
@@ -325,6 +325,7 @@ export default function ProxiesPage() {
               <div className="flex items-center gap-1">
                 <button
                   title="测速"
+                  aria-label="测速"
                   disabled={busyId === p.id}
                   onClick={() => testOne(p)}
                   className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
@@ -333,6 +334,7 @@ export default function ProxiesPage() {
                 </button>
                 <button
                   title="获取 IP"
+                  aria-label="获取 IP"
                   disabled={busyId === p.id}
                   onClick={() => fetchIp(p)}
                   className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
@@ -341,6 +343,7 @@ export default function ProxiesPage() {
                 </button>
                 <button
                   title="编辑"
+                  aria-label="编辑"
                   onClick={() => setEditItem(p)}
                   className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
                 >
@@ -348,6 +351,7 @@ export default function ProxiesPage() {
                 </button>
                 <button
                   title="删除"
+                  aria-label="删除"
                   onClick={() => remove(p)}
                   className="rounded p-1.5 text-gray-500 hover:bg-red-500/15 hover:text-red-400"
                 >

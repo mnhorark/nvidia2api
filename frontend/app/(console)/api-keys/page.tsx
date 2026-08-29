@@ -87,7 +87,7 @@ export default function ApiKeysPage() {
             <Button variant="primary" onClick={() => setCreate({ name: "", rate_limit: 0 })}>
               <Plus size={14} /> 创建 API Key
             </Button>
-            <Button onClick={load} loading={loading}>
+            <Button onClick={load} loading={loading} aria-label="刷新">
               <RefreshCw size={14} />
             </Button>
           </>
@@ -104,7 +104,7 @@ export default function ApiKeysPage() {
             <Th>名称</Th>
             <Th>Key</Th>
             <Th>状态</Th>
-            <Th>限流 (RPM)</Th>
+            <Th>限流(次/分)</Th>
             <Th>总请求</Th>
             <Th>成功 / 失败</Th>
             <Th>最后使用</Th>
@@ -139,6 +139,7 @@ export default function ApiKeysPage() {
             </Td>
             <Td>
               <button
+                aria-label="删除"
                 onClick={() => remove(k)}
                 className="rounded p-1.5 text-gray-500 hover:bg-red-500/15 hover:text-red-400"
               >
@@ -186,6 +187,8 @@ export default function ApiKeysPage() {
         <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-black/40 p-3">
           <code className="flex-1 break-all font-mono text-sm text-accent">{createdKey}</code>
           <button
+            title="复制"
+            aria-label="复制"
             onClick={() => {
               if (createdKey) navigator.clipboard.writeText(createdKey);
             }}
