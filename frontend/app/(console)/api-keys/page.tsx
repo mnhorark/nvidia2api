@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Copy, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Check, Copy, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api, asList, UserApiKey } from "@/lib/api";
 import {
   Badge,
@@ -9,6 +9,7 @@ import {
   DataTable,
   Field,
   fmtTime,
+  IconButton,
   Input,
   Modal,
   PageHeader,
@@ -24,6 +25,7 @@ export default function ApiKeysPage() {
   const [error, setError] = useState("");
   const [create, setCreate] = useState<{ name: string; rate_limit: number } | null>(null);
   const [createdKey, setCreatedKey] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
   const [busyId, setBusyId] = useState<number | null>(null);
 
   const load = useCallback(async () => {
@@ -48,7 +50,10 @@ export default function ApiKeysPage() {
     try {
       const res = await api.post<{ key?: string }>("/api/admin/api-keys", create);
       setCreate(null);
-      if (res.key) setCreatedKey(res.key);
+      if (res.key) {
+        setCreatedKey(res.key);
+        setCopied(false);
+      }
       load();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "创建失败");
@@ -77,6 +82,13 @@ export default function ApiKeysPage() {
     }
   }
 
+  function copyKey() {
+    if (!createdKey) return;
+    navigator.clipboard.writeText(createdKey);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  }
+
   return (
     <div>
       <PageHeader
@@ -84,17 +96,21 @@ export default function ApiKeysPage() {
         subtitle="通过 Bearer Token 访问 OpenAI 兼容接口"
         actions={
           <>
+            <Button onClick={load} loading={loading}>
+              <RefreshCw size={14} /> 刷新
+            </Button>
             <Button variant="primary" onClick={() => setCreate({ name: "", rate_limit: 0 })}>
               <Plus size={14} /> 创建 API Key
-            </Button>
-            <Button onClick={load} loading={loading} aria-label="刷新">
-              <RefreshCw size={14} />
             </Button>
           </>
         }
       />
 
-      {error && <p className="mb-4 text-sm text-red-400">{error}</p>}
+      {error && (
+        <div className="mb-4 rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-[13px] text-err">
+          {error}
+        </div>
+      )}
 
       <DataTable
         loading={loading}
@@ -114,22 +130,24 @@ export default function ApiKeysPage() {
         }
       >
         {keys.map((k) => (
-          <tr key={k.id} className="hover:bg-white/[0.02]">
+          <tr key={k.id} className="transition-colors hover:bg-white/[0.025]">
             <Td className="font-medium text-gray-200">{k.name}</Td>
             <Td>
-              <code className="font-mono text-xs text-gray-500">{k.key_prefix}…</code>
+              <code className="font-mono text-xs text-faint">{k.key_prefix}…</code>
             </Td>
             <Td>
               <Badge status={k.enabled ? "enabled" : "disabled"} />
             </Td>
-            <Td className="text-gray-400">{k.rate_limit > 0 ? `${k.rate_limit}/分钟` : "不限"}</Td>
-            <Td>{k.total_requests}</Td>
-            <Td>
-              <span className="text-accent">{k.success_requests}</span>
-              <span className="text-gray-600"> / </span>
-              <span className="text-red-400/80">{k.failed_requests}</span>
+            <Td className="tabular-nums text-mute">
+              {k.rate_limit > 0 ? `${k.rate_limit}/分钟` : "不限"}
             </Td>
-            <Td className="text-xs text-gray-500">{fmtTime(k.last_used_at)}</Td>
+            <Td className="tabular-nums">{k.total_requests}</Td>
+            <Td className="tabular-nums">
+              <span className="text-ok">{k.success_requests}</span>
+              <span className="text-faint"> / </span>
+              <span className="text-err/80">{k.failed_requests}</span>
+            </Td>
+            <Td className="text-xs text-faint">{fmtTime(k.last_used_at)}</Td>
             <Td>
               <Toggle
                 checked={k.enabled}
@@ -138,20 +156,20 @@ export default function ApiKeysPage() {
               />
             </Td>
             <Td>
-              <button
+              <IconButton
                 aria-label="删除"
+                danger
                 onClick={() => remove(k)}
-                className="rounded p-1.5 text-gray-500 hover:bg-red-500/15 hover:text-red-400"
               >
                 <Trash2 size={14} />
-              </button>
+              </IconButton>
             </Td>
           </tr>
         ))}
       </DataTable>
 
       <Modal open={!!create} title="创建 API Key" onClose={() => setCreate(null)}>
-        <form onSubmit={doCreate} className="space-y-3">
+        <form onSubmit={doCreate} className="space-y-3.5">
           <Field label="名称">
             <Input
               value={create?.name ?? ""}
@@ -181,25 +199,24 @@ export default function ApiKeysPage() {
       </Modal>
 
       <Modal open={!!createdKey} title="API Key 创建成功" onClose={() => setCreatedKey(null)}>
-        <p className="mb-3 text-sm text-amber-400">
-          完整 Key 只会显示这一次，请立即复制保存：
+        <p className="mb-3 flex items-start gap-2 rounded-lg border border-warn/25 bg-warn/[0.08] px-3 py-2.5 text-xs text-warn">
+          完整 Key 只会显示这一次，请立即复制保存。
         </p>
-        <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-black/40 p-3">
-          <code className="flex-1 break-all font-mono text-sm text-accent">{createdKey}</code>
-          <button
+        <div className="flex items-center gap-2 rounded-lg border border-line bg-[#0f1013] p-3">
+          <code className="flex-1 break-all font-mono text-[13px] text-accent">{createdKey}</code>
+          <IconButton
             title="复制"
             aria-label="复制"
-            onClick={() => {
-              if (createdKey) navigator.clipboard.writeText(createdKey);
-            }}
-            className="shrink-0 rounded p-1.5 text-gray-400 hover:bg-white/10 hover:text-gray-100"
+            onClick={copyKey}
           >
-            <Copy size={15} />
-          </button>
+            {copied ? <Check size={15} className="text-ok" /> : <Copy size={15} />}
+          </IconButton>
         </div>
-        <Button variant="primary" className="mt-4" onClick={() => setCreatedKey(null)}>
-          我已保存
-        </Button>
+        <div className="mt-4 flex justify-end">
+          <Button variant="primary" onClick={() => setCreatedKey(null)}>
+            我已保存
+          </Button>
+        </div>
       </Modal>
     </div>
   );

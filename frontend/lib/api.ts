@@ -16,10 +16,12 @@ export function getChannel(): string {
 }
 
 export function setChannel(slug: string) {
+  if (typeof window === "undefined") return;
+  // 值未变化时不写 localStorage、不派发事件：否则 layout 监听事件后会再走
+  // loadChannels -> setChannel -> 派发事件，形成无限请求循环（GET /api/admin/channels 刷屏）。
+  if (slug === localStorage.getItem(CHANNEL_KEY)) return;
   localStorage.setItem(CHANNEL_KEY, slug);
-  if (typeof window !== "undefined") {
-    window.dispatchEvent(new CustomEvent("nvidia2api:channel-change", { detail: slug }));
-  }
+  window.dispatchEvent(new CustomEvent("nvidia2api:channel-change", { detail: slug }));
 }
 
 export function setToken(token: string) {

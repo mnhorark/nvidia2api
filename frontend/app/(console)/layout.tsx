@@ -68,8 +68,6 @@ export default function ConsoleLayout({ children }: { children: React.ReactNode 
 
   // 监听全局渠道变更事件（渠道页 switchTo / lib setChannel 派发）：
   // 更新本地 state 使 <main key={channel}> 重挂载刷新页面，并重拉渠道列表保持侧边栏名称同步。
-  // 注意与 lib/api 的 setChannel 区别：事件由 setChannel 内部派出，此处一般不重复写入 localStorage，
-  // 仅当 detail 与当前存储不一致（手动派发场景）时补写，避免事件回环。
   useEffect(() => {
     const onChannelChange = (e: Event) => {
       const slug = (e as CustomEvent<string | undefined>).detail;
@@ -92,14 +90,17 @@ export default function ConsoleLayout({ children }: { children: React.ReactNode 
 
   return (
     <div className="flex min-h-screen">
-      <aside className="fixed inset-y-0 left-0 z-40 flex w-56 flex-col border-r border-white/5 bg-[#0c0c12]/90 backdrop-blur-xl">
-        <div className="flex items-center gap-2.5 border-b border-white/5 px-5 py-5">
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#76B900]/10">
-            <NvidiaLogo size={20} />
+      <aside className="fixed inset-y-0 left-0 z-40 flex w-56 flex-col bg-bg-soft border-r border-line">
+        {/* 品牌 */}
+        <div className="flex h-14 items-center gap-2.5 border-b border-line px-4">
+          <div className="flex h-7 w-7 items-center justify-center rounded-md bg-accent/15">
+            <NvidiaLogo size={17} />
           </div>
-          <div>
-            <div className="text-sm font-semibold tracking-wide text-gray-100">NVIDIA2API</div>
-            <div className="text-[10px] text-gray-500">AI API Infrastructure</div>
+          <div className="leading-tight">
+            <div className="text-[13px] font-semibold tracking-wide text-gray-100">
+              NVIDIA2API
+            </div>
+            <div className="text-[10px] text-faint">AI API Infrastructure</div>
           </div>
         </div>
 
@@ -109,7 +110,8 @@ export default function ConsoleLayout({ children }: { children: React.ReactNode 
           onPick={pick}
         />
 
-        <nav className="flex-1 space-y-0.5 overflow-y-auto px-3 py-1">
+        {/* 导航 */}
+        <nav className="flex-1 overflow-y-auto px-2 py-2 space-y-px">
           {NAV.map((item) => {
             const active = pathname.startsWith(item.href);
             const Icon = item.icon;
@@ -118,36 +120,39 @@ export default function ConsoleLayout({ children }: { children: React.ReactNode 
                 key={item.href}
                 href={item.href}
                 className={cx(
-                  "flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition-colors",
+                  "flex items-center gap-2.5 rounded-md px-2.5 py-[7px] text-[13px] transition-colors",
                   active
-                    ? "bg-accent/10 text-accent"
-                    : "text-gray-400 hover:bg-white/5 hover:text-gray-200"
+                    ? "bg-white/[0.07] font-medium text-gray-100"
+                    : "text-mute hover:bg-white/[0.04] hover:text-gray-200"
                 )}
               >
-                <Icon size={16} />
+                <Icon size={15} className={active ? "text-accent" : undefined} />
                 {item.label}
               </Link>
             );
           })}
         </nav>
 
-        <div className="border-t border-white/5 p-3">
+        {/* 底部退出 */}
+        <div className="border-t border-line p-2">
           <button
             onClick={() => {
               clearToken();
               router.replace("/login");
             }}
-            className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm text-gray-400 transition-colors hover:bg-red-500/10 hover:text-red-400"
+            className="flex w-full items-center gap-2.5 rounded-md px-2.5 py-[7px] text-[13px] text-mute transition-colors hover:bg-err/10 hover:text-err"
           >
-            <LogOut size={16} />
+            <LogOut size={15} />
             退出登录
           </button>
         </div>
       </aside>
 
       {/* key 随渠道变化：切换渠道时重挂载页面，各页数据自动按新渠道重新加载 */}
-      <main key={channel} className="ml-56 flex-1 px-6 py-6 lg:px-10">
-        {children}
+      <main key={channel} className="ml-56 flex-1">
+        <div className="mx-auto max-w-6xl px-6 py-6 lg:px-10">
+          {children}
+        </div>
       </main>
     </div>
   );

@@ -2,62 +2,110 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --bg: #0c0d0f;
+  --bg-soft: #101114;
+  --panel: rgba(255, 255, 255, 0.025);
+  --panel-strong: #141518;
+  --line: rgba(255, 255, 255, 0.07);
+  --line-strong: rgba(255, 255, 255, 0.13);
+  --text: #eceef1;
+  --text-mute: #8b9099;
+  --text-faint: #5b616a;
+  --accent: #76b900;
+  --accent-dim: rgba(118, 185, 0, 0.14);
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --err: #f87171;
+  --info: #60a5fa;
+}
+
 html,
 body {
-  background-color: #0a0a0f;
-  color: #e5e7eb;
+  background-color: var(--bg);
+  color: var(--text);
   min-height: 100%;
+  font-feature-settings: "ss01", "cv11";
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
 }
 
-body {
+/* 细腻的网格纹理，代替大渐变，不打断阅读 */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
   background-image:
-    radial-gradient(ellipse 60% 50% at 20% -10%, rgba(118, 185, 0, 0.08), transparent),
-    radial-gradient(ellipse 50% 40% at 90% 0%, rgba(79, 156, 249, 0.07), transparent);
-  background-attachment: fixed;
+    linear-gradient(rgba(255, 255, 255, 0.028) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.028) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(ellipse 90% 70% at 50% 0%, black, transparent 80%);
 }
 
+::selection {
+  background: rgba(118, 185, 0, 0.35);
+  color: #fff;
+}
+
+/* ---------- 滚动条 ---------- */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.12);
-  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  border: 3px solid var(--bg);
+  border-radius: 8px;
 }
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.2);
 }
 
+/* ---------- 面板 ---------- */
 .glass {
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(12px);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.panel {
+  background: var(--panel-strong);
+  border: 1px solid var(--line);
   border-radius: 12px;
 }
 
-/* ---- 进入动效（一次性、可打断） ---- */
+/* ---------- 键盘焦点 ---------- */
+:focus-visible {
+  outline: 2px solid rgba(118, 185, 0, 0.55);
+  outline-offset: 1px;
+  border-radius: 4px;
+}
+
+/* ---------- 动效（全部短促） ---------- */
 @keyframes fade-in {
   from { opacity: 0; }
   to { opacity: 1; }
 }
-
 @keyframes modal-in {
-  from { opacity: 0; transform: translateY(10px) scale(0.98); }
+  from { opacity: 0; transform: translateY(8px) scale(0.985); }
   to { opacity: 1; transform: none; }
 }
-
 @keyframes rise-in {
   from { opacity: 0; transform: translateY(-4px); }
   to { opacity: 1; transform: none; }
 }
-
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
 .animate-fade { animation: fade-in 150ms ease-out; }
-.animate-modal { animation: modal-in 180ms ease-out; }
+.animate-modal { animation: modal-in 160ms cubic-bezier(0.32, 0.72, 0, 1); }
 .animate-rise { animation: rise-in 150ms ease-out; }
+.animate-slide-up { animation: slide-up 200ms cubic-bezier(0.32, 0.72, 0, 1); }
 
 @media (prefers-reduced-motion: reduce) {
-  .animate-fade, .animate-modal, .animate-rise { animation: none; }
+  .animate-fade, .animate-modal, .animate-rise, .animate-slide-up { animation: none; }
 }

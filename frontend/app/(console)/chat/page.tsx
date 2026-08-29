@@ -1,9 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Bot, Brain, ChevronDown, ChevronRight, CornerDownLeft, Loader2, Trash2, Zap } from "lucide-react";
-import { AdminChatResponse, API_BASE_URL, api, asList, clearToken, getChannel, getToken, Model } from "@/lib/api";
-import { Button, Card, PageHeader, Select } from "@/components/ui";
+import { Bot, Brain, ChevronDown, ChevronRight, CornerDownLeft, Loader2, Trash2 } from "lucide-react";
+import { AdminChatResponse, API_BASE_URL, api, asList, getChannel, getToken, Model } from "@/lib/api";
+import { Button, PageHeader, Select } from "@/components/ui";
 import { toast } from "@/components/toaster";
 
 interface ChatMessage {
@@ -57,12 +57,11 @@ export default function ChatPage() {
     const text = input.trim();
     if (!text || sending) return;
     if (!model) {
-      toast.error("请先在“模型”页面启用至少一个模型");
+      toast.error("请先在「模型」页面启用至少一个模型");
       return;
     }
     setInput("");
     const history: ChatMessage[] = [...messages, { role: "user", content: text }];
-    // Streamed assistant message placeholder — updated in place per SSE chunk
     const assistant: ChatMessage = { role: "assistant", content: "", reasoning: "" };
     setMessages([...history, assistant]);
     setSending(true);
@@ -147,7 +146,7 @@ export default function ChatPage() {
       }
       paint();
       if (!content && !reasoning && !failed) {
-        setMessages(history); // nothing arrived
+        setMessages(history);
         toast.error("未收到有效响应");
       }
     } catch (e) {
@@ -160,13 +159,12 @@ export default function ChatPage() {
 
   return (
     <div className="flex h-[calc(100vh-3rem)] flex-col">
-      <div className="shrink-0">
       <PageHeader title="对话" subtitle="通过竞速引擎直接测试已启用的模型" actions={
         <>
           <Select
             value={model}
             onChange={(e) => setModel(e.target.value)}
-            className="w-64 !bg-white/[0.03]"
+            className="w-52"
           >
             <option value="">选择模型…</option>
             {models.map((m) => (
@@ -178,7 +176,7 @@ export default function ChatPage() {
           <Select
             value={effort}
             onChange={(e) => setEffort(e.target.value as typeof effort)}
-            className="w-32 !bg-white/[0.03]"
+            className="w-32"
             title="思考强度：仅对支持 reasoning 的模型生效"
           >
             <option value="">思考：默认</option>
@@ -197,86 +195,41 @@ export default function ChatPage() {
           </Button>
         </>
       } />
-      </div>
 
-      <Card className="flex-1 overflow-y-auto p-4">
+      <div className="flex-1 overflow-y-auto rounded-xl border border-line bg-panel-strong p-5">
         {messages.length === 0 ? (
-          <div className="flex h-full flex-col items-center justify-center gap-2 text-gray-600">
-            <Bot size={30} />
-            <p className="text-sm">选择模型并开始对话。请求会经过代理竞速引擎转发到当前渠道。</p>
+          <div className="flex h-full flex-col items-center justify-center gap-3 text-faint">
+            <Bot size={28} strokeWidth={1.5} />
+            <p className="text-[13px]">选择模型并开始对话，请求会经过代理竞速引擎转发到当前渠道</p>
           </div>
         ) : (
-          <div className="space-y-4">
+          <div className="space-y-5">
             {messages.map((m, i) => (
               <div key={i} className={m.role === "user" ? "flex justify-end" : "flex justify-start"}>
                 <div
                   className={
                     m.role === "user"
-                      ? "max-w-[75%] rounded-2xl rounded-br-md bg-accent/15 px-4 py-2.5 text-sm text-gray-100"
-                      : "max-w-[80%] rounded-2xl rounded-bl-md border border-white/10 bg-white/[0.04] px-4 py-2.5 text-sm text-gray-200"
+                      ? "max-w-[75%] rounded-2xl rounded-br-md border border-accent/25 bg-accent/[0.12] px-4 py-2.5 text-[13px] text-gray-100"
+                      : "max-w-[80%] rounded-2xl rounded-bl-md border border-line bg-white/[0.03] px-4 py-2.5 text-[13px] text-gray-200"
                   }
                 >
                   {m.reasoning && <ReasoningBlock text={m.reasoning} />}
                   {m.content
                     ? <p className="whitespace-pre-wrap leading-relaxed">{m.content}</p>
-                    : <p className="text-gray-600">&nbsp;</p>}
-                  {m.meta && (
-                    <div className="mt-2 border-t border-white/10 pt-2 text-[11px] text-gray-500">
-                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                        <span>首字 {Math.round(m.meta.first_token_ms ?? m.meta.first_chunk_ms ?? 0)}ms</span>
-                        <span>总耗时 {Math.round(m.meta.duration_ms ?? m.meta.first_chunk_ms ?? 0)}ms</span>
-                        <span>线路: {m.meta.route_type === "direct" ? "直连" : m.meta.proxy_name}</span>
-                        <span>Key: {m.meta.key_name}</span>
-                      </div>
-                      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-gray-500">
-                        <span>输入 {m.meta.prompt_tokens ?? m.meta.usage?.prompt_tokens ?? 0}</span>
-                        <span>输出 {m.meta.completion_tokens ?? m.meta.usage?.completion_tokens ?? 0}</span>
-                        <span>缓存 {m.meta.cached_tokens ?? 0}</span>
-                        <span>合计 {m.meta.total_tokens ?? m.meta.usage?.total_tokens ?? 0}</span>
-                      </div>
-                      {(m.meta.routes?.length ?? 0) > 0 && (
-                        <div className="mt-1.5 space-y-0.5">
-                          {(m.meta.routes ?? []).map((r, i) => (
-                            <div key={i} className="flex items-center gap-2">
-                              <span
-                                className={
-                                  r.status === "winner"
-                                    ? "text-emerald-400"
-                                    : r.status === "failed"
-                                      ? "text-red-400"
-                                      : "text-gray-600"
-                                }
-                              >
-                                {r.status === "winner" ? "●" : r.status === "failed" ? "✕" : "○"}
-                              </span>
-                              <span className="text-gray-400">
-                                {r.kind === "direct" ? "直连" : r.proxy_name} + {r.key_name}
-                              </span>
-                              <span className="text-gray-600">
-                                {r.status === "winner"
-                                  ? `${r.latency_ms}ms · 胜出`
-                                  : r.status === "cancelled"
-                                    ? "已取消"
-                                    : `${r.error}${r.http_status ? ` (${r.http_status})` : ""}`}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  )}
+                    : <p className="text-faint">&nbsp;</p>}
+                  {m.meta && <MetaBlock meta={m.meta} />}
                 </div>
               </div>
             ))}
             {sending && (
-              <div className="flex items-center gap-2 text-sm text-gray-500">
+              <div className="flex items-center gap-2 text-[13px] text-faint">
                 <Loader2 size={14} className="animate-spin" /> 竞速请求中…
               </div>
             )}
             <div ref={bottomRef} />
           </div>
         )}
-      </Card>
+      </div>
 
       <div className="mt-3 flex items-end gap-2">
         <textarea
@@ -290,10 +243,10 @@ export default function ChatPage() {
           }}
           rows={2}
           placeholder="输入消息，Enter 发送，Shift+Enter 换行"
-          className="flex-1 resize-none rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm text-gray-200 outline-none transition-colors placeholder:text-gray-600 focus:border-accent/60"
+          className="flex-1 resize-none rounded-xl border border-line bg-[#0f1013] px-4 py-3 text-[13px] text-gray-200 outline-none transition-colors placeholder:text-faint focus:border-accent/60 focus:ring-2 focus:ring-accent/15"
         />
-        <Button variant="primary" onClick={() => void send()} disabled={!input.trim() || sending}>
-          {sending ? <Loader2 size={16} className="animate-spin" /> : <CornerDownLeft size={16} />}
+        <Button variant="primary" className="h-10" onClick={() => void send()} disabled={!input.trim() || sending}>
+          {sending ? <Loader2 size={15} className="animate-spin" /> : <CornerDownLeft size={15} />}
           发送
         </Button>
       </div>
@@ -301,22 +254,69 @@ export default function ChatPage() {
   );
 }
 
+function MetaBlock({ meta }: { meta: NonNullable<ChatMessage["meta"]> }) {
+  return (
+    <div className="mt-2.5 rounded-lg border border-line bg-black/20 px-3 py-2 text-[11px] text-faint">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 tabular-nums">
+        <span>首字 {Math.round(meta.first_token_ms ?? meta.first_chunk_ms ?? 0)}ms</span>
+        <span>总耗时 {Math.round(meta.duration_ms ?? meta.first_chunk_ms ?? 0)}ms</span>
+        <span>线路: {meta.route_type === "direct" ? "直连" : meta.proxy_name}</span>
+        <span>Key: {meta.key_name}</span>
+      </div>
+      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 tabular-nums text-faint/90">
+        <span>输入 {meta.prompt_tokens ?? meta.usage?.prompt_tokens ?? 0}</span>
+        <span>输出 {meta.completion_tokens ?? meta.usage?.completion_tokens ?? 0}</span>
+        <span>缓存 {meta.cached_tokens ?? 0}</span>
+        <span>合计 {meta.total_tokens ?? meta.usage?.total_tokens ?? 0}</span>
+      </div>
+      {(meta.routes?.length ?? 0) > 0 && (
+        <div className="mt-2 space-y-1 border-t border-line pt-2">
+          {(meta.routes ?? []).map((r, i) => (
+            <div key={i} className="flex items-center gap-2">
+              <span
+                className={
+                  r.status === "winner"
+                    ? "text-ok"
+                    : r.status === "failed"
+                      ? "text-err"
+                      : "text-faint/60"
+                }
+              >
+                {r.status === "winner" ? "●" : r.status === "failed" ? "✕" : "○"}
+              </span>
+              <span className="text-gray-400">
+                {r.kind === "direct" ? "直连" : r.proxy_name} + {r.key_name}
+              </span>
+              <span className="text-faint tabular-nums">
+                {r.status === "winner"
+                  ? `${r.latency_ms}ms · 胜出`
+                  : r.status === "cancelled"
+                    ? "已取消"
+                    : `${r.error}${r.http_status ? ` (${r.http_status})` : ""}`}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function ReasoningBlock({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="mb-2 rounded-lg border border-amber-500/15 bg-amber-500/[0.05]">
+    <div className="mb-2 rounded-lg border border-warn/20 bg-warn/[0.05]">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-1.5 px-3 py-2 text-[11px] font-medium text-amber-300/90"
+        className="flex w-full items-center gap-1.5 px-3 py-2 text-[11px] font-medium text-warn"
       >
         <Brain size={12} />
         思考过程
         {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
       </button>
       {open && (
-        <div className="max-h-72 overflow-y-auto border-t border-amber-500/10 px-3 py-2 text-[12px] italic leading-relaxed text-gray-400/90">
+        <div className="max-h-72 overflow-y-auto border-t border-warn/10 px-3 py-2 text-xs italic leading-relaxed text-mute">
           <p className="whitespace-pre-wrap">{text}</p>
         </div>
       )}

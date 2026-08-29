@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { KeyRound } from "lucide-react";
+import { ArrowRight, KeyRound } from "lucide-react";
 import { NvidiaLogo } from "@/components/ui";
 import { api, setToken } from "@/lib/api";
 import { Button, Input } from "@/components/ui";
@@ -33,17 +33,29 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center px-4">
-      <div className="w-full max-w-sm">
+    <div className="relative flex min-h-screen items-center justify-center px-4">
+      {/* 顶部氛围光 */}
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-x-0 top-0 h-72"
+        style={{
+          background:
+            "radial-gradient(ellipse 50% 60% at 50% 0%, rgba(118,185,0,0.1), transparent)",
+        }}
+      />
+      <div className="relative w-full max-w-[360px]">
         <div className="mb-8 text-center">
-          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-accent/15 text-accent">
-            <NvidiaLogo size={30} />
+          <div className="mx-auto mb-4 flex h-11 w-11 items-center justify-center rounded-xl border border-accent/30 bg-accent/10 shadow-[0_0_24px_rgba(118,185,0,0.15)]">
+            <NvidiaLogo size={26} />
           </div>
-          <h1 className="text-2xl font-semibold tracking-wide text-gray-100">NVIDIA2API</h1>
-          <p className="mt-1 text-sm text-gray-500">AI API Infrastructure Console</p>
+          <h1 className="text-lg font-semibold tracking-wide text-gray-100">NVIDIA2API</h1>
+          <p className="mt-1 text-[13px] text-faint">AI API Infrastructure Console</p>
         </div>
 
-        <form onSubmit={submit} className="glass space-y-4 p-6">
+        <form
+          onSubmit={submit}
+          className="rounded-xl border border-line bg-panel-strong p-6 shadow-panel space-y-4"
+        >
           <Input
             placeholder="用户名"
             autoComplete="username"
@@ -58,16 +70,27 @@ export default function LoginPage() {
             value={password}
             onChange={(e) => setPassword(e.target.value)}
           />
-          {error && <p role="alert" className="text-sm text-red-400">{error}</p>}
+          {error && (
+            <p role="alert" className="rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-xs text-err">
+              {error}
+            </p>
+          )}
           <Button
             variant="primary"
-            className="w-full justify-center py-2.5"
+            className="w-full"
             loading={loading}
             type="submit"
           >
-            <KeyRound size={15} />
-            登录
+            {loading ? "登录中…" : (
+              <>
+                登录 <ArrowRight size={14} />
+              </>
+            )}
           </Button>
+          <div className="flex items-center justify-center gap-1.5 pt-1 text-[11px] text-faint">
+            <KeyRound size={11} />
+            管理员凭据由环境变量 ADMIN_USERNAME / ADMIN_PASSWORD 控制
+          </div>
         </form>
       </div>
     </div>

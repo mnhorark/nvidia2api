@@ -27,10 +27,10 @@ export const toast = {
   info: (m: string) => emit("info", m),
 };
 
-const STYLES: Record<ToastType, { icon: typeof Info; cls: string }> = {
-  success: { icon: CheckCircle2, cls: "border-emerald-500/30 text-emerald-300" },
-  error: { icon: XCircle, cls: "border-red-500/30 text-red-300" },
-  info: { icon: Info, cls: "border-sky-500/30 text-sky-300" },
+const CONFIG: Record<ToastType, { icon: typeof Info; stripe: string }> = {
+  success: { icon: CheckCircle2, stripe: "bg-ok" },
+  error: { icon: XCircle, stripe: "bg-err" },
+  info: { icon: Info, stripe: "bg-info" },
 };
 
 export function Toaster() {
@@ -56,22 +56,28 @@ export function Toaster() {
       className="pointer-events-none fixed bottom-5 right-5 z-[100] flex w-80 flex-col gap-2"
     >
       {items.map((t) => {
-        const s = STYLES[t.type];
-        const Icon = s.icon;
+        const cfg = CONFIG[t.type];
+        const Icon = cfg.icon;
         return (
           <div
             key={t.id}
-            className={`pointer-events-auto flex items-start gap-2.5 rounded-xl border bg-[#12121a]/95 px-3.5 py-3 text-sm shadow-2xl backdrop-blur-md ${s.cls}`}
+            className="animate-slide-up pointer-events-auto relative flex items-start gap-2.5 overflow-hidden rounded-lg border border-line-strong bg-[#181a1e] py-2.5 pl-4 pr-2 text-[13px] shadow-pop"
           >
-            <Icon size={16} className="mt-0.5 shrink-0" />
-            <span className="flex-1 text-zinc-200">{t.message}</span>
+            <span className={`absolute inset-y-0 left-0 w-0.5 ${cfg.stripe}`} />
+            <Icon
+              size={15}
+              className={`mt-0.5 shrink-0 ${
+                t.type === "success" ? "text-ok" : t.type === "error" ? "text-err" : "text-info"
+              }`}
+            />
+            <span className="flex-1 leading-snug text-gray-200">{t.message}</span>
             <button
               type="button"
               aria-label="关闭"
               onClick={() => setItems((prev) => prev.filter((x) => x.id !== t.id))}
-              className="mt-0.5 shrink-0 rounded p-0.5 text-zinc-500 transition-colors hover:bg-white/10 hover:text-zinc-200"
+              className="mt-0.5 shrink-0 rounded p-1 text-faint transition-colors hover:bg-white/[0.07] hover:text-gray-200"
             >
-              <X size={13} />
+              <X size={12} />
             </button>
           </div>
         );

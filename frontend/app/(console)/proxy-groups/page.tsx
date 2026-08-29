@@ -9,6 +9,7 @@ import {
   DataTable,
   Field,
   fmtTime,
+  IconButton,
   Input,
   Modal,
   PageHeader,
@@ -74,17 +75,21 @@ export default function ProxyGroupsPage() {
         subtitle="按地区 / 用途组织代理"
         actions={
           <>
+            <Button onClick={load} loading={loading}>
+              <RefreshCw size={14} /> 刷新
+            </Button>
             <Button variant="primary" onClick={() => setEdit({ name: "" })}>
               <Plus size={14} /> 新建分组
-            </Button>
-            <Button onClick={load} loading={loading} aria-label="刷新">
-              <RefreshCw size={14} />
             </Button>
           </>
         }
       />
 
-      {error && <p className="mb-4 text-sm text-red-400">{error}</p>}
+      {error && (
+        <div className="mb-4 rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-[13px] text-err">
+          {error}
+        </div>
+      )}
 
       <DataTable
         loading={loading}
@@ -102,32 +107,31 @@ export default function ProxyGroupsPage() {
         }
       >
         {groups.map((g) => (
-          <tr key={g.id} className="hover:bg-white/[0.02]">
+          <tr key={g.id} className="transition-colors hover:bg-white/[0.025]">
             <Td className="font-medium text-gray-200">{g.name}</Td>
-            <Td className="text-gray-400">{g.country || "—"}</Td>
-            <Td className="max-w-xs truncate text-gray-500">{g.description || "—"}</Td>
-            <Td>{g.proxy_count ?? "—"}</Td>
+            <Td className="text-mute">{g.country || "—"}</Td>
+            <Td className="max-w-xs truncate text-faint">{g.description || "—"}</Td>
+            <Td className="tabular-nums">{g.proxy_count ?? "—"}</Td>
             <Td>
               <Badge status={g.enabled ? "enabled" : "disabled"} />
             </Td>
-            <Td className="text-xs text-gray-500">{fmtTime(g.updated_at)}</Td>
+            <Td className="text-xs text-faint">{fmtTime(g.updated_at)}</Td>
             <Td>
-              <div className="flex items-center gap-1">
-                <button
+              <div className="flex items-center gap-0.5">
+                <IconButton
                   title="编辑"
                   aria-label="编辑"
                   onClick={() => setEdit(g)}
-                  className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
                 >
                   <Pencil size={14} />
-                </button>
-                <button
+                </IconButton>
+                <IconButton
                   aria-label="删除"
+                  danger
                   onClick={() => remove(g)}
-                  className="rounded p-1.5 text-gray-500 hover:bg-red-500/15 hover:text-red-400"
                 >
                   <Trash2 size={14} />
-                </button>
+                </IconButton>
               </div>
             </Td>
           </tr>
@@ -139,7 +143,7 @@ export default function ProxyGroupsPage() {
         title={edit?.id ? "编辑分组" : "新建分组"}
         onClose={() => setEdit(null)}
       >
-        <form onSubmit={save} className="space-y-3">
+        <form onSubmit={save} className="space-y-3.5">
           <Field label="名称">
             <Input
               value={edit?.name ?? ""}
