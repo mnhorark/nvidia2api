@@ -43,13 +43,34 @@ def split_endpoint(url: str, suffix: str = CHAT_PATH_DEFAULT) -> tuple[str, str]
 
 
 def join_url(base: str, path: str) -> str:
+    """把相对路径拼到 base 上，自动合并重叠的路径段。
+
+    base=https://h.com/zen/v1, path=/v1/responses     -> https://h.com/zen/v1/responses
+    base=https://h.com/zen/v1, path=/chat/completions -> https://h.com/zen/v1/chat/completions
+    """
     base = (base or "").rstrip("/")
-    path = (path or "")
+    path = (path or "").strip()
     if not path:
         return base
     if not path.startswith("/"):
         path = "/" + path
-    return base + path
+    # 取 base 的路径部分（剥掉 scheme://host）
+    if "://" in base:
+        _scheme, rest = base.split("://", 1)
+        if "/" in rest:
+            _host, base_path = rest.split("/", 1)
+            base_path = "/" + base_path
+        else:
+            base_path = ""
+    else:
+        base_path = base
+    # 找 base_path 后缀与 path 前缀的最大重叠段，合并去重（避免 /v1/v1 这类重复）
+    overlap = 0
+    for i in range(min(len(base_path), len(path)), 0, -1):
+        if base_path[-i:] == path[:i]:
+            overlap = i
+            break
+    return base + path[overlap:]
 
 
 class AuthScheme(models.TextChoices):
@@ -243,6 +264,14 @@ class AIModel(Timestamped):
     enabled = models.BooleanField(default=False, db_index=True)
     # 跨渠道重名时的路由优先级，越大越优先
     route_priority = models.IntegerField(default=0, db_index=True)
+    # 独立代理分组：设置后该模型的请求只走该分组内的代理线路
+    proxy_group = models.ForeignKey(
+        ProxyGroup, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="models", db_index=True,
+    )
+    # 模型独立端点覆盖：完整 URL 或相对路径（如 /v1/responses）；
+    # 留空则用渠道的 chat 端点。供走 Response API 等非标准端点的模型使用。
+    endpoint = models.CharField(max_length=512, blank=True, default="")
 
     class Meta:
         db_table = "model"

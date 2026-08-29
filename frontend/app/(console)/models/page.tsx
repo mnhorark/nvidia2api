@@ -2,17 +2,20 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Download, Pencil, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
-import { api, asList, Model } from "@/lib/api";
+import { api, asList, Model, ProxyGroup } from "@/lib/api";
 import {
   Badge,
+  BatchBar,
   Button,
   Checkbox,
   DataTable,
   Field,
   fmtTime,
+  IconButton,
   Input,
   Modal,
   PageHeader,
+  Select,
   Td,
   Th,
   Toggle,
@@ -21,6 +24,7 @@ import { toast } from "@/components/toaster";
 
 export default function ModelsPage() {
   const [models, setModels] = useState<Model[]>([]);
+  const [groups, setGroups] = useState<ProxyGroup[]>([]);
   const [q, setQ] = useState("");
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
@@ -34,7 +38,12 @@ export default function ModelsPage() {
     setLoading(true);
     setError("");
     try {
-      setModels(asList<Model>(await api.get("/api/admin/models")));
+      const [m, g] = await Promise.all([
+        api.get("/api/admin/models"),
+        api.get("/api/admin/proxy-groups"),
+      ]);
+      setModels(asList<Model>(m));
+      setGroups(asList<ProxyGroup>(g));
       setSelected(new Set());
     } catch (e) {
       setError(e instanceof Error ? e.message : "加载失败");
@@ -103,7 +112,6 @@ export default function ModelsPage() {
     );
   }
 
-  /** 反选：选中当前未选中的行 */
   function invertSelection() {
     setSelected((prev) => {
       const next = new Set<number>();
@@ -138,6 +146,8 @@ export default function ModelsPage() {
         display_name: edit.display_name ?? "",
         alias: edit.alias ?? "",
         description: edit.description ?? "",
+        proxy_group: edit.proxy_group ?? null,
+        endpoint: edit.endpoint ?? "",
       };
       if (edit.id) await api.patch(`/api/admin/models/${edit.id}`, body);
       else await api.post("/api/admin/models", body);
@@ -158,18 +168,18 @@ export default function ModelsPage() {
             <Button onClick={sync} loading={syncing}>
               <Download size={14} /> 同步渠道模型
             </Button>
+            <Button onClick={load} loading={loading}>
+              <RefreshCw size={14} /> 刷新
+            </Button>
             <Button variant="primary" onClick={() => setEdit({ model_name: "" })}>
               <Plus size={14} /> 添加模型
-            </Button>
-            <Button onClick={load} loading={loading} aria-label="刷新">
-              <RefreshCw size={14} />
             </Button>
           </>
         }
       />
 
       <div className="relative mb-4 max-w-sm">
-        <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-600" />
+        <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-faint" />
         <Input
           className="pl-9"
           placeholder="搜索模型名称…"
@@ -178,26 +188,26 @@ export default function ModelsPage() {
         />
       </div>
 
-      {error && <p className="mb-4 text-sm text-red-400">{error}</p>}
-
-      {selected.size > 0 && (
-        <div className="glass animate-rise mb-3 flex items-center gap-3 px-4 py-2.5 text-sm">
-          <span className="text-gray-400">
-            已选 <b className="text-gray-100">{selected.size}</b> 项
-          </span>
-          <Button disabled={batchBusy} onClick={() => batch("enable")}>批量启用</Button>
-          <Button disabled={batchBusy} onClick={() => batch("disable")}>批量禁用</Button>
-          <Button disabled={batchBusy} onClick={() => batch("delete")}>
-            <Trash2 size={14} /> 批量删除
-          </Button>
-          <Button disabled={selected.size === 0} onClick={invertSelection}>反选</Button>
-          <Button onClick={() => setSelected(new Set())}>取消选择</Button>
+      {error && (
+        <div className="mb-4 rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-[13px] text-err">
+          {error}
         </div>
       )}
 
+      <BatchBar count={selected.size}>
+        <Button size="sm" disabled={batchBusy} onClick={() => batch("enable")}>启用</Button>
+        <Button size="sm" disabled={batchBusy} onClick={() => batch("disable")}>禁用</Button>
+        <Button size="sm" variant="danger" disabled={batchBusy} onClick={() => batch("delete")}>
+          <Trash2 size={13} /> 删除
+        </Button>
+        <span className="h-4 w-px bg-white/[0.12]" />
+        <Button size="sm" disabled={batchBusy} onClick={invertSelection}>反选</Button>
+        <Button size="sm" onClick={() => setSelected(new Set())}>取消</Button>
+      </BatchBar>
+
       <DataTable
         loading={loading}
-        empty="暂无模型，点击“同步渠道模型”拉取"
+        empty="暂无模型，点击「同步渠道模型」拉取"
         head={
           <>
             <Th>
@@ -211,6 +221,8 @@ export default function ModelsPage() {
             <Th>模型名称</Th>
             <Th>对外名称</Th>
             <Th>显示名称</Th>
+            <Th>代理分组</Th>
+            <Th>端点</Th>
             <Th>来源</Th>
             <Th>状态</Th>
             <Th>启用</Th>
@@ -220,7 +232,7 @@ export default function ModelsPage() {
         }
       >
         {filtered.map((m) => (
-          <tr key={m.id} className="hover:bg-white/[0.02]">
+          <tr key={m.id} className="transition-colors hover:bg-white/[0.025]">
             <Td>
               <Checkbox
                 ariaLabel={`选择 ${m.model_name}`}
@@ -230,8 +242,26 @@ export default function ModelsPage() {
             </Td>
             <Td className="font-mono text-xs text-gray-200">{m.model_name}</Td>
             <Td className="font-mono text-xs text-accent">{m.public_name || m.model_name}</Td>
-            <Td className="text-gray-400">{m.display_name || "—"}</Td>
-            <Td className="text-gray-400">{m.provider || "—"}</Td>
+            <Td className="text-mute">{m.display_name || "—"}</Td>
+            <Td>
+              {m.proxy_group_name ? (
+                <span className="rounded border border-line bg-white/[0.03] px-1.5 py-0.5 text-xs text-info">
+                  {m.proxy_group_name}
+                </span>
+              ) : (
+                <span className="text-faint">—</span>
+              )}
+            </Td>
+            <Td>
+              {m.endpoint ? (
+                <span className="rounded border border-line bg-white/[0.03] px-1.5 py-0.5 text-xs text-accent">
+                  {m.endpoint}
+                </span>
+              ) : (
+                <span className="text-faint">chat</span>
+              )}
+            </Td>
+            <Td className="text-mute">{m.provider || "—"}</Td>
             <Td>
               <Badge status={m.enabled ? "enabled" : "disabled"} />
             </Td>
@@ -242,24 +272,23 @@ export default function ModelsPage() {
                 onChange={(v) => setEnabled(m, v)}
               />
             </Td>
-            <Td className="text-xs text-gray-500">{fmtTime(m.updated_at)}</Td>
+            <Td className="text-xs text-faint">{fmtTime(m.updated_at)}</Td>
             <Td>
-              <div className="flex items-center gap-1">
-                <button
+              <div className="flex items-center gap-0.5">
+                <IconButton
                   title="编辑"
                   aria-label="编辑"
                   onClick={() => setEdit(m)}
-                  className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
                 >
                   <Pencil size={14} />
-                </button>
-                <button
+                </IconButton>
+                <IconButton
                   aria-label="删除"
+                  danger
                   onClick={() => remove(m)}
-                  className="rounded p-1.5 text-gray-500 hover:bg-red-500/15 hover:text-red-400"
                 >
                   <Trash2 size={14} />
-                </button>
+                </IconButton>
               </div>
             </Td>
           </tr>
@@ -267,7 +296,7 @@ export default function ModelsPage() {
       </DataTable>
 
       <Modal open={!!edit} title={edit?.id ? "编辑模型" : "添加模型"} onClose={() => setEdit(null)}>
-        <form onSubmit={save} className="space-y-3">
+        <form onSubmit={save} className="space-y-3.5">
           <Field label="模型名称">
             <Input
               placeholder="模型 ID，如 deepseek-ai/deepseek-r1"
@@ -288,7 +317,7 @@ export default function ModelsPage() {
               value={edit?.alias ?? ""}
               onChange={(e) => setEdit((p) => ({ ...p, alias: e.target.value }))}
             />
-            <p className="mt-1 text-xs text-gray-500">
+            <p className="mt-1 text-xs text-faint">
               /v1/models 返回及 chat 请求时的模型名：别名 &gt; 显示名称 &gt; 原始模型名
             </p>
           </Field>
@@ -297,6 +326,39 @@ export default function ModelsPage() {
               value={edit?.description ?? ""}
               onChange={(e) => setEdit((p) => ({ ...p, description: e.target.value }))}
             />
+          </Field>
+          <Field label="独立代理分组（留空则用渠道全部代理）">
+            <Select
+              value={edit?.proxy_group ?? ""}
+              onChange={(e) =>
+                setEdit((p) => ({
+                  ...p,
+                  proxy_group: e.target.value ? Number(e.target.value) : null,
+                }))
+              }
+            >
+              <option value="">默认（渠道全部代理）</option>
+              {groups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                  {g.proxy_count != null ? `（${g.proxy_count}）` : ""}
+                </option>
+              ))}
+            </Select>
+            <p className="mt-1 text-xs text-faint">
+              设置后，该模型的请求只使用该分组内的代理线路，适合区域受限的模型
+            </p>
+          </Field>
+          <Field label="独立端点（留空则用渠道默认 chat 端点）">
+            <Input
+              placeholder="/v1/responses 或 https://host/v1/responses"
+              value={edit?.endpoint ?? ""}
+              onChange={(e) => setEdit((p) => ({ ...p, endpoint: e.target.value }))}
+            />
+            <p className="mt-1 text-xs text-faint">
+              部分模型走 Response API（/v1/responses）等非 chat 端点，在这里独立指定；
+              支持完整 URL 或相对路径。系统会自动转换请求/响应格式。
+            </p>
           </Field>
           <div className="flex justify-end gap-2 pt-2">
             <Button type="button" onClick={() => setEdit(null)}>

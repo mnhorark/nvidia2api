@@ -494,9 +494,26 @@ class ModelListView(AdminRequiredMixin, APIView):
             "display_name": request.data.get("display_name", ""),
             "description": request.data.get("description", ""),
             "provider": request.data.get("provider") or channel.slug,
+            "endpoint": (request.data.get("endpoint") or "").strip(),
             "enabled": request.data.get("enabled", False),
         })
+        self._apply_proxy_group(rec, request)
         return Response(ModelSerializer(rec).data, status=201 if created else 200)
+
+    @staticmethod
+    def _apply_proxy_group(rec, request):
+        gid = request.data.get("proxy_group")
+        if gid in (None, "", "null"):
+            if "proxy_group" in request.data:
+                rec.proxy_group = None
+        else:
+            try:
+                gid = int(gid)
+            except (TypeError, ValueError):
+                return
+            group = rec.channel.proxy_groups.filter(pk=gid).first()
+            rec.proxy_group = group
+        rec.save()
 
 
 class ModelSyncView(AdminRequiredMixin, APIView):
@@ -523,9 +540,25 @@ class ModelDetailView(AdminRequiredMixin, APIView):
         if not rec:
             return Response({"detail": "not found"}, status=404)
         for f in ("display_name", "alias", "route_priority", "description",
-                  "enabled", "status"):
+                  "enabled", "status", "endpoint"):
             if f in request.data:
-                setattr(rec, f, request.data[f])
+                if f == "endpoint":
+                    rec.endpoint = (request.data[f] or "").strip()
+                else:
+                    setattr(rec, f, request.data[f])
+        if "proxy_group" in request.data:
+            gid = request.data.get("proxy_group")
+            if gid in (None, "", "null"):
+                rec.proxy_group = None
+            else:
+                try:
+                    gid = int(gid)
+                except (TypeError, ValueError):
+                    gid = None
+                rec.proxy_group = (
+                    rec.channel.proxy_groups.filter(pk=gid).first()
+                    if gid is not None else None
+                )
         rec.save()
         return Response(ModelSerializer(rec).data)
 
@@ -566,13 +599,13 @@ class ModelBatchView(AdminRequiredMixin, APIView):
 
 
 class ProxyBatchView(AdminRequiredMixin, APIView):
-    """POST {ids: [...], action: "enable"|"disable"|"delete"|"test"}"""
+    """POST {ids: [...], action: "enable"|"disable"|"delete"|"test"|"group"}"""
 
     def post(self, request):
         channel = current_channel(request)
         ids = _parse_ids(request)
         action = request.data.get("action")
-        if not ids or action not in ("enable", "disable", "delete", "test"):
+        if not ids or action not in ("enable", "disable", "delete", "test", "group"):
             return Response({"error": {"message": "ids 与合法 action 必填",
                                        "code": "bad_request"}}, status=400)
         qs = list(channel.proxies.filter(id__in=ids))

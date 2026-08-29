@@ -24,6 +24,8 @@ class Route:
     key: ChannelKey
     proxy: Proxy | None = None
     claimed: bool = False
+    # 模型级端点覆盖（完整 URL 或相对路径）；None 时用渠道 chat 端点
+    url_override: str | None = None
 
     @property
     def name(self) -> str:
@@ -37,18 +39,22 @@ class Route:
 
 
 def build_routes(channel: Channel | None = None,
-                 max_routes: int | None = None) -> list[Route]:
+                 max_routes: int | None = None,
+                 proxy_group: int | None = None,
+                 endpoint: str | None = None) -> list[Route]:
     """Build race routes for a channel.
 
     Route count = min(启用代理数 + 1 直连, 可用 Key 数, max_routes_per_request)。
     每个代理占一条线路，再加上恰好 1 条直连；每条线路分配不同的 Key。
+    `proxy_group` 非空时，仅使用该分组内的代理。
+    `endpoint` 非空时，作为模型级端点覆盖写入每条线路（完整 URL 或相对路径）。
     """
     if channel is None:
         channel = channel_service.default_channel()
     cfg_max = sysconfig.get("max_routes_per_request", channel)
     max_routes = min(max_routes or cfg_max, cfg_max)
 
-    proxies = proxy_service.schedulable_proxies(channel)
+    proxies = proxy_service.schedulable_proxies(channel, group=proxy_group)
     keys = key_service.available_keys(channel)
 
     route_count = min(len(proxies) + 1, len(keys), max_routes)
@@ -62,6 +68,7 @@ def build_routes(channel: Channel | None = None,
         if not key_service.claim_rpm_slot(key.id):
             continue
         proxy = proxies[i] if i < len(proxies) else None
-        routes.append(Route(kind="proxy" if proxy else "direct", key=key, proxy=proxy))
+        routes.append(Route(kind="proxy" if proxy else "direct", key=key,
+                            proxy=proxy, url_override=endpoint or None))
 
     return routes

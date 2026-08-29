@@ -196,9 +196,12 @@ export interface Model {
   route_priority?: number;
   public_name?: string;
   description?: string;
+  proxy_group?: number | null;
+  proxy_group_name?: string;
   provider?: string;
   status?: string;
   enabled: boolean;
+  endpoint?: string;
   created_at: string;
   updated_at: string;
 }

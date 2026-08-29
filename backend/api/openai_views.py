@@ -144,12 +144,22 @@ def chat_completions(request, channel_slug: str | None = None):
         model_name = model.model_name
         stream = bool(body.get("stream"))
         upstream_body = _build_upstream_body(body, model_name)
+        # 记录思考参数：客户端原始传入 + 实际下发到上游，供日志页排查
+        upstream_thinking = thinking.build_upstream(body, model_name)
+        client_thinking = {
+            k: body.get(k) for k in thinking.THINKING_PARAM_KEYS
+            if k in body and body.get(k) is not None
+        }
 
         request_id = key_service.new_request_id()
-        routes = build_routes(channel)
+        # 若模型绑定了独立代理分组，则仅在该分组内选代理；
+        # 若模型设置了独立端点（如 /v1/responses），则覆盖渠道 chat 端点
+        routes = build_routes(channel, proxy_group=model.proxy_group_id,
+                              endpoint=model.endpoint)
         log = RequestLog.objects.create(
             channel=channel, request_id=request_id, user_api_key=user_key,
             model=requested_name, routes_count=len(routes), is_stream=stream,
+            client_thinking=client_thinking, upstream_thinking=upstream_thinking,
         )
         started = time.monotonic()
 
@@ -166,7 +176,9 @@ def chat_completions(request, channel_slug: str | None = None):
             log_id_holder = {"log": log, "started": started}
             semaphore_released_by_stream = True
             resp = _stream_response(routes, upstream_body, log_id_holder,
-                                    user_key, channel, max_attempts)
+                                    user_key, channel, max_attempts,
+                                    proxy_group=model.proxy_group_id,
+                                    endpoint=model.endpoint)
             response = StreamingHttpResponse(resp, content_type="text/event-stream")
             response["Cache-Control"] = "no-cache"
             response["X-Accel-Buffering"] = "no"
@@ -175,7 +187,8 @@ def chat_completions(request, channel_slug: str | None = None):
         result = None
         last_exc: Exception | None = None
         for attempt in range(max_attempts):
-            attempt_routes = routes if attempt == 0 else build_routes(channel)
+            attempt_routes = routes if attempt == 0 else build_routes(
+                channel, proxy_group=model.proxy_group_id, endpoint=model.endpoint)
             if not attempt_routes:
                 last_exc = NoRouteAvailable()
                 continue

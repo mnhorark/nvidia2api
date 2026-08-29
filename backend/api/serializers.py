@@ -93,11 +93,14 @@ class ProxyWriteSerializer(serializers.ModelSerializer):
 
 class ModelSerializer(serializers.ModelSerializer):
     public_name = serializers.CharField(read_only=True)
+    proxy_group_name = serializers.CharField(
+        source="proxy_group.name", read_only=True, default="")
 
     class Meta:
         model = AIModel
         fields = ["id", "channel", "model_name", "display_name", "alias",
                   "route_priority", "public_name", "description",
+                  "proxy_group", "proxy_group_name", "endpoint",
                   "provider", "status", "enabled", "created_at", "updated_at"]
 
 

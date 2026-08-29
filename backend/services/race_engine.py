@@ -16,6 +16,7 @@ from typing import Any, AnyStr, AsyncIterator
 import httpx
 from django.conf import settings
 
+from services import responses_api
 from services.key_service import report_failure, report_success
 from services.load_balancer import Route
 from services.proxy_service import report_proxy_result
@@ -120,8 +121,15 @@ def _client_kwargs(route: Route, stream: bool) -> dict:
 
 
 def _route_url(route: Route) -> str:
-    """该线路的上游完整 chat 端点，由渠道决定。"""
+    """该线路的上游完整 chat 端点，由渠道决定；模型级 endpoint 覆盖优先。"""
     channel = route.key.channel
+    if route.url_override:
+        ep = route.url_override.strip()
+        if ep.startswith("http://") or ep.startswith("https://"):
+            return ep
+        if channel is not None:
+            from apps.core.models import join_url
+            return join_url(channel.base_url, ep)
     if channel is None:
         from django.conf import settings
         return f"{settings.NVIDIA_BASE_URL}/chat/completions"
@@ -157,9 +165,13 @@ async def _do_request(route: Route, body: dict,
         return (_time.monotonic() - t0) * 1000
 
     headers = _route_headers(route)
+    url = _route_url(route)
+    # 模型级端点若为 Responses API（/responses），请求体与响应格式都需转换
+    is_resp = responses_api.is_responses_url(url)
+    body_to_send = responses_api.chat_to_responses_body(body) if is_resp else body
     try:
         async with httpx.AsyncClient(**_client_kwargs(route, False)) as client:
-            resp = await client.post(_route_url(route), json=body, headers=headers)
+            resp = await client.post(url, json=body_to_send, headers=headers)
             data: dict[str, Any] = {}
             try:
                 data = resp.json()
@@ -167,6 +179,8 @@ async def _do_request(route: Route, body: dict,
                 _mark_failure(route, "invalid_json", resp.status_code)
                 return RaceResult(ok=False, route=route, http_status=resp.status_code,
                                   error_type="invalid_json", latency_ms=_elapsed())
+            if is_resp:
+                data = responses_api.responses_payload_to_chat(data)
             if not is_valid_response(resp.status_code, data):
                 typ = _classify_status(resp.status_code, data)
                 _mark_failure(route, typ, resp.status_code)
@@ -257,7 +271,10 @@ async def _stream_first_valid(route: Route, body: dict):
     cm = httpx.AsyncClient(**_client_kwargs(route, True))
     client = await cm.__aenter__()
     try:
-        req_cm = client.stream("POST", _route_url(route), json=body, headers=headers)
+        url = _route_url(route)
+        is_resp = responses_api.is_responses_url(url)
+        body_to_send = responses_api.chat_to_responses_body(body) if is_resp else body
+        req_cm = client.stream("POST", url, json=body_to_send, headers=headers)
         resp = await req_cm.__aenter__()
         if resp.status_code != 200:
             typ = _classify_status(resp.status_code, {})
@@ -270,7 +287,11 @@ async def _stream_first_valid(route: Route, body: dict):
         async for line in ait:
             if not line.strip():
                 continue
-            if is_valid_stream_chunk(line) is not None:
+            if is_resp:
+                if responses_api.parse_stream_event(line) is not None:
+                    first_line = line
+                    break
+            elif is_valid_stream_chunk(line) is not None:
                 first_line = line
                 break
             # a data line present but invalid -> invalid response
@@ -369,8 +390,12 @@ class StreamWinner:
     report: list[dict] = None  # type: ignore[assignment]
 
     async def lines(self) -> AsyncIterator[str]:
-        async for chunk in iter_sse(self.first_line, self.aiter):
-            yield chunk
+        if responses_api.is_responses_url(_route_url(self.route)):
+            async for chunk in responses_api.iter_responses_sse(self.first_line, self.aiter):
+                yield chunk
+        else:
+            async for chunk in iter_sse(self.first_line, self.aiter):
+                yield chunk
 
     async def close(self):
         try:
