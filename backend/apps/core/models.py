@@ -98,6 +98,9 @@ class Channel(Timestamped):
     notes = models.TextField(blank=True, default="")
     # 公共 Key 渠道（如 Zen/Kilo）允许同渠道内复用同一 key 导入多条名额
     allow_duplicate_keys = models.BooleanField(default=False)
+    # 关闭"无效"标记：公共/匿名 Key 渠道（如 Zen 的 public、无鉴权渠道）不因
+    # 单次上游 401/403 把 Key 永久标记为 invalid（限流 429 / 冷却仍保留，会自动恢复）。
+    disable_key_invalid = models.BooleanField(default=False)
 
     class Meta:
         db_table = "channel"

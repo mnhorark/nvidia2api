@@ -16,13 +16,13 @@ import {
 } from "lucide-react";
 import { Channel, api, asList, setChannel } from "@/lib/api";
 import {
-  Badge,
   Button,
   Card,
   Checkbox,
   DataTable,
   Field,
   fmtTime,
+  IconButton,
   Input,
   Modal,
   PageHeader,
@@ -82,6 +82,7 @@ function ChannelsInner() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [edit, setEdit] = useState<Partial<Channel> | null>(null);
+  const [applyRpmToKeys, setApplyRpmToKeys] = useState(false);
   const [busyId, setBusyId] = useState<number | null>(null);
 
   const load = useCallback(async () => {
@@ -105,7 +106,10 @@ function ChannelsInner() {
   }, [load]);
 
   useEffect(() => {
-    if (params.get("new") === "1") setEdit({ ...EMPTY });
+    if (params.get("new") === "1") {
+      setEdit({ ...EMPTY });
+      setApplyRpmToKeys(false);
+    }
   }, [params]);
 
   async function save(e: React.FormEvent) {
@@ -121,6 +125,8 @@ function ChannelsInner() {
       auth_scheme: edit.auth_scheme,
       default_rpm: Number(edit.default_rpm ?? 40),
       allow_duplicate_keys: edit.allow_duplicate_keys ?? false,
+      disable_key_invalid: edit.disable_key_invalid ?? false,
+      apply_rpm_to_keys: applyRpmToKeys,
       enabled: edit.enabled ?? true,
       is_default: edit.is_default ?? false,
       notes: edit.notes ?? "",
@@ -129,6 +135,7 @@ function ChannelsInner() {
       if (edit.id) await api.patch(`/api/admin/channels/${edit.id}`, body);
       else await api.post("/api/admin/channels", body);
       setEdit(null);
+      setApplyRpmToKeys(false);
       await load();
       // 通知 layout 重拉渠道列表，侧边栏名称等信息保持同步（不带 slug，不切换全局渠道）
       window.dispatchEvent(new CustomEvent("nvidia2api:channel-change"));
@@ -222,14 +229,18 @@ function ChannelsInner() {
             <Button onClick={load} loading={loading}>
               <RefreshCw size={14} /> 刷新
             </Button>
-            <Button variant="primary" onClick={() => setEdit({ ...EMPTY })}>
+            <Button variant="primary" onClick={() => { setEdit({ ...EMPTY }); setApplyRpmToKeys(false); }}>
               <Plus size={14} /> 新增渠道
             </Button>
           </>
         }
       />
 
-      {error && <p className="mb-4 text-sm text-red-400">{error}</p>}
+      {error && (
+        <div className="mb-4 rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-[13px] text-err">
+          {error}
+        </div>
+      )}
 
       <DataTable
         loading={loading}
@@ -250,38 +261,45 @@ function ChannelsInner() {
         }
       >
         {channels.map((c) => (
-          <tr key={c.id} className={c.slug === current ? "bg-accent/[0.04]" : "hover:bg-white/[0.02]"}>
+          <tr
+            key={c.id}
+            className={
+              c.slug === current
+                ? "bg-accent/[0.05] transition-colors"
+                : "transition-colors hover:bg-white/[0.025]"
+            }
+          >
             <Td>
-              <div className="flex items-center gap-2">
-                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-accent/15">
+              <div className="flex items-center gap-2.5">
+                <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-accent/20 bg-accent/10">
                   <Layers size={12} className="text-accent" />
                 </span>
                 <div>
-                  <div className="font-medium text-gray-200">{c.name}</div>
-                  <code className="text-[10px] text-gray-500">{c.slug}</code>
+                  <div className="text-[13px] font-medium text-gray-200">{c.name}</div>
+                  <code className="text-[10px] text-faint">{c.slug}</code>
                 </div>
               </div>
             </Td>
             <Td>
-              <code className="block max-w-[260px] truncate font-mono text-[11px] text-gray-400" title={c.chat_url}>
+              <code className="block max-w-[260px] truncate font-mono text-[11px] text-mute" title={c.chat_url}>
                 {c.chat_url}
               </code>
             </Td>
-            <Td className="text-xs text-gray-400">
+            <Td className="text-xs text-mute">
               {c.auth_scheme === "bearer"
                 ? "Bearer"
                 : c.auth_scheme === "x_api_key"
                   ? "X-API-Key"
                   : "无"}
             </Td>
-            <Td className="text-xs text-gray-400">
-              {c.enabled_key_count}/{c.key_count}
+            <Td className="text-xs tabular-nums text-mute">
+              <span className="text-gray-200">{c.enabled_key_count}</span>/{c.key_count}
             </Td>
-            <Td className="text-xs text-gray-400">
-              {c.enabled_proxy_count}/{c.proxy_count}
+            <Td className="text-xs tabular-nums text-mute">
+              <span className="text-gray-200">{c.enabled_proxy_count}</span>/{c.proxy_count}
             </Td>
-            <Td className="text-xs text-gray-400">
-              {c.enabled_model_count}/{c.model_count}
+            <Td className="text-xs tabular-nums text-mute">
+              <span className="text-gray-200">{c.enabled_model_count}</span>/{c.model_count}
             </Td>
             <Td>
               <Toggle
@@ -292,86 +310,86 @@ function ChannelsInner() {
             </Td>
             <Td>
               {c.is_default ? (
-                <span className="text-accent">★ 默认</span>
+                <span className="inline-flex items-center gap-1 text-xs text-accent">
+                  <Star size={12} fill="currentColor" /> 默认
+                </span>
               ) : (
-                <button
+                <IconButton
                   title="设为默认"
                   aria-label="设为默认"
                   onClick={() => makeDefault(c)}
-                  className="rounded p-1 text-gray-600 hover:bg-white/10 hover:text-gray-200"
                 >
                   <Star size={13} />
-                </button>
+                </IconButton>
               )}
             </Td>
-            <Td className="text-xs text-gray-500">{fmtTime(c.updated_at)}</Td>
+            <Td className="text-xs text-faint">{fmtTime(c.updated_at)}</Td>
             <Td>
-              <div className="flex items-center gap-1">
-                <button
+              <div className="flex items-center gap-0.5">
+                <IconButton
                   title={c.slug === current ? "当前渠道" : "切换到此渠道"}
                   aria-label={c.slug === current ? "当前渠道" : "切换到此渠道"}
                   disabled={c.slug === current}
+                  active={c.slug === current}
                   onClick={() => switchTo(c)}
-                  className={c.slug === current
-                    ? "rounded p-1.5 text-accent"
-                    : "rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"}
                 >
                   {c.slug === current ? <Check size={14} /> : <Plug size={14} />}
-                </button>
-                <button
+                </IconButton>
+                <IconButton
                   title="测试连通性"
                   aria-label="测试连通性"
                   disabled={busyId === c.id}
                   onClick={() => test(c)}
-                  className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
                 >
                   <FlaskConical size={14} />
-                </button>
-                <button
+                </IconButton>
+                <IconButton
                   title="同步该渠道模型"
                   aria-label="同步该渠道模型"
                   disabled={busyId === c.id}
                   onClick={() => syncModels(c)}
-                  className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
                 >
                   <Download size={14} />
-                </button>
-                <button
+                </IconButton>
+                <IconButton
                   title="编辑"
                   aria-label="编辑"
-                  onClick={() => setEdit(c)}
-                  className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
+                  onClick={() => { setEdit(c); setApplyRpmToKeys(false); }}
                 >
                   <Pencil size={14} />
-                </button>
-                <button
+                </IconButton>
+                <IconButton
                   title="删除"
                   aria-label="删除"
+                  danger
                   onClick={() => remove(c)}
-                  className="rounded p-1.5 text-gray-500 hover:bg-red-500/15 hover:text-red-400"
                 >
                   <Trash2 size={14} />
-                </button>
+                </IconButton>
               </div>
             </Td>
           </tr>
         ))}
       </DataTable>
 
-      <Card className="mt-6">
-        <h3 className="mb-3 text-sm font-medium text-gray-300">对外调用地址</h3>
-        <p className="mb-3 text-xs leading-relaxed text-gray-500">
+      <Card className="mt-5">
+        <h3 className="mb-3 text-[13px] font-medium text-gray-200">对外调用地址</h3>
+        <p className="mb-3 text-xs leading-relaxed text-mute">
           平台对外仍是一套 OpenAI 兼容接口。默认渠道直连 <code>/v1/*</code>；
           指定渠道加 <code>/c/&lt;slug&gt;</code> 前缀，例如：
         </p>
-        <div className="space-y-1.5">
+        <div className="space-y-1.5 rounded-lg border border-line bg-black/20 p-3">
           {channels.map((c) => (
-            <div key={c.id} className="flex items-center gap-2 text-xs">
-              <Badge status={c.slug === current ? "healthy" : "disabled"} />
-              <code className="font-mono text-gray-400">
+            <div key={c.id} className="flex items-center gap-2.5 text-xs">
+              <span
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                  c.slug === current ? "bg-accent" : "bg-faint/50"
+                }`}
+              />
+              <code className="font-mono text-gray-300">
                 /c/{c.slug}/v1/chat/completions
               </code>
-              <span className="text-gray-600">→ {c.chat_url}</span>
+              <span className="text-faint">→ {c.chat_url}</span>
             </div>
           ))}
         </div>
@@ -383,15 +401,16 @@ function ChannelsInner() {
         title={edit?.id ? `编辑渠道 · ${edit.name}` : "新增渠道"}
         onClose={() => setEdit(null)}
       >
-        <form onSubmit={save} className="space-y-3">
+        <form onSubmit={save} className="space-y-3.5">
           {!edit?.id && (
             <div>
-              <p className="mb-2 text-xs text-gray-500">快速填充：</p>
+              <p className="mb-2 text-xs text-mute">快速填充：</p>
               <div className="flex flex-wrap gap-2">
                 {PRESETS.map((p) => (
                   <Button
                     key={p.slug}
                     type="button"
+                    size="sm"
                     onClick={() => setEdit((v) => ({ ...v, ...p }))}
                   >
                     {p.name}
@@ -427,7 +446,7 @@ function ChannelsInner() {
               placeholder="https://opencode.ai/zen/v1/chat/completions"
               required
             />
-            <p className="mt-1 text-[11px] text-gray-600">
+            <p className="mt-1 text-[11px] text-faint">
               可直接粘贴完整 chat 地址，系统会自动拆出 base 与 path
             </p>
           </Field>
@@ -477,6 +496,17 @@ function ChannelsInner() {
             </Field>
           </div>
 
+          {edit?.id && (
+            <label className="flex cursor-pointer items-center gap-2.5 text-[13px] text-gray-300">
+              <Checkbox
+                checked={applyRpmToKeys}
+                onChange={(v) => setApplyRpmToKeys(v)}
+                ariaLabel="保存时把默认 RPM 应用到现有 Key"
+              />
+              保存时把「默认 RPM」应用到该渠道所有现有 Key（覆盖各 Key 当前 RPM）
+            </label>
+          )}
+
           <Field label="备注">
             <Textarea
               rows={2}
@@ -485,33 +515,24 @@ function ChannelsInner() {
             />
           </Field>
 
-          <div className="flex items-center gap-5 pt-1">
-            <label className="flex items-center gap-2 text-sm text-gray-300">
-              <Checkbox
-                checked={edit?.enabled ?? true}
-                onChange={(v) => setEdit((s) => ({ ...s, enabled: v }))}
-                ariaLabel="启用"
-              />
-              启用
-            </label>
-            <label className="flex items-center gap-2 text-sm text-gray-300">
-              <Checkbox
-                checked={edit?.is_default ?? false}
-                onChange={(v) => setEdit((s) => ({ ...s, is_default: v }))}
-                ariaLabel="设为默认渠道"
-              />
-              设为默认渠道（/v1/* 走它）
-            </label>
-            <label className="flex items-center gap-2 text-sm text-gray-300">
-              <Checkbox
-                checked={edit?.allow_duplicate_keys ?? false}
-                onChange={(v) => setEdit((s) => ({ ...s, allow_duplicate_keys: v }))}
-                ariaLabel="允许重复 Key"
-              />
-              允许导入重复 Key（公共 Key 渠道）
-            </label>
+          <div className="grid gap-2 rounded-lg border border-line bg-white/[0.02] px-3 py-2.5">
+            {[
+              { key: "enabled", label: "启用", val: edit?.enabled ?? true },
+              { key: "is_default", label: "设为默认渠道（/v1/* 走它）", val: edit?.is_default ?? false },
+              { key: "allow_duplicate_keys", label: "允许导入重复 Key（公共 Key 渠道）", val: edit?.allow_duplicate_keys ?? false },
+              { key: "disable_key_invalid", label: "关闭 Key 无效标记（公共/匿名 Key 渠道，401/403 不标无效，保留限流与冷却）", val: edit?.disable_key_invalid ?? false },
+            ].map((opt) => (
+              <label key={opt.key} className="flex cursor-pointer items-center gap-2.5 text-[13px] text-gray-300">
+                <Checkbox
+                  checked={opt.val}
+                  onChange={(v) => setEdit((s) => ({ ...s, [opt.key]: v }))}
+                  ariaLabel={opt.label}
+                />
+                {opt.label}
+              </label>
+            ))}
           </div>
-          <div className="flex justify-end gap-2 pt-2">
+          <div className="flex justify-end gap-2 pt-1">
             <Button type="button" onClick={() => setEdit(null)}>
               取消
             </Button>

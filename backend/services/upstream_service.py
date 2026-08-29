@@ -15,8 +15,10 @@ logger = logging.getLogger("nvidia2api.upstream")
 
 
 def auth_headers(channel: Channel, api_key: str) -> dict:
-    """按渠道的鉴权方式生成请求头。"""
+    """按渠道的鉴权方式生成请求头。api_key 为空（匿名线路）时不携带任何鉴权头。"""
     headers = {"Content-Type": "application/json"}
+    if not api_key:
+        return headers
     if channel.auth_scheme == AuthScheme.X_API_KEY:
         headers["X-API-Key"] = api_key
     elif channel.auth_scheme == AuthScheme.NONE:

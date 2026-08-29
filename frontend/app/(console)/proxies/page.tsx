@@ -1,16 +1,18 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Gauge, Globe, Pencil, Plus, RefreshCw, Trash2, Upload } from "lucide-react";
+import { Gauge, Globe, Pencil, Plus, RefreshCw, Search, Trash2, Upload } from "lucide-react";
 import { api, asList, ChannelKey, Proxy, ProxyGroup } from "@/lib/api";
 import {
   Badge,
+  BatchBar,
   Button,
   Checkbox,
   DataTable,
   Field,
   fmtLatency,
   fmtTime,
+  IconButton,
   Input,
   Modal,
   PageHeader,
@@ -36,6 +38,10 @@ export default function ProxiesPage() {
   const [testingAll, setTestingAll] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
+  // 节点关键字
+  const [kw, setKw] = useState("");
+  // 批量分组
+  const [groupTarget, setGroupTarget] = useState("");
 
   const maxProxies = Math.max(keyCount - 1, 0);
 
@@ -138,7 +144,6 @@ export default function ProxiesPage() {
     );
   }
 
-  /** 反选：选中当前未选中的行 */
   function invertSelection() {
     setSelected((prev) => {
       const next = new Set<number>();
@@ -175,6 +180,85 @@ export default function ProxiesPage() {
     }
   }
 
+  async function batchGroup(gid: string) {
+    if (!gid || selected.size === 0) return;
+    setBatchBusy(true);
+    try {
+      await api.post("/api/admin/proxies/batch", {
+        ids: [...selected],
+        action: "group",
+        group_id: gid === "__none__" ? null : Number(gid),
+      });
+      toast.success(gid === "__none__" ? "已取消分组" : "批量分组完成");
+      setGroupTarget("");
+      await load();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "批量分组失败");
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
+  /** 按关键字匹配 + 指定前后区间，一键加入选中 */
+  function selectByRange(rangeKey: string) {
+    const needle = kw.trim().toLowerCase();
+    const matched = proxies.filter(
+      (p) =>
+        !needle ||
+        (p.name || "").toLowerCase().includes(needle) ||
+        (p.host || "").toLowerCase().includes(needle)
+    );
+    let picked: typeof proxies = [];
+    switch (rangeKey) {
+      case "all":
+        picked = matched;
+        break;
+      case "front50":
+        picked = matched.slice(0, 50);
+        break;
+      case "front50_100":
+        picked = matched.slice(50, 100);
+        break;
+      case "front100_150":
+        picked = matched.slice(100, 150);
+        break;
+      case "back50":
+        picked = matched.slice(-50);
+        break;
+      case "back50_100":
+        picked = matched.slice(-100, -50);
+        break;
+      case "back100_150":
+        picked = matched.slice(-150, -100);
+        break;
+      default:
+        picked = matched;
+    }
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const p of picked) next.add(p.id);
+      return next;
+    });
+  }
+
+  const RANGE_CHIPS: [string, string][] = [
+    ["all", "全部"],
+    ["front50", "前1-50"],
+    ["front50_100", "前50-100"],
+    ["front100_150", "前100-150"],
+    ["back50", "后1-50"],
+    ["back50_100", "后50-100"],
+    ["back100_150", "后100-150"],
+  ];
+
+  const kwMatched = kw.trim()
+    ? proxies.filter(
+        (p) =>
+          (p.name || "").toLowerCase().includes(kw.trim().toLowerCase()) ||
+          (p.host || "").toLowerCase().includes(kw.trim().toLowerCase())
+      ).length
+    : proxies.length;
+
   async function doImport() {
     try {
       const res = await api.post<Record<string, number>>("/api/admin/proxies/import", {
@@ -209,6 +293,8 @@ export default function ProxiesPage() {
     }
   }
 
+  const atCap = enabledCount >= maxProxies && maxProxies > 0;
+
   return (
     <div>
       <PageHeader
@@ -222,56 +308,108 @@ export default function ProxiesPage() {
             <Button onClick={testAll} loading={testingAll}>
               <Gauge size={14} /> 全部测速
             </Button>
+            <Button onClick={load} loading={loading}>
+              <RefreshCw size={14} /> 刷新
+            </Button>
             <Button
               variant="primary"
               onClick={() => setEditItem({ protocol: "socks5", port: 0 })}
             >
               <Plus size={14} /> 添加代理
             </Button>
-            <Button onClick={load} loading={loading} aria-label="刷新">
-              <RefreshCw size={14} />
-            </Button>
           </>
         }
       />
 
-      <div className="glass mb-5 flex flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3 text-sm [font-variant-numeric:tabular-nums]">
-        <span className="text-gray-400">
-          渠道 Key：<b className="text-gray-100">{keyCount}</b>
-        </span>
-        <span className="text-gray-400">
-          启用代理：
-          <b className="text-accent">{enabledCount}</b>
-          <span className="text-gray-600"> / {maxProxies}（最多）</span>
-        </span>
-        <span className="text-gray-400">直连线路：1</span>
-        <span className="text-gray-400">
-          当前总线路：<b className="text-gray-100">{Math.min(enabledCount, maxProxies) + 1}</b>
-        </span>
-        {enabledCount >= maxProxies && maxProxies > 0 && (
-          <span className="text-xs text-amber-400">已达启用上限</span>
-        )}
+      {/* 线路状态条 */}
+      <div className="mb-5 grid grid-cols-2 gap-3 md:grid-cols-4">
+        <div className="rounded-lg border border-line bg-panel-strong px-4 py-3">
+          <div className="text-[11px] text-faint">渠道 Key</div>
+          <div className="mt-0.5 text-lg font-semibold tabular-nums text-gray-100">{keyCount}</div>
+        </div>
+        <div className={`rounded-lg border px-4 py-3 ${atCap ? "border-warn/30 bg-warn/[0.05]" : "border-line bg-panel-strong"}`}>
+          <div className="text-[11px] text-faint">启用代理</div>
+          <div className="mt-0.5 text-lg font-semibold tabular-nums text-gray-100">
+            <span className={atCap ? "text-warn" : "text-accent"}>{enabledCount}</span>
+            <span className="text-sm font-normal text-faint"> / {maxProxies}</span>
+          </div>
+          {atCap && <div className="text-[10px] text-warn">已达启用上限</div>}
+        </div>
+        <div className="rounded-lg border border-line bg-panel-strong px-4 py-3">
+          <div className="text-[11px] text-faint">直连线路</div>
+          <div className="mt-0.5 text-lg font-semibold tabular-nums text-gray-100">1</div>
+        </div>
+        <div className="rounded-lg border border-line bg-panel-strong px-4 py-3">
+          <div className="text-[11px] text-faint">当前总线路</div>
+          <div className="mt-0.5 text-lg font-semibold tabular-nums text-gray-100">
+            {Math.min(enabledCount, maxProxies) + 1}
+          </div>
+        </div>
       </div>
 
-      {error && <p className="mb-4 text-sm text-red-400">{error}</p>}
-
-      {selected.size > 0 && (
-        <div className="glass animate-rise mb-3 flex items-center gap-3 px-4 py-2.5 text-sm">
-          <span className="text-gray-400">
-            已选 <b className="text-gray-100">{selected.size}</b> 项
-          </span>
-          <Button disabled={batchBusy} onClick={() => batch("enable")}>批量启用</Button>
-          <Button disabled={batchBusy} onClick={() => batch("disable")}>批量禁用</Button>
-          <Button disabled={batchBusy} onClick={() => batch("test")}>
-            <Gauge size={14} /> 批量测速
-          </Button>
-          <Button disabled={batchBusy} onClick={() => batch("delete")}>
-            <Trash2 size={14} /> 批量删除
-          </Button>
-          <Button disabled={selected.size === 0} onClick={invertSelection}>反选</Button>
-          <Button onClick={() => setSelected(new Set())}>取消选择</Button>
+      {error && (
+        <div className="mb-4 rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-[13px] text-err">
+          {error}
         </div>
       )}
+
+      {/* 快速选择 / 筛选 */}
+      <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-line bg-panel px-3 py-2.5">
+        <div className="relative">
+          <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
+          <Input
+            className="h-7 w-40 border-white/[0.08] bg-white/[0.03] pl-8 text-xs"
+            placeholder="节点关键字…"
+            value={kw}
+            onChange={(e) => setKw(e.target.value)}
+          />
+        </div>
+        <div className="flex items-center gap-0.5 rounded-md bg-white/[0.04] p-0.5">
+          {RANGE_CHIPS.map(([key, label]) => (
+            <button
+              key={key}
+              disabled={batchBusy}
+              onClick={() => selectByRange(key)}
+              className="rounded px-2 py-1 text-[11px] text-mute transition-colors hover:bg-white/[0.08] hover:text-gray-200 disabled:opacity-50"
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <span className="text-[11px] tabular-nums text-faint">
+          匹配 {kwMatched} · 已选 {selected.size}
+        </span>
+      </div>
+
+      <BatchBar count={selected.size}>
+        <Button size="sm" disabled={batchBusy} onClick={() => batch("enable")}>启用</Button>
+        <Button size="sm" disabled={batchBusy} onClick={() => batch("disable")}>禁用</Button>
+        <Button size="sm" disabled={batchBusy} onClick={() => batch("test")}>
+          <Gauge size={13} /> 测速
+        </Button>
+        <Button size="sm" variant="danger" disabled={batchBusy} onClick={() => batch("delete")}>
+          <Trash2 size={13} /> 删除
+        </Button>
+        <div className="flex items-center gap-1.5">
+          <Select
+            className="h-7 w-32 text-xs"
+            value={groupTarget}
+            onChange={(e) => setGroupTarget(e.target.value)}
+          >
+            <option value="">批量分组…</option>
+            {groups.map((g) => (
+              <option key={g.id} value={g.id}>{g.name}</option>
+            ))}
+            <option value="__none__">取消分组</option>
+          </Select>
+          <Button size="sm" disabled={batchBusy || !groupTarget} onClick={() => batchGroup(groupTarget)}>
+            应用
+          </Button>
+        </div>
+        <span className="h-4 w-px bg-white/[0.12]" />
+        <Button size="sm" disabled={batchBusy} onClick={invertSelection}>反选</Button>
+        <Button size="sm" onClick={() => setSelected(new Set())}>取消</Button>
+      </BatchBar>
 
       <DataTable
         loading={loading}
@@ -301,7 +439,7 @@ export default function ProxiesPage() {
         }
       >
         {proxies.map((p) => (
-          <tr key={p.id} className="hover:bg-white/[0.02]">
+          <tr key={p.id} className="transition-colors hover:bg-white/[0.025]">
             <Td>
               <Checkbox
                 ariaLabel={`选择 ${p.name}`}
@@ -311,17 +449,31 @@ export default function ProxiesPage() {
             </Td>
             <Td className="font-medium text-gray-200">{p.name}</Td>
             <Td>
-              <code className="rounded bg-white/5 px-1.5 py-0.5 text-xs uppercase text-blue-300">
+              <code className="rounded border border-line bg-white/[0.03] px-1.5 py-0.5 text-[10px] font-medium uppercase text-info">
                 {p.protocol}
               </code>
             </Td>
-            <Td className="font-mono text-xs text-gray-400">
+            <Td className="font-mono text-xs text-mute">
               {p.host}:{p.port}
             </Td>
-            <Td className="text-gray-400">{p.group_name || "—"}</Td>
-            <Td className="font-mono text-xs text-gray-400">{p.public_ip || "—"}</Td>
-            <Td className="text-gray-400">{p.country || "—"}</Td>
-            <Td title={p.latency != null ? `${p.latency} ms` : undefined}>{fmtLatency(p.latency)}</Td>
+            <Td className="text-mute">{p.group_name || "—"}</Td>
+            <Td className="font-mono text-xs text-mute">{p.public_ip || "—"}</Td>
+            <Td className="text-mute">{p.country || "—"}</Td>
+            <Td
+              className="tabular-nums"
+              title={p.latency != null ? `${p.latency} ms` : undefined}
+            >
+              <span
+                className={
+                  p.latency == null ? "text-faint"
+                    : p.latency < 300 ? "text-ok"
+                    : p.latency < 1000 ? "text-gray-200"
+                    : "text-warn"
+                }
+              >
+                {fmtLatency(p.latency)}
+              </span>
+            </Td>
             <Td>
               <Badge status={p.status} />
             </Td>
@@ -332,43 +484,40 @@ export default function ProxiesPage() {
                 onChange={(v) => setEnabled(p, v)}
               />
             </Td>
-            <Td className="text-xs text-gray-500">{fmtTime(p.last_check_time)}</Td>
+            <Td className="text-xs text-faint">{fmtTime(p.last_check_time)}</Td>
             <Td>
-              <div className="flex items-center gap-1">
-                <button
+              <div className="flex items-center gap-0.5">
+                <IconButton
                   title="测速"
                   aria-label="测速"
                   disabled={busyId === p.id}
                   onClick={() => testOne(p)}
-                  className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
                 >
                   <Gauge size={14} />
-                </button>
-                <button
+                </IconButton>
+                <IconButton
                   title="获取 IP"
                   aria-label="获取 IP"
                   disabled={busyId === p.id}
                   onClick={() => fetchIp(p)}
-                  className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
                 >
                   <Globe size={14} />
-                </button>
-                <button
+                </IconButton>
+                <IconButton
                   title="编辑"
                   aria-label="编辑"
                   onClick={() => setEditItem(p)}
-                  className="rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-200"
                 >
                   <Pencil size={14} />
-                </button>
-                <button
+                </IconButton>
+                <IconButton
                   title="删除"
                   aria-label="删除"
+                  danger
                   onClick={() => remove(p)}
-                  className="rounded p-1.5 text-gray-500 hover:bg-red-500/15 hover:text-red-400"
                 >
                   <Trash2 size={14} />
-                </button>
+                </IconButton>
               </div>
             </Td>
           </tr>
@@ -376,7 +525,7 @@ export default function ProxiesPage() {
       </DataTable>
 
       <Modal open={importOpen} wide title="批量导入代理" onClose={() => setImportOpen(false)}>
-        <p className="mb-3 text-xs leading-relaxed text-gray-500">
+        <p className="mb-3 text-xs leading-relaxed text-mute">
           每行一条：名称---协议://[user:pass@]host:port，或直接写代理地址
         </p>
         <Textarea
@@ -398,7 +547,7 @@ export default function ProxiesPage() {
         title={editItem?.id ? "编辑代理" : "添加代理"}
         onClose={() => setEditItem(null)}
       >
-        <form onSubmit={save} className="space-y-3">
+        <form onSubmit={save} className="space-y-3.5">
           <Field label="名称">
             <Input
               value={editItem?.name ?? ""}

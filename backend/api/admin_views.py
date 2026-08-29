@@ -155,6 +155,7 @@ class ChannelListView(AdminRequiredMixin, APIView):
             is_default=make_default,
             notes=request.data.get("notes") or "",
             allow_duplicate_keys=bool(request.data.get("allow_duplicate_keys", False)),
+            disable_key_invalid=bool(request.data.get("disable_key_invalid", False)),
         )
         channel.save()
         return Response(ChannelSerializer(channel).data, status=201)
@@ -178,8 +179,13 @@ class ChannelDetailView(AdminRequiredMixin, APIView):
                         if isinstance(request.data[f], str) else request.data[f])
         if "allow_duplicate_keys" in request.data:
             channel.allow_duplicate_keys = bool(request.data["allow_duplicate_keys"])
+        if "disable_key_invalid" in request.data:
+            channel.disable_key_invalid = bool(request.data["disable_key_invalid"])
         if "default_rpm" in request.data:
             channel.default_rpm = int(request.data["default_rpm"])
+            # 勾选"应用到现有 Key"时，把该渠道所有 Key 的独立 RPM 一并覆盖
+            if request.data.get("apply_rpm_to_keys"):
+                channel.keys.update(rpm_limit=channel.default_rpm)
         if "enabled" in request.data:
             channel.enabled = bool(request.data["enabled"])
         if request.data.get("is_default"):
@@ -235,14 +241,12 @@ class ChannelKeyListView(AdminRequiredMixin, APIView):
                else (channel.default_rpm or 40))
         if rpm is None:
             return _bad_param("rpm_limit")
-        if not key:
-            return Response({"error": {"message": "api_key required", "code": "bad_request"}},
-                            status=400)
-        if channel.keys.filter(api_key=key).exists():
-            return Response({"error": {"message": "duplicate key", "code": "duplicate"}},
-                            status=400)
         if not name:
             name = f"{channel.name} Key {channel.keys.count() + 1:03d}"
+        # 空 key = 匿名线路槽位（无鉴权渠道，如 LLM7 / Zen），允许多条并存
+        if key and channel.keys.filter(api_key=key).exists():
+            return Response({"error": {"message": "duplicate key", "code": "duplicate"}},
+                            status=400)
         rec = ChannelKey.objects.create(channel=channel, name=name, api_key=key,
                                         rpm_limit=rpm)
         return Response(ChannelKeySerializer(rec).data, status=201)
@@ -616,6 +620,24 @@ class ProxyBatchView(AdminRequiredMixin, APIView):
             result = proxy_service.run_async(
                 check_all(channel, ids=[p.id for p in qs]))
             return Response({"matched": len(qs), "action": action, **result})
+        if action == "group":
+            gid = request.data.get("group_id")
+            if gid in (None, "", "null"):
+                channel.proxies.filter(id__in=ids).update(group=None)
+                return Response({"matched": len(qs), "action": action,
+                                 "succeeded": len(qs)})
+            try:
+                gid = int(gid)
+            except (TypeError, ValueError):
+                return Response({"error": {"message": "group_id 非法",
+                                           "code": "bad_request"}}, status=400)
+            group = channel.proxy_groups.filter(pk=gid).first()
+            if not group:
+                return Response({"error": {"message": "分组不存在",
+                                           "code": "not_found"}}, status=404)
+            channel.proxies.filter(id__in=ids).update(group=group)
+            return Response({"matched": len(qs), "action": action,
+                             "succeeded": len(qs), "group_id": gid})
         # enable / disable：逐个走 set_enabled 以保留「启用数 ≤ Key 数 - 1」限制
         done, skipped = 0, []
         for p in qs:
@@ -631,13 +653,13 @@ class ProxyBatchView(AdminRequiredMixin, APIView):
 # ---------------------------------------------------------------- user api keys
 
 class KeyBatchView(AdminRequiredMixin, APIView):
-    """POST {ids: [...], action: "enable"|"disable"|"delete"|"test"}"""
+    """POST {ids: [...], action: "enable"|"disable"|"delete"|"test"|"set_rpm"}"""
 
     def post(self, request):
         channel = current_channel(request)
         ids = _parse_ids(request)
         action = request.data.get("action")
-        if not ids or action not in ("enable", "disable", "delete", "test"):
+        if not ids or action not in ("enable", "disable", "delete", "test", "set_rpm"):
             return Response({"error": {"message": "ids 与合法 action 必填",
                                        "code": "bad_request"}}, status=400)
         qs = list(channel.keys.filter(id__in=ids))
@@ -651,6 +673,13 @@ class KeyBatchView(AdminRequiredMixin, APIView):
                                 **key_service.test_key(k)})
             return Response({"matched": len(qs), "action": action,
                              "results": results})
+        if action == "set_rpm":
+            rpm = _parse_int(request.data.get("rpm"))
+            if rpm is None or rpm < 0:
+                return _bad_param("rpm")
+            changed = channel.keys.filter(id__in=ids).update(rpm_limit=rpm)
+            return Response({"matched": len(qs), "action": action,
+                             "succeeded": changed})
         # enable / disable：仅对非目标状态的行生效，避免反复打状态
         if action == "enable":
             status = ChannelKeyStatus.AVAILABLE

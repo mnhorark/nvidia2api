@@ -23,6 +23,7 @@ class ChannelSerializer(serializers.ModelSerializer):
             "id", "name", "slug", "base_url", "chat_path", "models_path",
             "chat_url", "models_url", "key_prefix", "auth_scheme", "default_rpm",
             "allow_duplicate_keys",
+            "disable_key_invalid",
             "enabled", "is_default", "notes",
             "key_count", "enabled_key_count", "proxy_count", "enabled_proxy_count",
             "model_count", "enabled_model_count", "created_at", "updated_at",
@@ -33,17 +34,23 @@ class ChannelSerializer(serializers.ModelSerializer):
 class ChannelKeySerializer(serializers.ModelSerializer):
     api_key = serializers.SerializerMethodField()
     remaining_rpm = serializers.SerializerMethodField()
+    is_anonymous = serializers.SerializerMethodField()
 
     class Meta:
         model = ChannelKey
         fields = [
-            "id", "channel", "name", "api_key", "status", "rpm_limit",
+            "id", "channel", "name", "api_key", "is_anonymous", "status", "rpm_limit",
             "minute_request_count", "remaining_rpm", "success_count", "failure_count",
             "last_used_at", "last_error", "created_at", "updated_at",
         ]
 
     def get_api_key(self, obj):
+        if not obj.api_key:
+            return ""
         return mask_key(obj.api_key)
+
+    def get_is_anonymous(self, obj):
+        return not obj.api_key
 
     def get_remaining_rpm(self, obj):
         from django.utils import timezone

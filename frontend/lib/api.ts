@@ -125,6 +125,7 @@ export interface Channel {
   auth_scheme: string;
   default_rpm: number;
   allow_duplicate_keys: boolean;
+  disable_key_invalid: boolean;
   enabled: boolean;
   is_default: boolean;
   notes: string;
@@ -143,6 +144,7 @@ export interface ChannelKey {
   channel: number | null;
   name: string;
   api_key: string; // 已脱敏
+  is_anonymous?: boolean; // 无鉴权渠道的匿名线路（无需 Key）
   status: string;
   enabled?: boolean;
   rpm_limit: number;

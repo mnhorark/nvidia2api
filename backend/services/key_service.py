@@ -9,15 +9,21 @@ from django.db import transaction
 from django.db.models import F, Q
 from django.utils import timezone
 
-from apps.core.models import Channel, ChannelKey, ChannelKeyStatus
+from apps.core.models import AuthScheme, Channel, ChannelKey, ChannelKeyStatus
 from services import sysconfig
 
 logger = logging.getLogger("nvidia2api.keys")
 
 MINUTE_SECONDS = 60
 
+# 无鉴权渠道（如 LLM7 / Zen）的“无需 Key”标记：导入时该条目成为匿名线路槽位，
+# api_key 存空字符串，上游请求不携带鉴权头，但仍占用一个可调度的 Key 名额。
+NO_KEY_MARKER = "@nokey"
+
 
 def mask_key(key: str) -> str:
+    if not key:
+        return ""
     if len(key) <= 10:
         return key[:4] + "****"
     return key[:10] + "*" * 8 + key[-4:]
@@ -39,7 +45,14 @@ def parse_import_text(text: str) -> list[tuple[str, str, str | None]]:
 
 
 def bulk_import_keys(text: str, channel: Channel) -> dict:
-    """Import keys from `name---key` or bare `key` lines into a channel."""
+    """Import keys from `name---key` or bare `key` lines into a channel.
+
+    无鉴权渠道（auth_scheme=none，如 LLM7）可导入“无需 Key”的匿名线路：
+      - `名称---` / `名称---@nokey`：显式匿名，名称保留；
+      - 裸行（无 `---`）：直接作为匿名线路的名称（无需再写 `---`）。
+    每条匿名线路仅作为可调度的线路槽位（api_key 存空字符串，请求不上送鉴权头）。
+    """
+    no_auth = channel.auth_scheme == AuthScheme.NONE
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     seen_in_batch: set[str] = set()
     result = {"success": 0, "duplicate": 0, "invalid": 0, "failed": 0, "errors": []}
@@ -48,21 +61,36 @@ def bulk_import_keys(text: str, channel: Channel) -> dict:
     default_rpm = sysconfig.get("default_upstream_rpm", channel)
     for ln in lines:
         auto_named = False
+        anonymous = False
         if "---" in ln:
             name, key = (p.strip() for p in ln.split("---", 1))
             if not name:
                 name = f"{label} Key {auto_idx:03d}"
                 auto_named = True
+        elif no_auth:
+            # 无鉴权渠道：裸行就是一条匿名线路的名称，不用再写 `---`；
+            # 裸 `@nokey` 则自动命名。
+            if ln == NO_KEY_MARKER:
+                name = f"{label} Key {auto_idx:03d}"
+                key, anonymous = "", True
+                auto_named = True
+            else:
+                name, key, anonymous = ln, "", True
         else:
             key = ln
             name = f"{label} Key {auto_idx:03d}"
             auto_named = True
-        if not key or " " in key:
+        # 空 key 或显式 `@nokey` 标记 → 匿名线路槽位
+        if key in ("", NO_KEY_MARKER):
+            key = ""
+            anonymous = True
+        if not anonymous and (not key or " " in key):
             result["invalid"] += 1
             result["errors"].append({"line": ln, "reason": "invalid_format"})
             continue
+        # 匿名线路每个都是独立槽位，跳过重复检查（允许多条并存）
         allow_dup = bool(getattr(channel, "allow_duplicate_keys", False))
-        if not allow_dup and (
+        if not anonymous and not allow_dup and (
             key in seen_in_batch or channel.keys.filter(api_key=key).exists()
         ):
             result["duplicate"] += 1
@@ -178,7 +206,14 @@ def report_failure(key_id: int, error_type: str, http_status: int = 0):
     elif http_status == 429:
         new_status = ChannelKeyStatus.RATE_LIMITED
     with transaction.atomic():
-        key = ChannelKey.objects.select_for_update().get(pk=key_id)
+        key = ChannelKey.objects.select_for_update().select_related("channel").get(pk=key_id)
+        breaker_off = bool(key.channel and key.channel.disable_key_invalid)
+        # 匿名线路（api_key 为空）的 401/403 是"上游必须鉴权"的确定性信号：
+        # 空 key 永远无法通过鉴权。不受 disable_key_invalid 影响，一律标 invalid，
+        # 否则会一直留在调度池里反复 401（"开了禁用无效还是没用"的根因）。
+        is_anonymous = not key.api_key
+        if breaker_off and new_status == ChannelKeyStatus.INVALID and not is_anonymous:
+            new_status = None
         key.failure_count += 1
         key.last_error = f"{error_type}:{http_status}" if http_status else error_type
         fields = ["failure_count", "last_error"]
