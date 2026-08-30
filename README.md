@@ -1,19 +1,45 @@
 # NVIDIA2API
 
-针对 NVIDIA AI API 的 API 聚合、代理加速、Key 池管理、代理池管理与 OpenAI 兼容中转平台。
+多渠道的 AI API 聚合中转平台：一套对外 OpenAI 兼容接口，背后可同时接入 NVIDIA、OpenCode Zen、Kilo、LLM7 等任意 OpenAI 兼容上游。每个渠道的 Key、代理池、代理分组、模型、请求日志、设置完全独立。
+
+![cover](doc/img/cover.png)
+
+## 多渠道
+
+一个**渠道（Channel）** = 一个上游端点 + 一套独立配置。新增渠道时直接粘贴完整 chat 地址即可，系统自动拆出 base 与 path：
+
+| 渠道 | 粘贴的地址 | 自动解析出的 chat_url |
+|---|---|---|
+| OpenCode Zen | `https://opencode.ai/zen/v1/chat/completions` | 同左 |
+| Kilo Gateway | `https://api.kilo.ai/api/gateway/chat/completions` | 同左 |
+| LLM7 | `https://api.llm7.io/v1/chat/completions` | 同左 |
+| NVIDIA | `https://integrate.api.nvidia.com/v1` | `.../v1/chat/completions` |
+
+对外调用方式：
+
+```text
+/v1/chat/completions               -> 默认渠道
+/c/<slug>/v1/chat/completions      -> 指定渠道，如 /c/zen/v1/chat/completions
+```
+
+各渠道相互隔离的资源：**Keys、代理池、代理分组、模型、请求日志、运行参数**。
+跨渠道共享的资源：平台对外的用户 API Key（`sk-nvidia2api-*`）。
 
 ![cover](doc/img/cover.png)
 
 ## 功能
 
-- NVIDIA API Key 管理：CRUD、批量导入（`name---key` 或纯 `key`）、默认 40 RPM、服务端滑动窗口限流、429/401/5xx 自动冷却与状态管理
-- 代理池：SOCKS5/HTTP/HTTPS、批量导入、分组、并发异步测速（延迟 + 公网 IP + 地理位置）、启用数量强制 `≤ NVIDIA Key 数 - 1`（后端强制，前端仅展示）
-- 模型管理：从 NVIDIA 同步模型、启停控制，仅 `enabled=true` 的模型通过 OpenAI API 暴露
-- OpenAI 兼容 API：`GET /v1/models`、`POST /v1/chat/completions`（含 `stream=true` SSE）
-- 请求竞速引擎：一次请求 = 每代理 1 条线路 + 1 条直连线路，每条线路绑定不同的 NVIDIA Key，`asyncio` 并发 + `FIRST_COMPLETED` + 响应有效性校验，首个有效响应为 Winner，其余任务立即取消
-- 用户 API Key：`sk-nvidia2api-*`，仅存 SHA-256 Hash，创建时完整展示一次，支持每 Key 独立 RPM
-- 请求日志：request_id、耗时、Winner 线路、Key、代理、状态、Token 统计
-- Dashboard：Key/Proxy/Model/请求量/成功率/平均延迟统计
+- 渠道管理：任意 OpenAI 兼容上游（NVIDIA / OpenCode Zen / Kilo / LLM7 …），粘贴完整 chat 地址自动解析，支持 Bearer / X-API-Key / 无鉴权，一键切换、设为默认、连通性测试
+- 渠道 Keys 管理：CRUD、批量导入（`name---key` 或纯 `key`）、每渠道独立默认 RPM、服务端滑动窗口限流、429/401/5xx 自动冷却与状态管理
+- 代理池：SOCKS5/HTTP/HTTPS、批量导入、分组、并发异步测速（延迟 + 公网 IP + 地理位置）；按渠道隔离，启用数量强制 `≤ 该渠道 Key 数 - 1`（后端强制，前端仅展示）
+- 模型管理：按渠道同步上游模型、启停控制，仅 `enabled=true` 的模型对外暴露；同名模型可在不同渠道共存
+- OpenAI 兼容 API：`/v1/*` 走默认渠道，`/c/<slug>/v1/*` 指定渠道；含 `stream=true` SSE
+- 请求竞速引擎：一次请求 = 每代理 1 条线路 + 1 条直连线路，每条线路绑定不同的渠道 Key，`asyncio` 并发 + `FIRST_COMPLETED` + 响应有效性校验，首个有效响应为 Winner，其余任务立即取消
+- 用户 API Key：`sk-nvidia2api-*`，仅存 SHA-256 Hash，创建时完整展示一次，支持每 Key 独立 RPM（跨渠道共享）
+- 思考强度透传：`reasoning_effort` / `thinking` / `reasoning_budget` / `chat_template_kwargs` 等多种写法归一化后下发上游，可按模型剥离
+- 请求日志：request_id、耗时、Winner 线路、Key、代理、状态、Token 统计；按渠道隔离
+- Dashboard：Key/Proxy/Model/请求量/成功率/平均延迟统计；跟随当前渠道
+- 设置：运行参数按渠道独立保存，可一键恢复默认
 - 管理后台登录：`/api/admin/login`（用户名密码 → 固定 Token）
 
 ## 技术栈
@@ -25,7 +51,7 @@
 
 ```
 backend/     Django（config/ 配置、apps/core/ 数据模型、services/ 业务服务、api/ Admin + OpenAI API、tests/ 测试）
-frontend/    Next.js 控制台（dashboard、nvidia-keys、proxies、proxy-groups、models、api-keys、request-logs、settings、login）
+frontend/    Next.js 控制台（dashboard、channels、chat、keys、proxies、proxy-groups、models、api-keys、request-logs、settings、login）
 data/        SQLite 数据目录（Docker 卷挂载点）
 ```
 
@@ -38,7 +64,7 @@ cp .env.example .env
 cd backend
 pip install -r requirements.txt
 python manage.py migrate
-python -m pytest tests          # 23 个测试：导入/限流/代理限制/竞速/并发安全
+python -m pytest tests          # 78 个测试：导入/限流/代理限制/竞速/并发安全/思考强度/多渠道
 python manage.py runserver 0.0.0.0:8000
 
 # 前端
@@ -59,19 +85,26 @@ SQLite 数据保存在 `./data`（已挂载到容器 `/app/data`）。
 
 ## 使用流程
 
-1. 登录控制台 → **NVIDIA Keys** → 批量导入 Key（`主账号01---nvapi-xxx` 或每行一个 `nvapi-xxx`，自动去重/自动命名）
-2. **Proxies** → 批量导入代理、测速、获取 IP、启用（数量受 Key 数 - 1 限制）
-3. **Models** → 点击「同步 NVIDIA 模型」，启用要暴露的模型
-4. **API Keys** → 创建用户 Key（完整 Key 仅显示一次）
-5. 用 OpenAI SDK 调用：
+1. 登录控制台 → **渠道** → 新增渠道（内置 OpenCode Zen / Kilo / LLM7 预设，也可直接粘贴自己的端点），用顶部下拉一键切换当前渠道
+2. **渠道 Keys** → 批量导入该渠道的 Key（`主账号01---sk-xxx` 或每行一个 `sk-xxx`，自动去重/自动命名）
+3. **Proxies** → 批量导入代理、测速、获取 IP、启用（数量受该渠道 Key 数 - 1 限制）
+4. **Models** → 点击「同步渠道模型」，启用要暴露的模型
+5. **API Keys** → 创建用户 Key（完整 Key 仅显示一次，跨渠道通用）
+6. 用 OpenAI SDK 调用：
 
 ```python
 from openai import OpenAI
 
+# 默认渠道
 client = OpenAI(api_key="sk-nvidia2api-xxxx", base_url="http://localhost:8000/v1")
-resp = client.chat.completions.create(
-    model="meta/llama-3.3-70b-instruct",
+
+# 指定渠道：base_url 加 /c/<slug> 前缀
+zen = OpenAI(api_key="sk-nvidia2api-xxxx", base_url="http://localhost:8000/c/zen/v1")
+
+resp = zen.chat.completions.create(
+    model="your-model-id",
     messages=[{"role": "user", "content": "你好"}],
+    extra_body={"reasoning_effort": "high"},   # 思考强度会归一化后下发上游
 )
 print(resp.choices[0].message.content)
 ```
@@ -79,7 +112,7 @@ print(resp.choices[0].message.content)
 ## 竞速机制
 
 ```
-用户 → 验证 Key/模型/限流 → build_routes()
+用户 → 解析渠道 → 验证 Key/模型/限流 → build_routes(channel)
   代理A + Key1 ┐
   代理B + Key2 ├ asyncio 并发 (FIRST_COMPLETED)
   直连  + Key3 ┘

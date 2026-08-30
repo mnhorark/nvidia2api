@@ -2,10 +2,24 @@ export const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
 
 export const TOKEN_KEY = "nvidia2api_admin_token";
+export const CHANNEL_KEY = "nvidia2api_channel";
 
 export function getToken(): string | null {
   if (typeof window === "undefined") return null;
   return localStorage.getItem(TOKEN_KEY);
+}
+
+/** 当前选中的渠道 slug；切换渠道后所有管理接口自动带上 X-Channel */
+export function getChannel(): string {
+  if (typeof window === "undefined") return "";
+  return localStorage.getItem(CHANNEL_KEY) ?? "";
+}
+
+export function setChannel(slug: string) {
+  localStorage.setItem(CHANNEL_KEY, slug);
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent("nvidia2api:channel-change", { detail: slug }));
+  }
 }
 
 export function setToken(token: string) {
@@ -48,6 +62,9 @@ export async function request<T = unknown>(
     ...(options.headers as Record<string, string>),
   };
   if (token) headers["Authorization"] = `Token ${token}`;
+  // 渠道作用域：所有管理接口按当前渠道过滤，页面无需各自传参
+  const channel = getChannel();
+  if (channel) headers["X-Channel"] = channel;
 
   const res = await fetch(`${API_BASE_URL}${path}`, { ...options, headers });
 
@@ -95,8 +112,34 @@ export const api = {
 };
 
 // ---------- Types ----------
-export interface NvidiaKey {
+export interface Channel {
   id: number;
+  name: string;
+  slug: string;
+  base_url: string;
+  chat_path: string;
+  models_path: string;
+  chat_url: string;
+  models_url: string;
+  key_prefix: string;
+  auth_scheme: string;
+  default_rpm: number;
+  enabled: boolean;
+  is_default: boolean;
+  notes: string;
+  key_count: number;
+  enabled_key_count: number;
+  proxy_count: number;
+  enabled_proxy_count: number;
+  model_count: number;
+  enabled_model_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChannelKey {
+  id: number;
+  channel: number | null;
   name: string;
   api_key: string; // 已脱敏
   status: string;
@@ -148,6 +191,9 @@ export interface Model {
   id: number;
   model_name: string;
   display_name?: string;
+  alias?: string;
+  route_priority?: number;
+  public_name?: string;
   description?: string;
   provider?: string;
   status?: string;
@@ -205,6 +251,8 @@ export interface RequestLog {
 }
 
 export interface DashboardStats {
+  channel?: string;
+  channel_name?: string;
   nvidia_keys: number;
   enabled_keys: number;
   proxies: number;
@@ -233,15 +281,61 @@ export interface RuntimeParam {
   value: number | string;
   default: number | string;
   description: string;
+  overridden: boolean;
 }
 
 export interface TokenUsageDay {
   date: string;
   prompt_tokens: number;
   completion_tokens: number;
+  cached_tokens: number;
   total_tokens: number;
   requests: number;
   success: number;
+}
+
+export interface UsageTotals {
+  requests: number;
+  success: number;
+  success_rate: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens: number;
+  total_tokens: number;
+  avg_latency_s: number | null;
+  avg_ttft_ms: number | null;
+  cache_hit_rate: number;
+}
+
+export interface UsageTotalsPrev {
+  requests: number;
+  total_tokens: number;
+  success_rate: number;
+}
+
+export interface ChannelUsage {
+  name: string;
+  requests: number;
+  total_tokens: number;
+}
+
+export interface ModelUsage {
+  model: string;
+  requests: number;
+  success: number;
+  success_rate: number;
+  total_tokens: number;
+  avg_latency_s: number | null;
+}
+
+export interface UsageResponse {
+  granularity: "hour" | "day";
+  days: TokenUsageDay[];
+  totals: UsageTotals;
+  prev_totals: UsageTotalsPrev;
+  models: ModelUsage[];
+  channels: ChannelUsage[];
+  keys: ChannelUsage[];
 }
 
 export interface AdminChatRoute {

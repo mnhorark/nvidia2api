@@ -31,6 +31,7 @@ function splitReasoning(raw: string, explicitReasoning?: string) {
 export default function ChatPage() {
   const [models, setModels] = useState<Model[]>([]);
   const [model, setModel] = useState("");
+  const [effort, setEffort] = useState<"" | "off" | "low" | "medium" | "high" | "max">("");
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sending, setSending] = useState(false);
@@ -91,6 +92,7 @@ export default function ChatPage() {
           model,
           stream: true,
           messages: history.map((m) => ({ role: m.role, content: m.content })),
+          ...(effort ? { reasoning_effort: effort } : {}),
         }),
       });
       if (!res.ok || !res.body) {
@@ -152,7 +154,7 @@ export default function ChatPage() {
     } finally {
       setSending(false);
     }
-  }, [input, messages, model, sending]);
+  }, [input, messages, model, effort, sending]);
 
   return (
     <div className="flex h-[calc(100vh-7rem)] flex-col">
@@ -169,6 +171,19 @@ export default function ChatPage() {
                 {m.display_name || m.model_name}
               </option>
             ))}
+          </Select>
+          <Select
+            value={effort}
+            onChange={(e) => setEffort(e.target.value as typeof effort)}
+            className="w-32 !bg-white/[0.03]"
+            title="思考强度：仅对支持 reasoning 的模型生效"
+          >
+            <option value="">思考：默认</option>
+            <option value="off">思考：关闭</option>
+            <option value="low">思考：低</option>
+            <option value="medium">思考：中</option>
+            <option value="high">思考：高</option>
+            <option value="max">思考：最大</option>
           </Select>
           <Button
             onClick={() => setMessages([])}

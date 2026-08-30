@@ -106,16 +106,36 @@ def is_valid_stream_chunk(line: str) -> dict | None:
 
 def _client_kwargs(route: Route, stream: bool) -> dict:
     from services import sysconfig
-    read = sysconfig.get("upstream_read_timeout")
+    channel = route.key.channel
+    read = sysconfig.get("upstream_read_timeout", channel)
     kwargs: dict[str, Any] = {
         "timeout": httpx.Timeout(
-            connect=sysconfig.get("upstream_connect_timeout"),
+            connect=sysconfig.get("upstream_connect_timeout", channel),
             read=read, write=read, pool=read,
         ),
     }
     if route.proxy is not None:
         kwargs["proxy"] = route.proxy.url
     return kwargs
+
+
+def _route_url(route: Route) -> str:
+    """该线路的上游完整 chat 端点，由渠道决定。"""
+    channel = route.key.channel
+    if channel is None:
+        from django.conf import settings
+        return f"{settings.NVIDIA_BASE_URL}/chat/completions"
+    return channel.chat_url
+
+
+def _route_headers(route: Route) -> dict:
+    from services import upstream_service
+
+    channel = route.key.channel
+    if channel is None:
+        return {"Authorization": f"Bearer {route.key.api_key}",
+                "Content-Type": "application/json"}
+    return upstream_service.auth_headers(channel, route.key.api_key)
 
 
 def _classify_error(exc: Exception) -> tuple[str, int]:
@@ -128,7 +148,7 @@ def _classify_error(exc: Exception) -> tuple[str, int]:
     return "network_error", 0
 
 
-async def _do_request(route: Route, body: dict, base_url: str,
+async def _do_request(route: Route, body: dict,
                       started: float | None = None) -> RaceResult:
     import time as _time
     t0 = started if started is not None else _time.monotonic()
@@ -136,15 +156,10 @@ async def _do_request(route: Route, body: dict, base_url: str,
     def _elapsed() -> float:
         return (_time.monotonic() - t0) * 1000
 
-    headers = {
-        "Authorization": f"Bearer {route.key.api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = _route_headers(route)
     try:
         async with httpx.AsyncClient(**_client_kwargs(route, False)) as client:
-            resp = await client.post(
-                f"{base_url}/chat/completions", json=body, headers=headers
-            )
+            resp = await client.post(_route_url(route), json=body, headers=headers)
             data: dict[str, Any] = {}
             try:
                 data = resp.json()
@@ -197,13 +212,13 @@ def _mark_failure(route: Route, error_type: str, http_status: int):
 # racing
 # ---------------------------------------------------------------------------
 
-async def _race(routes: list[Route], body: dict, base_url: str) -> RaceResult:
+async def _race(routes: list[Route], body: dict) -> RaceResult:
     import time as _time
     if not routes:
         raise NoRouteAvailable()
     t0 = _time.monotonic()
     tasks: dict[asyncio.Task, Route] = {
-        asyncio.ensure_future(_do_request(r, body, base_url, t0)): r for r in routes
+        asyncio.ensure_future(_do_request(r, body, t0)): r for r in routes
     }
     report: list[dict] = []
     errors: list[str] = []
@@ -236,18 +251,13 @@ async def _race(routes: list[Route], body: dict, base_url: str) -> RaceResult:
     raise AllRoutesFailed(errors, report)
 
 
-async def _stream_first_valid(route: Route, body: dict, base_url: str):
+async def _stream_first_valid(route: Route, body: dict):
     """Open a streaming connection; yield (client_ctx, response, first_chunk) on validity."""
-    headers = {
-        "Authorization": f"Bearer {route.key.api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = _route_headers(route)
     cm = httpx.AsyncClient(**_client_kwargs(route, True))
     client = await cm.__aenter__()
     try:
-        req_cm = client.stream(
-            "POST", f"{base_url}/chat/completions", json=body, headers=headers
-        )
+        req_cm = client.stream("POST", _route_url(route), json=body, headers=headers)
         resp = await req_cm.__aenter__()
         if resp.status_code != 200:
             typ = _classify_status(resp.status_code, {})
@@ -289,19 +299,19 @@ async def _stream_first_valid(route: Route, body: dict, base_url: str):
         return None, route_info(route, "failed", error=typ)
 
 
-def race_chat(routes: list[Route], body: dict, base_url: str) -> RaceResult:
+def race_chat(routes: list[Route], body: dict) -> RaceResult:
     """Synchronous entry: race non-streaming chat completion."""
-    return asyncio.run(_race(routes, body, base_url))
+    return asyncio.run(_race(routes, body))
 
 
-async def race_stream_winner(routes: list[Route], body: dict, base_url: str):
+async def race_stream_winner(routes: list[Route], body: dict):
     """Race streaming connections; returns (route, cm, req_cm, resp, aiter, first_line, report)."""
     import time as _time
     if not routes:
         raise NoRouteAvailable()
     t0 = _time.monotonic()
     tasks = {
-        asyncio.ensure_future(_stream_first_valid(r, body, base_url)): r for r in routes
+        asyncio.ensure_future(_stream_first_valid(r, body)): r for r in routes
     }
     report: list[dict] = []
     n_failed = 0
@@ -373,7 +383,7 @@ class StreamWinner:
             pass
 
 
-async def race_stream(routes: list[Route], body: dict, base_url: str) -> StreamWinner:
-    route, cm, req_cm, resp, ait, first_line, report = await race_stream_winner(routes, body, base_url)
+async def race_stream(routes: list[Route], body: dict) -> StreamWinner:
+    route, cm, req_cm, resp, ait, first_line, report = await race_stream_winner(routes, body)
     return StreamWinner(route=route, cm=cm, req_cm=req_cm, aiter=ait, first_line=first_line,
                         report=report)

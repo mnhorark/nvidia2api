@@ -4,8 +4,12 @@ from . import admin_views, openai_views
 
 urlpatterns = [
     # OpenAI-compatible
+    # /v1/*                      -> 平台默认渠道
+    # /c/<slug>/v1/*             -> 指定渠道，例如 /c/zen/v1/chat/completions
     path("v1/models", openai_views.list_models),
     path("v1/chat/completions", openai_views.chat_completions),
+    path("c/<slug:channel_slug>/v1/models", openai_views.list_models),
+    path("c/<slug:channel_slug>/v1/chat/completions", openai_views.chat_completions),
 
     # Admin
     path("api/admin/login", admin_views.LoginView.as_view()),
@@ -14,10 +18,20 @@ urlpatterns = [
     path("api/admin/chat", admin_views.AdminChatView.as_view()),
     path("api/admin/settings", admin_views.SettingsView.as_view()),
 
-    path("api/admin/nvidia-keys", admin_views.NvidiaKeyListView.as_view()),
-    path("api/admin/nvidia-keys/import", admin_views.NvidiaKeyImportView.as_view()),
-    path("api/admin/nvidia-keys/<int:pk>", admin_views.NvidiaKeyDetailView.as_view()),
-    path("api/admin/nvidia-keys/<int:pk>/test", admin_views.NvidiaKeyTestView.as_view()),
+    # Channels
+    path("api/admin/channels", admin_views.ChannelListView.as_view()),
+    path("api/admin/channels/<int:pk>", admin_views.ChannelDetailView.as_view()),
+    path("api/admin/channels/<int:pk>/test", admin_views.ChannelTestView.as_view()),
+
+    # 渠道 Keys（兼容旧路径 /api/admin/nvidia-keys/*）
+    path("api/admin/keys", admin_views.ChannelKeyListView.as_view()),
+    path("api/admin/keys/import", admin_views.ChannelKeyImportView.as_view()),
+    path("api/admin/keys/<int:pk>", admin_views.ChannelKeyDetailView.as_view()),
+    path("api/admin/keys/<int:pk>/test", admin_views.ChannelKeyTestView.as_view()),
+    path("api/admin/nvidia-keys", admin_views.ChannelKeyListView.as_view()),
+    path("api/admin/nvidia-keys/import", admin_views.ChannelKeyImportView.as_view()),
+    path("api/admin/nvidia-keys/<int:pk>", admin_views.ChannelKeyDetailView.as_view()),
+    path("api/admin/nvidia-keys/<int:pk>/test", admin_views.ChannelKeyTestView.as_view()),
 
     path("api/admin/proxies", admin_views.ProxyListView.as_view()),
     path("api/admin/proxies/import", admin_views.ProxyImportView.as_view()),
@@ -30,6 +44,7 @@ urlpatterns = [
     path("api/admin/proxy-groups/<int:pk>", admin_views.ProxyGroupDetailView.as_view()),
 
     path("api/admin/models", admin_views.ModelListView.as_view()),
+    path("api/admin/models/batch", admin_views.ModelBatchView.as_view()),
     path("api/admin/models/sync", admin_views.ModelSyncView.as_view()),
     path("api/admin/models/<int:pk>", admin_views.ModelDetailView.as_view()),
 

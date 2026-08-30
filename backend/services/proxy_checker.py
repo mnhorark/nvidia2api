@@ -59,8 +59,12 @@ async def check_proxy(proxy: Proxy, timeout: float | None = None) -> dict:
         return {"ok": False, "error": type(exc).__name__, "latency_ms": round(latency_ms, 1)}
 
 
-async def check_all(timeout: float | None = None) -> dict:
-    proxies = list(Proxy.objects.all())
+async def check_all(channel=None, timeout: float | None = None,
+                    ids: list[int] | None = None) -> dict:
+    qs = Proxy.objects.all() if channel is None else channel.proxies.all()
+    if ids:
+        qs = qs.filter(id__in=ids)
+    proxies = list(qs)
     sem = asyncio.Semaphore(20)
 
     async def one(p):

@@ -2,10 +2,11 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Gauge, Globe, Pencil, Plus, RefreshCw, Trash2, Upload } from "lucide-react";
-import { api, asList, NvidiaKey, Proxy, ProxyGroup } from "@/lib/api";
+import { api, asList, ChannelKey, Proxy, ProxyGroup } from "@/lib/api";
 import {
   Badge,
   Button,
+  Checkbox,
   DataTable,
   Field,
   fmtLatency,
@@ -33,6 +34,8 @@ export default function ProxiesPage() {
   const [editItem, setEditItem] = useState<Partial<Proxy> | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
   const [testingAll, setTestingAll] = useState(false);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
 
   const maxProxies = Math.max(keyCount - 1, 0);
 
@@ -43,13 +46,14 @@ export default function ProxiesPage() {
       const [p, g, k] = await Promise.all([
         api.get("/api/admin/proxies"),
         api.get("/api/admin/proxy-groups"),
-        api.get("/api/admin/nvidia-keys"),
+        api.get("/api/admin/keys"),
       ]);
       const proxyList = asList<Proxy>(p);
       setProxies(proxyList);
+      setSelected(new Set());
       setEnabledCount(proxyList.filter((x) => x.enabled).length);
       setGroups(asList<ProxyGroup>(g));
-      setKeyCount(asList<NvidiaKey>(k).length);
+      setKeyCount(asList<ChannelKey>(k).length);
     } catch (e) {
       setError(e instanceof Error ? e.message : "加载失败");
     } finally {
@@ -119,6 +123,47 @@ export default function ProxiesPage() {
     }
   }
 
+  function toggleOne(id: number) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleAll() {
+    setSelected((prev) =>
+      prev.size === proxies.length ? new Set() : new Set(proxies.map((p) => p.id))
+    );
+  }
+
+  async function batch(action: "enable" | "disable" | "delete" | "test") {
+    if (selected.size === 0) return;
+    if (action === "delete" && !confirm(`确认删除选中的 ${selected.size} 个代理？`)) return;
+    setBatchBusy(true);
+    try {
+      const res = await api.post<{
+        succeeded?: number;
+        skipped?: { id: number; name: string; reason: string }[];
+        ok?: number;
+        failed?: number;
+      }>("/api/admin/proxies/batch", { ids: [...selected], action });
+      if (action === "enable" && res.skipped && res.skipped.length > 0) {
+        toast.error(`已启用 ${res.succeeded ?? 0} 个，${res.skipped.length} 个超出上限被跳过`);
+      } else if (action === "test") {
+        toast.success(`测速完成：成功 ${res.ok ?? 0}，失败 ${res.failed ?? 0}`);
+      } else {
+        toast.success("批量操作完成");
+      }
+      await load();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "批量操作失败");
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
   async function doImport() {
     try {
       const res = await api.post<Record<string, number>>("/api/admin/proxies/import", {
@@ -157,7 +202,7 @@ export default function ProxiesPage() {
     <div>
       <PageHeader
         title="代理池"
-        subtitle="SOCKS5 / HTTP / HTTPS 代理线路管理"
+        subtitle="当前渠道的 SOCKS5 / HTTP / HTTPS 代理线路；启用上限 = 该渠道 Key 数 - 1"
         actions={
           <>
             <Button onClick={() => setImportOpen(true)}>
@@ -179,9 +224,9 @@ export default function ProxiesPage() {
         }
       />
 
-      <div className="glass mb-5 flex flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3 text-sm">
+      <div className="glass mb-5 flex flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3 text-sm [font-variant-numeric:tabular-nums]">
         <span className="text-gray-400">
-          NVIDIA Key：<b className="text-gray-100">{keyCount}</b>
+          渠道 Key：<b className="text-gray-100">{keyCount}</b>
         </span>
         <span className="text-gray-400">
           启用代理：
@@ -199,11 +244,36 @@ export default function ProxiesPage() {
 
       {error && <p className="mb-4 text-sm text-red-400">{error}</p>}
 
+      {selected.size > 0 && (
+        <div className="glass animate-rise mb-3 flex items-center gap-3 px-4 py-2.5 text-sm">
+          <span className="text-gray-400">
+            已选 <b className="text-gray-100">{selected.size}</b> 项
+          </span>
+          <Button disabled={batchBusy} onClick={() => batch("enable")}>批量启用</Button>
+          <Button disabled={batchBusy} onClick={() => batch("disable")}>批量禁用</Button>
+          <Button disabled={batchBusy} onClick={() => batch("test")}>
+            <Gauge size={14} /> 批量测速
+          </Button>
+          <Button disabled={batchBusy} onClick={() => batch("delete")}>
+            <Trash2 size={14} /> 批量删除
+          </Button>
+          <Button onClick={() => setSelected(new Set())}>取消选择</Button>
+        </div>
+      )}
+
       <DataTable
         loading={loading}
         empty="暂无代理"
         head={
           <>
+            <Th>
+              <Checkbox
+                ariaLabel="全选"
+                checked={proxies.length > 0 && selected.size === proxies.length}
+                indeterminate={selected.size > 0 && selected.size < proxies.length}
+                onChange={toggleAll}
+              />
+            </Th>
             <Th>名称</Th>
             <Th>协议</Th>
             <Th>地址</Th>
@@ -220,6 +290,13 @@ export default function ProxiesPage() {
       >
         {proxies.map((p) => (
           <tr key={p.id} className="hover:bg-white/[0.02]">
+            <Td>
+              <Checkbox
+                ariaLabel={`选择 ${p.name}`}
+                checked={selected.has(p.id)}
+                onChange={() => toggleOne(p.id)}
+              />
+            </Td>
             <Td className="font-medium text-gray-200">{p.name}</Td>
             <Td>
               <code className="rounded bg-white/5 px-1.5 py-0.5 text-xs uppercase text-blue-300">

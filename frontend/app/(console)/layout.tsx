@@ -1,27 +1,30 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import {
   Activity,
-  MessageSquareText,
   Boxes,
   FileClock,
   Globe2,
   KeyRound,
+  Layers,
   LayoutDashboard,
   LogOut,
+  MessageSquareText,
   Network,
   Settings,
 } from "lucide-react";
-import { clearToken, getToken } from "@/lib/api";
+import { Channel, api, asList, clearToken, getChannel, getToken, setChannel } from "@/lib/api";
+import { ChannelSwitcher } from "@/components/channel-switcher";
 import { cx, NvidiaLogo } from "@/components/ui";
 
 const NAV = [
   { href: "/dashboard", label: "仪表盘", icon: LayoutDashboard },
+  { href: "/channels", label: "渠道", icon: Layers },
   { href: "/chat", label: "对话", icon: MessageSquareText },
-  { href: "/nvidia-keys", label: "NVIDIA Keys", icon: KeyRound },
+  { href: "/keys", label: "渠道 Keys", icon: KeyRound },
   { href: "/proxies", label: "代理池", icon: Globe2 },
   { href: "/proxy-groups", label: "代理分组", icon: Network },
   { href: "/models", label: "模型", icon: Boxes },
@@ -34,16 +37,41 @@ export default function ConsoleLayout({ children }: { children: React.ReactNode 
   const pathname = usePathname();
   const router = useRouter();
   const [ready, setReady] = useState(false);
+  const [channels, setChannels] = useState<Channel[]>([]);
+  const [channel, setChannelSlug] = useState("");
+
+  const loadChannels = useCallback(async () => {
+    try {
+      const data = await api.get<{ results: Channel[]; current: string }>(
+        "/api/admin/channels"
+      );
+      const list = asList<Channel>(data.results);
+      setChannels(list);
+      const saved = getChannel();
+      const known = list.some((c) => c.slug === saved);
+      const slug = known ? saved : data.current || list[0]?.slug || "";
+      if (slug) setChannel(slug);
+      setChannelSlug(slug);
+    } catch {
+      /* 忽略：登录失效时 request() 会跳转 */
+    }
+  }, []);
 
   useEffect(() => {
     if (!getToken()) {
       router.replace("/login");
     } else {
       setReady(true);
+      void loadChannels();
     }
-  }, [router]);
+  }, [router, loadChannels]);
 
   if (!ready) return null;
+
+  function pick(slug: string) {
+    setChannel(slug);
+    setChannelSlug(slug);
+  }
 
   return (
     <div className="flex min-h-screen">
@@ -58,7 +86,13 @@ export default function ConsoleLayout({ children }: { children: React.ReactNode 
           </div>
         </div>
 
-        <nav className="flex-1 space-y-0.5 overflow-y-auto px-3 py-4">
+        <ChannelSwitcher
+          channels={channels}
+          current={channel}
+          onPick={pick}
+        />
+
+        <nav className="flex-1 space-y-0.5 overflow-y-auto px-3 py-1">
           {NAV.map((item) => {
             const active = pathname.startsWith(item.href);
             const Icon = item.icon;
@@ -94,7 +128,10 @@ export default function ConsoleLayout({ children }: { children: React.ReactNode 
         </div>
       </aside>
 
-      <main className="ml-56 flex-1 px-6 py-6 lg:px-10">{children}</main>
+      {/* key 随渠道变化：切换渠道时重挂载页面，各页数据自动按新渠道重新加载 */}
+      <main key={channel} className="ml-56 flex-1 px-6 py-6 lg:px-10">
+        {children}
+      </main>
     </div>
   );
 }

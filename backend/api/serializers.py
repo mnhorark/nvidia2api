@@ -1,21 +1,44 @@
 from rest_framework import serializers
 
 from apps.core.models import (
-    AIModel, NvidiaApiKey, Proxy, ProxyGroup, RequestLog, SystemSetting, UserApiKey,
+    AIModel, Channel, ChannelKey, Proxy, ProxyGroup, RequestLog, SystemSetting,
+    UserApiKey,
 )
 from services.key_service import mask_key
 
 
-class NvidiaKeySerializer(serializers.ModelSerializer):
+class ChannelSerializer(serializers.ModelSerializer):
+    chat_url = serializers.CharField(read_only=True)
+    models_url = serializers.CharField(read_only=True)
+    key_count = serializers.IntegerField(read_only=True, default=0)
+    enabled_key_count = serializers.IntegerField(read_only=True, default=0)
+    proxy_count = serializers.IntegerField(read_only=True, default=0)
+    enabled_proxy_count = serializers.IntegerField(read_only=True, default=0)
+    model_count = serializers.IntegerField(read_only=True, default=0)
+    enabled_model_count = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = Channel
+        fields = [
+            "id", "name", "slug", "base_url", "chat_path", "models_path",
+            "chat_url", "models_url", "key_prefix", "auth_scheme", "default_rpm",
+            "enabled", "is_default", "notes",
+            "key_count", "enabled_key_count", "proxy_count", "enabled_proxy_count",
+            "model_count", "enabled_model_count", "created_at", "updated_at",
+        ]
+        read_only_fields = ["slug"]
+
+
+class ChannelKeySerializer(serializers.ModelSerializer):
     api_key = serializers.SerializerMethodField()
     remaining_rpm = serializers.SerializerMethodField()
 
     class Meta:
-        model = NvidiaApiKey
+        model = ChannelKey
         fields = [
-            "id", "name", "api_key", "status", "rpm_limit", "minute_request_count",
-            "remaining_rpm", "success_count", "failure_count", "last_used_at",
-            "last_error", "created_at", "updated_at",
+            "id", "channel", "name", "api_key", "status", "rpm_limit",
+            "minute_request_count", "remaining_rpm", "success_count", "failure_count",
+            "last_used_at", "last_error", "created_at", "updated_at",
         ]
 
     def get_api_key(self, obj):
@@ -34,8 +57,8 @@ class ProxyGroupSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ProxyGroup
-        fields = ["id", "name", "description", "country", "enabled", "proxy_count",
-                  "created_at", "updated_at"]
+        fields = ["id", "channel", "name", "description", "country", "enabled",
+                  "proxy_count", "created_at", "updated_at"]
 
 
 class ProxySerializer(serializers.ModelSerializer):
@@ -46,7 +69,7 @@ class ProxySerializer(serializers.ModelSerializer):
     class Meta:
         model = Proxy
         fields = [
-            "id", "name", "protocol", "host", "port", "username", "password",
+            "id", "channel", "name", "protocol", "host", "port", "username", "password",
             "group", "group_name", "country", "region", "city", "isp", "enabled",
             "status", "latency_ms", "public_ip", "last_check_at", "success_count",
             "failure_count", "consecutive_failures", "url", "created_at", "updated_at",
@@ -66,10 +89,13 @@ class ProxyWriteSerializer(serializers.ModelSerializer):
 
 
 class ModelSerializer(serializers.ModelSerializer):
+    public_name = serializers.CharField(read_only=True)
+
     class Meta:
         model = AIModel
-        fields = ["id", "model_name", "display_name", "description", "provider",
-                  "status", "enabled", "created_at", "updated_at"]
+        fields = ["id", "channel", "model_name", "display_name", "alias",
+                  "route_priority", "public_name", "description",
+                  "provider", "status", "enabled", "created_at", "updated_at"]
 
 
 class UserApiKeySerializer(serializers.ModelSerializer):
@@ -83,10 +109,10 @@ class UserApiKeySerializer(serializers.ModelSerializer):
 class RequestLogSerializer(serializers.ModelSerializer):
     class Meta:
         model = RequestLog
-        fields = ["id", "request_id", "model", "created_at", "duration_ms", "status",
-                  "http_status", "error_type", "winner_route_type", "winner_key_name",
-                  "winner_proxy_name", "proxy_public_ip", "is_stream", "routes_count",
-                  "prompt_tokens", "completion_tokens", "total_tokens",
+        fields = ["id", "channel", "request_id", "model", "created_at", "duration_ms",
+                  "status", "http_status", "error_type", "winner_route_type",
+                  "winner_key_name", "winner_proxy_name", "proxy_public_ip", "is_stream",
+                  "routes_count", "prompt_tokens", "completion_tokens", "total_tokens",
                   "cached_tokens", "first_token_ms", "routes"]
 
 

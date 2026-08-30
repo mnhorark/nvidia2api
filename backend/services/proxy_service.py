@@ -1,4 +1,4 @@
-"""Proxy management: import, parse, enable-limit enforcement, groups."""
+"""代理管理：导入、解析、启用上限、分组。全部按渠道隔离。"""
 from __future__ import annotations
 
 import asyncio
@@ -9,22 +9,21 @@ from urllib.parse import urlparse
 from django.db import transaction
 from django.utils import timezone
 
-from apps.core.models import NvidiaApiKey, NvidiaApiKeyStatus, Proxy, ProxyGroup, ProxyStatus
+from apps.core.models import Channel, ChannelKey, ChannelKeyStatus, Proxy, ProxyGroup, ProxyStatus
+from services import sysconfig
 
 logger = logging.getLogger("nvidia2api.proxy")
 
 SUPPORTED_PROTOCOLS = {"socks5", "socks5h", "http", "https"}
 
 
-def max_proxies_for_current_keys() -> int:
-    n = NvidiaApiKey.objects.exclude(
-        status=NvidiaApiKeyStatus.DISABLED
-    ).count()
+def max_proxies_for_channel(channel: Channel) -> int:
+    n = channel.keys.exclude(status=ChannelKeyStatus.DISABLED).count()
     return max(n - 1, 0)
 
 
-def enabled_proxy_count() -> int:
-    return Proxy.objects.filter(enabled=True).count()
+def enabled_proxy_count(channel: Channel) -> int:
+    return channel.proxies.filter(enabled=True).count()
 
 
 def parse_proxy_url(url: str) -> dict | None:
@@ -47,34 +46,38 @@ def parse_proxy_url(url: str) -> dict | None:
     }
 
 
-def bulk_import_proxies(text: str) -> dict:
+def bulk_import_proxies(text: str, channel: Channel) -> dict:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     result = {"success": 0, "duplicate": 0, "invalid": 0, "failed": 0, "errors": []}
-    auto_idx = Proxy.objects.count() + 1
+    auto_idx = channel.proxies.count() + 1
     seen: set[tuple] = set()
     for ln in lines:
+        auto_named = False
         if "---" in ln:
             name, url = (p.strip() for p in ln.split("---", 1))
             if not name:
                 name = f"代理 {auto_idx:03d}"
+                auto_named = True
         else:
             url = ln
             name = f"代理 {auto_idx:03d}"
+            auto_named = True
         parsed = parse_proxy_url(url)
         if not parsed:
             result["invalid"] += 1
             result["errors"].append({"line": ln, "reason": "invalid_format"})
             continue
         ident = (parsed["protocol"], parsed["host"], parsed["port"], parsed["username"])
-        if ident in seen or Proxy.objects.filter(
+        if ident in seen or channel.proxies.filter(
             protocol=ident[0], host=ident[1], port=ident[2], username=ident[3]
         ).exists():
             result["duplicate"] += 1
             continue
         try:
-            Proxy.objects.create(name=name, **parsed)
+            Proxy.objects.create(channel=channel, name=name, **parsed)
             seen.add(ident)
-            auto_idx += 1
+            if auto_named:
+                auto_idx += 1
             result["success"] += 1
         except Exception as exc:  # noqa: BLE001
             logger.exception("import proxy failed")
@@ -84,14 +87,16 @@ def bulk_import_proxies(text: str) -> dict:
 
 
 def set_enabled(proxy: Proxy, enabled: bool) -> tuple[bool, str]:
-    """Enforce: enabled proxies <= number of NVIDIA keys - 1."""
+    """Enforce: enabled proxies <= number of channel keys - 1."""
     if enabled and not proxy.enabled:
-        n_keys = NvidiaApiKey.objects.exclude(status=NvidiaApiKeyStatus.DISABLED).count()
+        channel = proxy.channel
+        n_keys = channel.keys.exclude(status=ChannelKeyStatus.DISABLED).count()
         max_allowed = max(n_keys - 1, 0)
-        current = Proxy.objects.filter(enabled=True).count()
+        current = channel.proxies.filter(enabled=True).count()
         if current >= max_allowed:
             msg = (
-                f"当前 NVIDIA API Key 数量为 {n_keys}，最多允许启用 {max_allowed} 个代理。"
+                f"当前渠道 {channel.name} 的 Key 数量为 {n_keys}，"
+                f"最多允许启用 {max_allowed} 个代理。"
             )
             return False, msg
     proxy.enabled = enabled
@@ -102,6 +107,10 @@ def set_enabled(proxy: Proxy, enabled: bool) -> tuple[bool, str]:
 
 def report_proxy_result(proxy_id: int, success: bool, latency_ms: float | None = None):
     now = timezone.now()
+    proxy = Proxy.objects.filter(pk=proxy_id).first()
+    channel = proxy.channel if proxy else None
+    unhealthy_threshold = sysconfig.get("proxy_unhealthy_threshold", channel)
+    cooldown_seconds = sysconfig.get("proxy_failure_cooldown_seconds", channel)
     with transaction.atomic():
         p = Proxy.objects.select_for_update().get(pk=proxy_id)
         if success:
@@ -118,9 +127,9 @@ def report_proxy_result(proxy_id: int, success: bool, latency_ms: float | None =
         else:
             p.failure_count += 1
             p.consecutive_failures += 1
-            if p.consecutive_failures >= __import__("services.sysconfig", fromlist=["get"]).get("proxy_unhealthy_threshold"):
+            if p.consecutive_failures >= unhealthy_threshold:
                 p.status = ProxyStatus.UNHEALTHY
-                p.cooldown_until = now + timedelta(seconds=__import__("services.sysconfig", fromlist=["get"]).get("proxy_failure_cooldown_seconds"))
+                p.cooldown_until = now + timedelta(seconds=cooldown_seconds)
             elif p.consecutive_failures >= 1:
                 p.status = ProxyStatus.DEGRADED
             p.save(update_fields=[
@@ -129,12 +138,11 @@ def report_proxy_result(proxy_id: int, success: bool, latency_ms: float | None =
             ])
 
 
-def schedulable_proxies() -> list[Proxy]:
+def schedulable_proxies(channel: Channel) -> list[Proxy]:
     """Enabled, not in cooldown, healthy-ish proxies, best first."""
     now = timezone.now()
-    qs = Proxy.objects.filter(enabled=True).select_related("group")
     out = []
-    for p in qs:
+    for p in channel.proxies.filter(enabled=True).select_related("group"):
         if p.cooldown_until and p.cooldown_until > now:
             continue
         if p.status == ProxyStatus.UNHEALTHY:
@@ -147,8 +155,8 @@ def schedulable_proxies() -> list[Proxy]:
     return out
 
 
-def add_group(name: str, **kwargs) -> ProxyGroup:
-    return ProxyGroup.objects.create(name=name, **kwargs)
+def add_group(channel: Channel, name: str, **kwargs) -> ProxyGroup:
+    return ProxyGroup.objects.create(channel=channel, name=name, **kwargs)
 
 
 def run_async(coro):

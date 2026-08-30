@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Ban, Check, FlaskConical, Pencil, Plus, RefreshCw, Trash2, Upload } from "lucide-react";
-import { api, asList, NvidiaKey } from "@/lib/api";
+import { api, asList, Channel, ChannelKey } from "@/lib/api";
 import {
   Badge,
   Button,
@@ -28,21 +28,28 @@ interface ImportResult {
   [k: string]: unknown;
 }
 
-export default function NvidiaKeysPage() {
-  const [keys, setKeys] = useState<NvidiaKey[]>([]);
+export default function ChannelKeysPage() {
+  const [keys, setKeys] = useState<ChannelKey[]>([]);
+  const [channelName, setChannelName] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState("");
   const [importResult, setImportResult] = useState<ImportResult | null>(null);
-  const [editItem, setEditItem] = useState<Partial<NvidiaKey> | null>(null);
+  const [editItem, setEditItem] = useState<Partial<ChannelKey> | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
-      setKeys(asList<NvidiaKey>(await api.get("/api/admin/nvidia-keys")));
+      const [k, ch] = await Promise.all([
+        api.get("/api/admin/keys"),
+        api.get<{ results: Channel[]; current: string }>("/api/admin/channels"),
+      ]);
+      setKeys(asList<ChannelKey>(k));
+      const list = asList<Channel>(ch.results);
+      setChannelName(list.find((c) => c.slug === ch.current)?.name ?? "");
     } catch (e) {
       setError(e instanceof Error ? e.message : "加载失败");
     } finally {
@@ -56,7 +63,7 @@ export default function NvidiaKeysPage() {
 
   async function doImport() {
     try {
-      const res = await api.post<ImportResult>("/api/admin/nvidia-keys/import", {
+      const res = await api.post<ImportResult>("/api/admin/keys/import", {
         text: importText,
       });
       setImportResult(res);
@@ -70,15 +77,16 @@ export default function NvidiaKeysPage() {
     e.preventDefault();
     if (!editItem) return;
     const body: Record<string, unknown> = { name: editItem.name };
-    if (editItem.api_key && editItem.api_key.includes("nvapi")) {
+    // 留空表示不修改；各渠道 Key 的格式不同，不做前缀校验
+    if (editItem.api_key && !editItem.api_key.includes("••") && !editItem.api_key.includes("*")) {
       body.api_key = editItem.api_key;
     }
     if (editItem.rpm_limit) body.rpm_limit = editItem.rpm_limit;
     try {
       if (editItem.id) {
-        await api.patch(`/api/admin/nvidia-keys/${editItem.id}`, body);
+        await api.patch(`/api/admin/keys/${editItem.id}`, body);
       } else {
-        await api.post("/api/admin/nvidia-keys", body);
+        await api.post("/api/admin/keys", body);
       }
       setEditItem(null);
       load();
@@ -87,10 +95,10 @@ export default function NvidiaKeysPage() {
     }
   }
 
-  async function toggle(k: NvidiaKey) {
+  async function toggle(k: ChannelKey) {
     setBusyId(k.id);
     try {
-      await api.patch(`/api/admin/nvidia-keys/${k.id}`, {
+      await api.patch(`/api/admin/keys/${k.id}`, {
         enabled: !(k.enabled ?? k.status !== "disabled"),
       });
       await load();
@@ -101,20 +109,20 @@ export default function NvidiaKeysPage() {
     }
   }
 
-  async function remove(k: NvidiaKey) {
+  async function remove(k: ChannelKey) {
     if (!confirm(`确认删除 ${k.name}？`)) return;
     try {
-      await api.del(`/api/admin/nvidia-keys/${k.id}`);
+      await api.del(`/api/admin/keys/${k.id}`);
       load();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "删除失败");
     }
   }
 
-  async function test(k: NvidiaKey) {
+  async function test(k: ChannelKey) {
     setBusyId(k.id);
     try {
-      await api.post(`/api/admin/nvidia-keys/${k.id}/test`, {});
+      await api.post(`/api/admin/keys/${k.id}/test`, {});
       toast.success(`${k.name} 测试完成`);
       load();
     } catch (e) {
@@ -127,8 +135,12 @@ export default function NvidiaKeysPage() {
   return (
     <div>
       <PageHeader
-        title="NVIDIA Keys"
-        subtitle="管理上游 NVIDIA API Key，默认每 Key 限 40 请求/分钟"
+        title="渠道 Keys"
+        subtitle={
+          channelName
+            ? `管理「${channelName}」渠道的上游 API Key，各渠道独立统计与限流`
+            : "管理当前渠道的上游 API Key，各渠道独立统计与限流"
+        }
         actions={
           <>
             <Button onClick={() => setImportOpen(true)}>
@@ -226,7 +238,7 @@ export default function NvidiaKeysPage() {
       <Modal
         open={importOpen}
         wide
-        title="批量导入 NVIDIA Key"
+        title="批量导入渠道 Key"
         onClose={() => {
           setImportOpen(false);
           setImportResult(null);
@@ -258,11 +270,11 @@ export default function NvidiaKeysPage() {
         ) : (
           <>
             <p className="mb-3 text-xs leading-relaxed text-gray-500">
-              每行一条，支持 <code className="text-gray-300">名称---nvapi-xxx</code> 或仅 <code className="text-gray-300">nvapi-xxx</code>
+              每行一条，支持 <code className="text-gray-300">名称---key</code> 或仅 <code className="text-gray-300">key</code>，未命名的按渠道自动命名
             </p>
             <Textarea
               rows={10}
-              placeholder={"主账号01---nvapi-xxxxxxxx\nnvapi-yyyyyyyy"}
+              placeholder={"主账号01---sk-xxxxxxxx\nsk-yyyyyyyy"}
               value={importText}
               onChange={(e) => setImportText(e.target.value)}
             />
@@ -279,7 +291,7 @@ export default function NvidiaKeysPage() {
       {/* 新增/编辑 */}
       <Modal
         open={!!editItem}
-        title={editItem?.id ? "编辑 Key" : "添加 NVIDIA Key"}
+        title={editItem?.id ? "编辑 Key" : "添加渠道 Key"}
         onClose={() => setEditItem(null)}
       >
         <form onSubmit={save} className="space-y-3">
@@ -293,7 +305,7 @@ export default function NvidiaKeysPage() {
           {!editItem?.id && (
             <Field label="API Key">
               <Input
-                placeholder="nvapi-..."
+                placeholder="上游 API Key"
                 onChange={(e) => setEditItem((p) => ({ ...p, api_key: e.target.value }))}
                 required
               />

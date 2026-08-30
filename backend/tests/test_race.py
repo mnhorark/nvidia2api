@@ -1,9 +1,10 @@
 import asyncio
+import itertools
 from unittest.mock import patch
 
 from django.test import TestCase
 
-from apps.core.models import NvidiaApiKey, Proxy
+from apps.core.models import Channel, ChannelKey
 from services.load_balancer import Route
 from services import race_engine
 from services.race_engine import (
@@ -11,8 +12,17 @@ from services.race_engine import (
 )
 
 
+_CHANNEL_SEQ = itertools.count()
+
+
 def make_route(name, key_suffix):
-    key = NvidiaApiKey(name=f"key-{key_suffix}", api_key=f"nvapi-{key_suffix}")
+    """每条线路都挂一个临时渠道：TestCase 会回滚，name/slug 用序号保证不撞。"""
+    seq = next(_CHANNEL_SEQ)
+    channel = Channel.objects.create(
+        name=f"Test-{seq}-{key_suffix}", slug=f"test-{seq}-{key_suffix}",
+        base_url="https://upstream.test/v1")
+    key = ChannelKey(channel=channel, name=f"key-{key_suffix}",
+                     api_key=f"nvapi-{key_suffix}")
     return Route(kind="direct", key=key)
 
 
@@ -64,7 +74,7 @@ class RaceTests(TestCase):
              patch.object(race_engine, "_mark_failure"):
             routes = [make_route(f"r{i}", i) for i in range(len(behaviors))]
             try:
-                result = asyncio.run(race_engine._race(routes, {}, "http://upstream"))
+                result = asyncio.run(race_engine._race(routes, {}))
                 winner_idx = int(result.route.key.name.split("-")[-1])
                 return winner_idx, cancelled, result
             except AllRoutesFailed:
@@ -91,7 +101,7 @@ class StreamRaceTests(TestCase):
 
         cancelled = [False, False, False]
 
-        async def fake_stream(route, body, base_url):
+        async def fake_stream(route, body):
             idx = int(route.key.name.split("-")[-1])
             delay = [0.5, 0.05, 0.3][idx]
             ok = [True, True, False][idx]
@@ -108,7 +118,7 @@ class StreamRaceTests(TestCase):
         with patch.object(race_engine, "_stream_first_valid", fake_stream):
             routes = [make_route(f"r{i}", i) for i in range(3)]
             route, *_ = asyncio.run(
-                race_engine.race_stream_winner(routes, {}, "http://upstream"))
+                race_engine.race_stream_winner(routes, {}))
             self.assertEqual(route.key.name, "key-1")
         self.assertTrue(cancelled[0])
         self.assertTrue(cancelled[2])
@@ -116,10 +126,10 @@ class StreamRaceTests(TestCase):
     def test_stream_all_invalid_raises(self):
         from services import race_engine
 
-        async def fake_stream(route, body, base_url):
+        async def fake_stream(route, body):
             return None, {"name": route.name, "error": "boom"}
 
         with patch.object(race_engine, "_stream_first_valid", fake_stream):
             routes = [make_route("r0", 0)]
             with self.assertRaises(AllRoutesFailed):
-                asyncio.run(race_engine.race_stream_winner(routes, {}, "http://x"))
+                asyncio.run(race_engine.race_stream_winner(routes, {}))

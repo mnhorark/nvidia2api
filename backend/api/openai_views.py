@@ -12,7 +12,7 @@ from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.core.models import AIModel, RequestLog
-from services import api_key_service, key_service
+from services import api_key_service, channel_service, key_service, model_registry, thinking
 from services.load_balancer import build_routes
 from services.race_engine import (
     AllRoutesFailed, NoRouteAvailable, race_chat, race_stream,
@@ -31,25 +31,52 @@ def _authenticate(request):
     return api_key_service.authenticate(auth[7:].strip())
 
 
-def list_models(request):
+def _model_entry(m: AIModel) -> dict:
+    return {
+        "id": m.public_name,
+        "object": "model",
+        "created": int(m.created_at.timestamp()),
+        "owned_by": m.channel.slug if m.channel else m.provider,
+    }
+
+
+def list_models(request, channel_slug: str | None = None):
+    """/v1/models 汇总所有渠道；/c/<slug>/v1/models 只看该渠道。"""
     user_key = _authenticate(request)
     if user_key is None:
         return openai_error("Invalid API key", "invalid_api_key", 401, "authentication_error")
     if not user_key.enabled:
         return openai_error("API key disabled", "key_disabled", 403, "authentication_error")
-    models = AIModel.objects.filter(enabled=True).order_by("model_name")
-    return JsonResponse({
-        "object": "list",
-        "data": [
-            {
-                "id": m.model_name,
-                "object": "model",
-                "created": int(m.created_at.timestamp()),
-                "owned_by": m.provider,
-            }
-            for m in models
-        ],
-    })
+
+    if channel_slug:
+        channel = channel_service.resolve(channel_slug)
+        models = list(channel.models.filter(enabled=True).order_by("model_name"))
+    else:
+        models = model_registry.list_public()
+    return JsonResponse({"object": "list", "data": [_model_entry(m) for m in models]})
+
+
+def _resolve_target(name: str, channel_slug: str | None):
+    """把客户端的 model 名解析成 (AIModel, Channel)；失败返回 (None, None)。
+
+    /c/<slug> 前缀锁定渠道；否则走全局注册表（跨渠道）。
+    """
+    if channel_slug:
+        channel = channel_service.resolve(channel_slug)
+        model = model_registry.resolve_in_channel(name, channel)
+        return model, channel
+    model = model_registry.resolve(name)
+    return model, (model.channel if model else None)
+
+
+def _not_found_error(name: str, channel_slug: str | None):
+    msg = f"The model '{name}' does not exist"
+    if not channel_slug:
+        owners = model_registry.channels_with_model(name)
+        if owners:
+            # 模型存在但所属渠道被禁用，给个可操作的提示
+            msg += f" (disabled channel(s): {', '.join(c.slug for c in owners)})"
+    return openai_error(msg, "model_not_found", 404, "invalid_request_error")
 
 
 ALLOWED_PARAMS = {
@@ -59,8 +86,18 @@ ALLOWED_PARAMS = {
 }
 
 
+def _build_upstream_body(body: dict, model_name: str) -> dict:
+    """通用参数透传 + 思考强度参数归一化下发。"""
+    upstream = {
+        k: v for k, v in body.items()
+        if k in ALLOWED_PARAMS and k not in thinking.THINKING_PARAM_KEYS and v is not None
+    }
+    upstream.update(thinking.build_upstream(body, model_name))
+    return upstream
+
+
 @csrf_exempt
-def chat_completions(request):
+def chat_completions(request, channel_slug: str | None = None):
     if request.method != "POST":
         return openai_error("Method not allowed", "method_not_allowed", 405)
 
@@ -89,29 +126,34 @@ def chat_completions(request):
         if len(request.body) > 4 * 1024 * 1024:
             return openai_error("Request body too large", "payload_too_large", 413)
 
-        model_name = body.get("model", "")
+        # 渠道优先级：URL 前缀 > 请求体里的 channel 字段 > 按 model 名跨渠道解析
+        requested_name = body.get("model", "")
         messages = body.get("messages")
-        if not model_name or not isinstance(messages, list) or not messages:
+        if not requested_name or not isinstance(messages, list) or not messages:
             return openai_error("model and messages are required", "invalid_request",
                                 400, "invalid_request_error")
-        if not AIModel.objects.filter(model_name=model_name, enabled=True).exists():
-            return openai_error(f"The model '{model_name}' does not exist",
-                                "model_not_found", 404, "invalid_request_error")
 
+        slug = channel_slug or (str(body.get("channel") or "").strip() or None)
+        model, channel = _resolve_target(requested_name, slug)
+        if model is None:
+            return _not_found_error(requested_name, slug)
+
+        # 上游必须用真实模型名，别名只在平台对外这一层存在
+        model_name = model.model_name
         stream = bool(body.get("stream"))
-        upstream_body = {k: v for k, v in body.items() if k in ALLOWED_PARAMS and v is not None}
+        upstream_body = _build_upstream_body(body, model_name)
 
         request_id = key_service.new_request_id()
-        routes = build_routes()
+        routes = build_routes(channel)
         log = RequestLog.objects.create(
-            request_id=request_id, user_api_key=user_key, model=model_name,
-            routes_count=len(routes), is_stream=stream,
+            channel=channel, request_id=request_id, user_api_key=user_key,
+            model=requested_name, routes_count=len(routes), is_stream=stream,
         )
         started = time.monotonic()
 
         if not routes:
             _finish_log(log, started, False, 503, "no_available_route")
-            return openai_error("当前没有可用线路（没有可用的 NVIDIA Key）",
+            return openai_error("当前没有可用线路（该渠道没有可用的 Key）",
                                 "no_available_route", 503)
 
         if stream:
@@ -123,7 +165,7 @@ def chat_completions(request):
             return response
 
         try:
-            result = race_chat(routes, upstream_body, settings.NVIDIA_BASE_URL)
+            result = race_chat(routes, upstream_body)
         except NoRouteAvailable:
             _finish_log(log, started, False, 503, "no_available_route")
             return openai_error("当前没有可用线路", "no_available_route", 503)
@@ -148,7 +190,7 @@ def _stream_response(routes, upstream_body, holder, user_key):
 
     async def produce():
         from services.race_engine import race_stream
-        return await race_stream(routes, upstream_body, settings.NVIDIA_BASE_URL)
+        return await race_stream(routes, upstream_body)
 
     winner = None
     loop = asyncio.new_event_loop()

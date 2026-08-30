@@ -282,6 +282,42 @@ export function DataTable({
   );
 }
 
+/* ---------- Checkbox ---------- */
+export function Checkbox({
+  checked,
+  onChange,
+  indeterminate,
+  disabled,
+  ariaLabel,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  indeterminate?: boolean;
+  disabled?: boolean;
+  ariaLabel?: string;
+}) {
+  const ref = React.useRef<HTMLInputElement>(null);
+  React.useEffect(() => {
+    if (ref.current) ref.current.indeterminate = !!indeterminate && !checked;
+  }, [indeterminate, checked]);
+  return (
+    <input
+      ref={ref}
+      type="checkbox"
+      role="checkbox"
+      aria-label={ariaLabel}
+      checked={checked}
+      disabled={disabled}
+      onChange={(e) => onChange(e.target.checked)}
+      className={cx(
+        "h-4 w-4 shrink-0 rounded accent-[#76b900] cursor-pointer align-middle",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40",
+        "disabled:cursor-not-allowed disabled:opacity-40"
+      )}
+    />
+  );
+}
+
 /* ---------- Toggle ---------- */
 export function Toggle({
   checked,
@@ -298,7 +334,9 @@ export function Toggle({
       disabled={disabled}
       onClick={() => onChange(!checked)}
       className={cx(
-        "relative h-5 w-9 rounded-full transition-colors disabled:opacity-40",
+        "relative h-5 w-9 rounded-full transition-colors cursor-pointer " +
+          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40 " +
+          "disabled:opacity-40 disabled:cursor-not-allowed",
         checked ? "bg-accent" : "bg-white/15"
       )}
     >

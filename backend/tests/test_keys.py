@@ -4,23 +4,29 @@ from datetime import timedelta
 from django.test import TestCase, TransactionTestCase
 from django.utils import timezone
 
-from apps.core.models import NvidiaApiKey, NvidiaApiKeyStatus
-from services import key_service
+from apps.core.models import Channel, ChannelKey, ChannelKeyStatus
+from services import channel_service, key_service
+
+
+def _ch():
+    return channel_service.ensure_default_channel()
 
 
 class KeyImportTests(TestCase):
     def test_named_and_bare_formats(self):
         text = "主账号01---nvapi-aaa\n主账号02---nvapi-bbb\nnvapi-ccc\n\n  nvapi-ddd  \n"
-        res = key_service.bulk_import_keys(text)
+        channel = channel_service.ensure_default_channel()
+        res = key_service.bulk_import_keys(text, channel)
         self.assertEqual(res["success"], 4)
-        self.assertEqual(NvidiaApiKey.objects.count(), 4)
-        auto = NvidiaApiKey.objects.get(api_key="nvapi-ccc")
+        self.assertEqual(ChannelKey.objects.count(), 4)
+        auto = ChannelKey.objects.get(api_key="nvapi-ccc")
         self.assertTrue(auto.name.startswith("NVIDIA Key"))
-        self.assertEqual(NvidiaApiKey.objects.get(api_key="nvapi-aaa").name, "主账号01")
+        self.assertEqual(ChannelKey.objects.get(api_key="nvapi-aaa").name, "主账号01")
 
     def test_dedup_and_invalid(self):
-        NvidiaApiKey.objects.create(name="x", api_key="nvapi-dup")
-        res = key_service.bulk_import_keys("nvapi-dup\nnvapi-dup\n   \nbad key\nnvapi-new")
+        ChannelKey.objects.create(channel=_ch(), name="x", api_key="nvapi-dup")
+        res = key_service.bulk_import_keys("nvapi-dup\nnvapi-dup\n   \nbad key\nnvapi-new",
+                                     channel_service.ensure_default_channel())
         self.assertEqual(res["duplicate"], 2)
         self.assertEqual(res["invalid"], 1)
         self.assertEqual(res["success"], 1)
@@ -32,21 +38,21 @@ class KeyImportTests(TestCase):
 
 class RateLimitTests(TestCase):
     def setUp(self):
-        self.key = NvidiaApiKey.objects.create(name="k1", api_key="nvapi-x", rpm_limit=5)
+        self.key = ChannelKey.objects.create(channel=_ch(), name="k1", api_key="nvapi-x", rpm_limit=5)
 
     def test_rpm_enforced(self):
         self.assertTrue(all(key_service.claim_rpm_slot(self.key.id) for _ in range(5)))
         self.assertFalse(key_service.claim_rpm_slot(self.key.id))
         self.key.refresh_from_db()
-        self.assertEqual(self.key.status, NvidiaApiKeyStatus.RATE_LIMITED)
+        self.assertEqual(self.key.status, ChannelKeyStatus.RATE_LIMITED)
 
         # window rolls over
-        NvidiaApiKey.objects.filter(pk=self.key.id).update(
+        ChannelKey.objects.filter(pk=self.key.id).update(
             minute_window_start=timezone.now() - timedelta(seconds=61))
         self.assertTrue(key_service.claim_rpm_slot(self.key.id))
 
     def test_cooldown_blocks(self):
-        NvidiaApiKey.objects.filter(pk=self.key.id).update(
+        ChannelKey.objects.filter(pk=self.key.id).update(
             cooldown_until=timezone.now() + timedelta(seconds=30))
         self.assertFalse(key_service.claim_rpm_slot(self.key.id))
 
@@ -56,7 +62,7 @@ class RateLimitTests(TestCase):
 
 class ConcurrentRateLimitTests(TransactionTestCase):
     def test_concurrent_claims_do_not_exceed_rpm(self):
-        key = NvidiaApiKey.objects.create(name="k1", api_key="nvapi-x", rpm_limit=5)
+        key = ChannelKey.objects.create(channel=_ch(), name="k1", api_key="nvapi-x", rpm_limit=5)
         results = []
 
         def worker():
@@ -74,22 +80,22 @@ class ConcurrentRateLimitTests(TransactionTestCase):
 
 class FailureStatusTests(TestCase):
     def setUp(self):
-        self.key = NvidiaApiKey.objects.create(name="k", api_key="nvapi-y", rpm_limit=40)
+        self.key = ChannelKey.objects.create(channel=_ch(), name="k", api_key="nvapi-y", rpm_limit=40)
 
     def test_401_marks_invalid(self):
         key_service.report_failure(self.key.id, "http_error", 401)
         self.key.refresh_from_db()
-        self.assertEqual(self.key.status, NvidiaApiKeyStatus.INVALID)
+        self.assertEqual(self.key.status, ChannelKeyStatus.INVALID)
 
     def test_429_marks_rate_limited_with_cooldown(self):
         key_service.report_failure(self.key.id, "http_error", 429)
         self.key.refresh_from_db()
-        self.assertEqual(self.key.status, NvidiaApiKeyStatus.RATE_LIMITED)
+        self.assertEqual(self.key.status, ChannelKeyStatus.RATE_LIMITED)
         self.assertIsNotNone(self.key.cooldown_until)
 
     def test_success_resets(self):
         key_service.report_failure(self.key.id, "http_error", 429)
         key_service.report_success(self.key.id)
         self.key.refresh_from_db()
-        self.assertEqual(self.key.status, NvidiaApiKeyStatus.AVAILABLE)
+        self.assertEqual(self.key.status, ChannelKeyStatus.AVAILABLE)
         self.assertIsNone(self.key.cooldown_until)

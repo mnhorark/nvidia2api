@@ -6,6 +6,7 @@ import { api, asList, Model } from "@/lib/api";
 import {
   Badge,
   Button,
+  Checkbox,
   DataTable,
   Field,
   fmtTime,
@@ -26,12 +27,15 @@ export default function ModelsPage() {
   const [error, setError] = useState("");
   const [edit, setEdit] = useState<Partial<Model> | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
       setModels(asList<Model>(await api.get("/api/admin/models")));
+      setSelected(new Set());
     } catch (e) {
       setError(e instanceof Error ? e.message : "加载失败");
     } finally {
@@ -84,6 +88,36 @@ export default function ModelsPage() {
     }
   }
 
+  function toggleOne(id: number) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleAll() {
+    setSelected((prev) =>
+      prev.size === filtered.length ? new Set() : new Set(filtered.map((m) => m.id))
+    );
+  }
+
+  async function batch(action: "enable" | "disable" | "delete") {
+    if (selected.size === 0) return;
+    if (action === "delete" && !confirm(`确认删除选中的 ${selected.size} 个模型？`)) return;
+    setBatchBusy(true);
+    try {
+      await api.post("/api/admin/models/batch", { ids: [...selected], action });
+      toast.success("批量操作完成");
+      await load();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "批量操作失败");
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
   async function save(e: React.FormEvent) {
     e.preventDefault();
     if (!edit) return;
@@ -91,6 +125,7 @@ export default function ModelsPage() {
       const body = {
         model_name: edit.model_name,
         display_name: edit.display_name ?? "",
+        alias: edit.alias ?? "",
         description: edit.description ?? "",
       };
       if (edit.id) await api.patch(`/api/admin/models/${edit.id}`, body);
@@ -110,7 +145,7 @@ export default function ModelsPage() {
         actions={
           <>
             <Button onClick={sync} loading={syncing}>
-              <Download size={14} /> 同步 NVIDIA 模型
+              <Download size={14} /> 同步渠道模型
             </Button>
             <Button variant="primary" onClick={() => setEdit({ model_name: "" })}>
               <Plus size={14} /> 添加模型
@@ -134,11 +169,33 @@ export default function ModelsPage() {
 
       {error && <p className="mb-4 text-sm text-red-400">{error}</p>}
 
+      {selected.size > 0 && (
+        <div className="glass animate-rise mb-3 flex items-center gap-3 px-4 py-2.5 text-sm">
+          <span className="text-gray-400">
+            已选 <b className="text-gray-100">{selected.size}</b> 项
+          </span>
+          <Button disabled={batchBusy} onClick={() => batch("enable")}>批量启用</Button>
+          <Button disabled={batchBusy} onClick={() => batch("disable")}>批量禁用</Button>
+          <Button disabled={batchBusy} onClick={() => batch("delete")}>
+            <Trash2 size={14} /> 批量删除
+          </Button>
+          <Button onClick={() => setSelected(new Set())}>取消选择</Button>
+        </div>
+      )}
+
       <DataTable
         loading={loading}
-        empty="暂无模型，点击“同步 NVIDIA 模型”拉取"
+        empty="暂无模型，点击“同步渠道模型”拉取"
         head={
           <>
+            <Th>
+              <Checkbox
+                ariaLabel="全选"
+                checked={filtered.length > 0 && selected.size === filtered.length}
+                indeterminate={selected.size > 0 && selected.size < filtered.length}
+                onChange={toggleAll}
+              />
+            </Th>
             <Th>模型名称</Th>
             <Th>显示名称</Th>
             <Th>Provider</Th>
@@ -151,9 +208,17 @@ export default function ModelsPage() {
       >
         {filtered.map((m) => (
           <tr key={m.id} className="hover:bg-white/[0.02]">
+            <Td>
+              <Checkbox
+                ariaLabel={`选择 ${m.model_name}`}
+                checked={selected.has(m.id)}
+                onChange={() => toggleOne(m.id)}
+              />
+            </Td>
             <Td className="font-mono text-xs text-gray-200">{m.model_name}</Td>
+            <Td className="font-mono text-xs text-accent">{m.public_name || m.model_name}</Td>
             <Td className="text-gray-400">{m.display_name || "—"}</Td>
-            <Td className="text-gray-400">{m.provider || "nvidia"}</Td>
+            <Td className="text-gray-400">{m.provider || "—"}</Td>
             <Td>
               <Badge status={m.enabled ? "enabled" : "disabled"} />
             </Td>
@@ -189,7 +254,7 @@ export default function ModelsPage() {
         <form onSubmit={save} className="space-y-3">
           <Field label="模型名称">
             <Input
-              placeholder="meta/llama-3.3-70b-instruct"
+              placeholder="模型 ID，如 deepseek-ai/deepseek-r1"
               value={edit?.model_name ?? ""}
               onChange={(e) => setEdit((p) => ({ ...p, model_name: e.target.value }))}
               required
@@ -200,6 +265,16 @@ export default function ModelsPage() {
               value={edit?.display_name ?? ""}
               onChange={(e) => setEdit((p) => ({ ...p, display_name: e.target.value }))}
             />
+          </Field>
+          <Field label="对外名称（别名，留空则使用显示名称）">
+            <Input
+              placeholder="客户端在 /v1 里使用的模型名，如 gpt-4o-mini"
+              value={edit?.alias ?? ""}
+              onChange={(e) => setEdit((p) => ({ ...p, alias: e.target.value }))}
+            />
+            <p className="mt-1 text-xs text-gray-500">
+              /v1/models 返回及 chat 请求时的模型名：别名 &gt; 显示名称 &gt; 原始模型名
+            </p>
           </Field>
           <Field label="描述">
             <Input
