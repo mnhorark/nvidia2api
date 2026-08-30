@@ -4,7 +4,11 @@
 
 ```ini
 SECRET_KEY=change-me
+# 敏感字段加密专用密钥（可选，留空则用 SECRET_KEY 派生；写入数据后不可变更）
+ENCRYPTION_KEY=
 DEBUG=false
+# 逗号分隔的允许 Host（* = 任意）
+ALLOWED_HOSTS=*
 
 # 数据目录 / DB
 DATA_DIR=./data
@@ -32,7 +36,7 @@ LOG_LEVEL=INFO
 NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000
 ```
 
-生产务必改 `SECRET_KEY`、`ADMIN_PASSWORD`、`ADMIN_TOKEN`。
+生产务必改 `SECRET_KEY`、`ADMIN_PASSWORD`、`ADMIN_TOKEN`，并建议显式配置 `ENCRYPTION_KEY`（否则入库密钥由 `SECRET_KEY` 派生，两者都必须唯一且保密）。
 
 ## 本地开发
 

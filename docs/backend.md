@@ -7,7 +7,7 @@ backend/
 ├── apps/core/       # models + AdminConfig.ready() 自动迁移
 ├── services/        # 纯业务，零 Django View
 ├── api/             # Admin API + OpenAI API
-└── tests/           # 78 个用例（导入/限流/竞速/并发/启停上限/思考强度/多渠道）
+└── tests/           # 182 个用例（导入/限流/竞速/并发/启停上限/思考强度/多渠道/额度/熔断）
 ```
 
 ## services/
@@ -23,6 +23,12 @@ backend/
 | `api_key_service.py` | `generate_key`（sk-nvidia2api-36hex）、hash 查询、可选限流（rate_limit>0 时每分钟窗口） |
 | `upstream_service.py` | 上游 HTTP：`auth_headers()` 按渠道鉴权方式生成头、`list_models_raw`、`sync_models` 幂等 upsert、`probe` |
 | `thinking.py` | 思考强度参数：`parse()` 把各种客户端写法收敛成 `ThinkingSpec`，`to_upstream()` 按 `thinking_passthrough` / `thinking_strip_models` 决定是否下发 |
+| `model_registry.py` | 对外名解析：主别名 + 附加别名（多别名）→ 模型映射；`resolve()` 让任意对外名都能路由到同一个上游模型 |
+| `responses_api.py` | Responses API（`/v1/responses`）请求/响应格式与 chat 的自动互转 |
+| `anthropic_api.py` | Anthropic `/v1/messages` 协议转换与鉴权 |
+| `channel_health.py` | 渠道连续失败自动熔断 + 冷却状态管理（`channel_cooldown_failures` / `channel_cooldown_seconds`） |
+| `crypto.py` | 敏感字段（Key / 代理密码）AES-GCM 加密（Fernet），密钥取 `ENCRYPTION_KEY` 或由 `SECRET_KEY` 派生；旧明文自动回落兼容 |
+| `cleanup.py` | 请求日志清理（按 `log_retention_days` 保留天数） |
 | `sysconfig.py` | 运行时参数注册表：**按渠道隔离**；`get(key, channel)` / `set_params(updates, channel)` / `reset_params()` |
 
 ## api/
