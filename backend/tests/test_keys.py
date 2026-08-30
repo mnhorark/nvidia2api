@@ -6,6 +6,12 @@ from django.utils import timezone
 
 from apps.core.models import Channel, ChannelKey, ChannelKeyStatus
 from services import channel_service, key_service
+from services.crypto import decrypt_secret
+
+
+def _plain_keys(qs):
+    """API Key 现在加密存储，按明文取值需解密后比较。"""
+    return {decrypt_secret(k.api_key or ""): k for k in qs}
 
 
 def _ch():
@@ -19,9 +25,10 @@ class KeyImportTests(TestCase):
         res = key_service.bulk_import_keys(text, channel)
         self.assertEqual(res["success"], 4)
         self.assertEqual(ChannelKey.objects.count(), 4)
-        auto = ChannelKey.objects.get(api_key="nvapi-ccc")
+        plain = _plain_keys(ChannelKey.objects.all())
+        auto = plain["nvapi-ccc"]
         self.assertTrue(auto.name.startswith("NVIDIA Key"))
-        self.assertEqual(ChannelKey.objects.get(api_key="nvapi-aaa").name, "主账号01")
+        self.assertEqual(plain["nvapi-aaa"].name, "主账号01")
 
     def test_dedup_and_invalid(self):
         ChannelKey.objects.create(channel=_ch(), name="x", api_key="nvapi-dup")
@@ -37,7 +44,9 @@ class KeyImportTests(TestCase):
             allow_duplicate_keys=True)
         res = key_service.bulk_import_keys("public\npublic", channel)
         self.assertEqual(res["success"], 2)
-        self.assertEqual(channel.keys.filter(api_key="public").count(), 2)
+        self.assertEqual(
+            sum(1 for k in channel.keys.all() if decrypt_secret(k.api_key or "") == "public"),
+            2)
 
     def test_anonymous_nokey_import(self):
         """无鉴权渠道支持批量导入“无需 Key”的匿名线路槽位。"""

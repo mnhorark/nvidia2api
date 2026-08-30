@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Bot, Brain, ChevronDown, ChevronRight, CornerDownLeft, Loader2, Trash2 } from "lucide-react";
-import { AdminChatResponse, API_BASE_URL, api, asList, getChannel, getToken, Model } from "@/lib/api";
+import { AdminChatResponse, API_BASE_URL, api, asList, clearToken, getChannel, getToken, Model } from "@/lib/api";
+import { useLocalStorage } from "@/lib/use-local-storage";
 import { Button, PageHeader, Select } from "@/components/ui";
 import { toast } from "@/components/toaster";
 
@@ -13,7 +14,7 @@ interface ChatMessage {
   meta?: AdminChatResponse["meta"];
 }
 
-const THINK_RE = /<think>([\s\S]*?)<\/think>/i;
+const THINK_RE = /\s*<thinking>([\s\S]*?)<\/thinking>/i;
 
 function splitReasoning(raw: string, explicitReasoning?: string) {
   if (explicitReasoning && explicitReasoning.trim()) {
@@ -30,12 +31,21 @@ function splitReasoning(raw: string, explicitReasoning?: string) {
 
 export default function ChatPage() {
   const [models, setModels] = useState<Model[]>([]);
-  const [model, setModel] = useState("");
-  const [effort, setEffort] = useState<"" | "off" | "low" | "medium" | "high" | "max">("");
+  const [model, setModel] = useLocalStorage("chatModel", "");
+  const [effort, setEffort] = useLocalStorage<"" | "off" | "low" | "medium" | "high" | "max">(
+    "chatEffort",
+    ""
+  );
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sending, setSending] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  // 在途流式请求控制器：切页 / 清空时取消，避免对已卸载组件 setState
+  const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    return () => abortRef.current?.abort();
+  }, []);
 
   useEffect(() => {
     api
@@ -44,9 +54,15 @@ export default function ChatPage() {
       .then((list) => {
         const enabled = list.filter((m) => m.enabled);
         setModels(enabled);
-        if (enabled[0]) setModel(enabled[0].model_name);
+        // 优先恢复上次选中的模型；若已不存在（禁用/删除）则退回第一个可用模型
+        if (enabled.length) {
+          setModel(
+            enabled.some((m) => m.model_name === model) ? model : enabled[0].model_name
+          );
+        }
       })
       .catch((e) => toast.error(e.message));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -80,6 +96,9 @@ export default function ChatPage() {
       });
     };
 
+    const ac = new AbortController();
+    abortRef.current = ac;
+
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/chat`, {
         method: "POST",
@@ -89,6 +108,7 @@ export default function ChatPage() {
           // 与 lib/api 的 request 一致：带上当前渠道作用域
           ...(getChannel() ? { "X-Channel": getChannel() } : {}),
         },
+        signal: ac.signal,
         body: JSON.stringify({
           model,
           stream: true,
@@ -97,6 +117,11 @@ export default function ChatPage() {
         }),
       });
       if (!res.ok || !res.body) {
+        if (res.status === 401 || res.status === 403) {
+          clearToken();
+          window.location.href = "/login";
+          return;
+        }
         const err = await res.json().catch(() => ({}));
         throw new Error(err?.error?.message || `HTTP ${res.status}`);
       }
@@ -150,10 +175,13 @@ export default function ChatPage() {
         toast.error("未收到有效响应");
       }
     } catch (e) {
+      // 主动取消（清空 / 切页）：静默返回，不覆盖已生成的会话
+      if ((e as Error)?.name === "AbortError") return;
       setMessages(history);
       toast.error(e instanceof Error ? e.message : "请求失败");
     } finally {
       setSending(false);
+      if (abortRef.current === ac) abortRef.current = null;
     }
   }, [input, messages, model, effort, sending]);
 
@@ -187,7 +215,10 @@ export default function ChatPage() {
             <option value="max">思考：最大</option>
           </Select>
           <Button
-            onClick={() => setMessages([])}
+            onClick={() => {
+              abortRef.current?.abort();
+              setMessages([]);
+            }}
             disabled={!messages.length}
             variant="ghost"
           >

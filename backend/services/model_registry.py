@@ -24,6 +24,20 @@ def public_name(model: AIModel) -> str:
     return model.public_name
 
 
+def public_names(model: AIModel) -> list[str]:
+    """模型的所有对外名：主对外名（alias > display_name > model_name）+ 附加别名。
+
+    附加别名存于 `aliases`（JSON 数组），一个模型可暴露多个可调用名字，
+    与 one-api 的模型映射（一对多）思路一致。
+    """
+    names: list[str] = []
+    for raw in [model.public_name] + (model.aliases or []):
+        n = str(raw or "").strip()
+        if n and n not in names:
+            names.append(n)
+    return names
+
+
 def _rank(model: AIModel) -> tuple:
     """排序键，越小越优先。"""
     return (
@@ -45,20 +59,21 @@ def candidates() -> list[AIModel]:
 
 
 def index() -> dict[str, AIModel]:
-    """对外名 -> 模型。重名时按优先级取第一个。"""
+    """对外名 -> 模型。重名时按优先级取第一个。含全部附加别名。"""
     table: dict[str, AIModel] = {}
     for m in candidates():
-        table.setdefault(public_name(m), m)
+        for n in public_names(m):
+            table.setdefault(n, m)
     return table
 
 
-def list_public() -> list[AIModel]:
-    """/v1/models 返回的模型列表（已去重，按对外名排序）。"""
-    return sorted(index().values(), key=lambda m: public_name(m).lower())
+def list_public() -> list[tuple[AIModel, str]]:
+    """/v1/models 返回的 (模型, 对外名) 列表：每个对外名一条（已去重，按对外名排序）。"""
+    return [(m, n) for n, m in sorted(index().items(), key=lambda kv: kv[0].lower())]
 
 
 def resolve(name: str) -> AIModel | None:
-    """按对外名解析模型（alias 优先，其次上游原始名）。"""
+    """按任意对外名解析模型（主对外名或附加别名；其次上游原始名）。"""
     name = (name or "").strip()
     if not name:
         return None
@@ -73,23 +88,32 @@ def resolve(name: str) -> AIModel | None:
 
 
 def resolve_in_channel(name: str, channel: Channel) -> AIModel | None:
-    """在指定渠道内解析：alias / display_name / 上游原始名任一命中即可。"""
+    """在指定渠道内解析：任意对外名（含附加别名）/ display_name / 上游原始名命中即可。"""
     name = (name or "").strip()
     if not name:
         return None
-    return (
+    rec = (
         channel.models.filter(enabled=True)
         .filter(Q(alias=name) | Q(display_name=name) | Q(model_name=name))
         .order_by("-route_priority", "id")
         .first()
     )
+    if rec:
+        return rec
+    # 附加别名在 Python 层匹配（JSON list 不便在 SQLite 上做索引/contains）
+    for m in channel.models.filter(enabled=True).order_by("-route_priority", "id"):
+        for n in (m.aliases or []):
+            if str(n).strip() == name:
+                return m
+    return None
 
 
 def conflicts() -> dict[str, list[int]]:
-    """对外名 -> 参与冲突的模型 id 列表（长度 > 1 才是冲突）。"""
+    """对外名 -> 参与冲突的模型 id 列表（长度 > 1 才是冲突）。含附加别名。"""
     buckets: dict[str, list[int]] = {}
     for m in candidates():
-        buckets.setdefault(public_name(m), []).append(m.id)
+        for n in public_names(m):
+            buckets.setdefault(n, []).append(m.id)
     return {k: v for k, v in buckets.items() if len(v) > 1}
 
 
@@ -98,7 +122,7 @@ def channels_with_model(name: str) -> list[Channel]:
     name = (name or "").strip()
     found: list[Channel] = []
     for m in candidates():
-        if public_name(m) == name or m.model_name == name:
+        if name in public_names(m) or m.model_name == name:
             if m.channel and m.channel not in found:
                 found.append(m.channel)
     return found

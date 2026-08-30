@@ -130,9 +130,11 @@ class AdminChannelApiTests(TestCase):
         zen = Channel.objects.get(slug="zen")
         self.assertEqual(zen.keys.count(), 2)
         self.assertEqual(nvidia.keys.count(), 0)
-        # 未命名的那条按渠道名自动命名
-        self.assertEqual(zen.keys.get(api_key="key-b").name, "Zen Key 001")
-        self.assertEqual(zen.keys.get(api_key="key-a").name, "x")
+        # 未命名的那条按渠道名自动命名（Key 已加密存储，按明文解密后比较）
+        from services.crypto import decrypt_secret
+        plain = {decrypt_secret(k.api_key or ""): k for k in zen.keys.all()}
+        self.assertEqual(plain["key-b"].name, "Zen Key 001")
+        self.assertEqual(plain["key-a"].name, "x")
 
     def test_models_and_logs_scoped(self):
         nvidia = Channel.objects.create(name="NVIDIA", slug="nvidia",
@@ -332,6 +334,31 @@ class ModelAliasTests(TestCase):
             "/v1/models", HTTP_AUTHORIZATION=f"Bearer {raw_key}")
         data = json.loads(openai_views.list_models(request).content)
         self.assertEqual([m["id"] for m in data["data"]], ["显示名"])
+
+    def test_multiple_aliases(self):
+        """一个模型可暴露多个对外名（主名 + 附加别名），/v1 与解析均生效。"""
+        from services import model_registry
+        AIModel.objects.create(channel=self.channel, model_name="raw/name",
+                               alias="main-name", aliases=["alias-1", "alias-2"],
+                               enabled=True)
+        m = AIModel.objects.get(model_name="raw/name")
+        self.assertEqual(model_registry.public_names(m),
+                         ["main-name", "alias-1", "alias-2"])
+
+        _user, raw_key = api_key_service.create_key("tester")
+        request = RequestFactory().get(
+            "/v1/models", HTTP_AUTHORIZATION=f"Bearer {raw_key}")
+        data = json.loads(openai_views.list_models(request).content)
+        self.assertEqual(sorted(x["id"] for x in data["data"]),
+                         ["alias-1", "alias-2", "main-name"])
+
+        # 任意对外名都能解析到同一个上游模型
+        for n in ("main-name", "alias-1", "alias-2"):
+            self.assertEqual(model_registry.resolve(n).model_name, "raw/name")
+        # 渠道内解析也命中附加别名
+        self.assertEqual(
+            model_registry.resolve_in_channel("alias-2", self.channel).model_name,
+            "raw/name")
 
 
 class DashboardUsageAggregateTests(TestCase):
@@ -737,15 +764,192 @@ class ResponsesTranslateTests(TestCase):
         self.assertEqual(out["input"][0]["content"][0]["type"], "input_text")
         self.assertEqual(out["input"][1]["content"][0]["type"], "output_text")
 
-    def test_unsupported_params_dropped(self):
+    def test_common_params_passed_through(self):
+        """同名通用参数（seed/stop 等）忠实透传，不做白名单裁剪。"""
         from services import responses_api
         out = responses_api.chat_to_responses_body({
             "model": "m", "messages": [{"role": "user", "content": "hi"}],
             "seed": 1, "stop": ["x"], "temperature": 0.5, "max_tokens": 100})
-        self.assertNotIn("seed", out)
-        self.assertNotIn("stop", out)
+        self.assertEqual(out["seed"], 1)
+        self.assertEqual(out["stop"], ["x"])
         self.assertEqual(out["temperature"], 0.5)
         self.assertEqual(out["max_output_tokens"], 100)
+
+    def test_chat_only_params_dropped_to_responses_but_kept_from(self):
+        """n / penalties 是 chat 独有、responses 明确移除：chat->responses 不携带，
+        responses->chat 方向保留（避免 400，又不丢数据）。"""
+        from services import responses_api
+        out = responses_api.chat_to_responses_body({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "n": 2, "frequency_penalty": 0.3, "presence_penalty": 0.2})
+        self.assertNotIn("n", out)
+        self.assertNotIn("frequency_penalty", out)
+        self.assertNotIn("presence_penalty", out)
+        back = responses_api.responses_to_chat_body({
+            "model": "m", "input": "hi", "n": 2, "frequency_penalty": 0.3})
+        self.assertEqual(back["n"], 2)
+        self.assertEqual(back["frequency_penalty"], 0.3)
+
+    def test_reasoning_effort_mapped_both_ways(self):
+        """思考参数：chat reasoning_effort <-> responses reasoning.effort。"""
+        from services import responses_api
+        out = responses_api.chat_to_responses_body({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "max"})
+        self.assertEqual(out["reasoning"]["effort"], "high")
+        out_off = responses_api.chat_to_responses_body({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"thinking": False}})
+        self.assertEqual(out_off["reasoning"]["effort"], "none")
+        back = responses_api.responses_to_chat_body({
+            "model": "m", "input": "hi", "reasoning": {"effort": "none"}})
+        self.assertEqual(back["reasoning_effort"], "off")
+
+    def test_finish_reason_incomplete_details_mapped(self):
+        """finish_reason <-> incomplete_details.reason 双向忠实映射。"""
+        from services import responses_api
+        chat = responses_api.responses_payload_to_chat({
+            "id": "r", "object": "response", "created_at": 1, "model": "m",
+            "status": "incomplete", "output": [
+                {"id": "m1", "type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "x"}]}],
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "usage": {"input_tokens": 1, "output_tokens": 2}})
+        self.assertEqual(chat["choices"][0]["finish_reason"], "length")
+        resp = responses_api.chat_to_responses_payload({
+            "id": "c", "object": "chat.completion", "created": 1, "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant",
+                                                 "content": "x"},
+                         "finish_reason": "content_filter"}],
+            "usage": {}})
+        self.assertEqual(resp["status"], "incomplete")
+        self.assertEqual(resp["incomplete_details"]["reason"], "content_filter")
+
+    def test_json_schema_format_details_preserved(self):
+        """json_schema 结构化输出细节双向保留（name/schema/strict）。"""
+        from services import responses_api
+        js = {"type": "json_schema", "json_schema": {
+            "name": "person", "schema": {"type": "object"}, "strict": True}}
+        out = responses_api.chat_to_responses_body({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "response_format": js})
+        fmt = out["text"]["format"]
+        self.assertEqual(fmt["type"], "json_schema")
+        self.assertEqual(fmt["name"], "person")
+        self.assertIs(fmt["strict"], True)
+        self.assertEqual(fmt["schema"], {"type": "object"})
+        back = responses_api.responses_to_chat_body({
+            "model": "m", "input": "hi", "text": {"format": fmt}})
+        self.assertEqual(back["response_format"]["json_schema"]["name"], "person")
+
+    def test_responses_payload_echoes_request_params(self):
+        """/v1/responses 非流式输出回显请求参数（instructions/tools 等）。"""
+        from services import responses_api
+        resp = responses_api.chat_to_responses_payload({
+            "id": "c", "object": "chat.completion", "created": 1, "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant",
+                                                 "content": "hi"},
+                         "finish_reason": "stop"}],
+            "usage": {}}, echo={"instructions": "be nice", "store": False})
+        self.assertEqual(resp["instructions"], "be nice")
+        self.assertFalse(resp["store"])
+        self.assertEqual(resp["status"], "completed")
+
+    def test_refusal_preserved(self):
+        """responses refusal 内容 -> chat message.refusal -> responses refusal 条目。"""
+        from services import responses_api
+        chat = responses_api.responses_payload_to_chat({
+            "id": "r", "object": "response", "created_at": 1, "model": "m",
+            "status": "completed", "output": [
+                {"id": "m1", "type": "message", "role": "assistant",
+                 "content": [{"type": "refusal", "refusal": "I cannot help"}]}],
+            "usage": {}})
+        self.assertEqual(chat["choices"][0]["message"]["refusal"], "I cannot help")
+        resp = responses_api.chat_to_responses_payload({
+            "id": "c", "object": "chat.completion", "created": 1, "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant",
+                                                 "content": "", "refusal": "no"},
+                         "finish_reason": "stop"}], "usage": {}})
+        self.assertEqual(resp["output"][0]["content"][0]["type"], "refusal")
+
+    def test_tools_and_tool_choice_converted_both_ways(self):
+        """tools / tool_choice 结构包装差异的忠实映射（双向）。"""
+        from services import responses_api
+        # chat -> responses
+        out = responses_api.chat_to_responses_body({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather", "description": "d",
+                "parameters": {"type": "object"}}}],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}}})
+        self.assertEqual(out["tools"][0]["name"], "get_weather")
+        self.assertNotIn("function", out["tools"][0])
+        self.assertEqual(out["tool_choice"]["name"], "get_weather")
+        # responses -> chat
+        back = responses_api.responses_to_chat_body({
+            "model": "m", "input": "hi",
+            "tools": [{"type": "function", "name": "get_weather",
+                       "description": "d", "parameters": {"type": "object"}}],
+            "tool_choice": {"type": "function", "name": "get_weather"}})
+        self.assertEqual(back["tools"][0]["function"]["name"], "get_weather")
+        self.assertEqual(back["tool_choice"]["function"]["name"], "get_weather")
+
+    def test_developer_role_preserved(self):
+        """developer role 是 Responses 原生角色，不被改写为 system。"""
+        from services import responses_api
+        out = responses_api.chat_to_responses_body({
+            "model": "m",
+            "messages": [{"role": "developer", "content": "be strict"}]})
+        self.assertEqual(out["input"][0]["role"], "developer")
+
+    def test_function_call_input_not_misread_as_user(self):
+        """responses input 里的 assistant function_call 条目转成 chat tool_calls。"""
+        from services import responses_api
+        chat = responses_api.responses_to_chat_body({
+            "model": "m",
+            "input": [{"type": "function_call", "call_id": "c1",
+                       "name": "f1", "arguments": "{}"}]})
+        self.assertEqual(chat["messages"][0]["role"], "assistant")
+        self.assertEqual(chat["messages"][0]["tool_calls"][0]["id"], "c1")
+
+    def test_instructions_become_system_message(self):
+        """responses instructions 顶层参数 -> chat system 消息。"""
+        from services import responses_api
+        chat = responses_api.responses_to_chat_body({
+            "model": "m", "instructions": "be nice", "input": "hi"})
+        self.assertEqual(chat["messages"][0]["role"], "system")
+        self.assertEqual(chat["messages"][0]["content"], "be nice")
+
+    def test_stream_tool_call_arguments_accumulate_without_duplication(self):
+        """标准流式工具调用：added(name) + arguments.delta(增量)，done 不重复。"""
+        from services import responses_api
+        state: dict = {"args_seen": set()}
+        out1 = json.loads(responses_api._translate_event("data: " + json.dumps({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "fc_1", "type": "function_call", "call_id": "fc_1",
+                     "name": "get_weather", "arguments": ""}}), state))
+        self.assertEqual(out1["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+                         "get_weather")
+        out2 = json.loads(responses_api._translate_event("data: " + json.dumps({
+            "type": "response.function_call_arguments.delta", "output_index": 0,
+            "item_id": "fc_1", "delta": "{\"city\": \"beijing\"}"}), state))
+        self.assertEqual(
+            out2["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\": \"beijing\"}")
+        # done 已按增量透传过参数，不重复追加完整参数
+        out3 = responses_api._translate_event("data: " + json.dumps({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "fc_1", "type": "function_call", "call_id": "fc_1",
+                     "name": "get_weather", "arguments": "{\"city\": \"beijing\"}"}}), state)
+        self.assertIsNone(out3)
+        # 非标准上游只发 done 未发 delta：兜底补发一次完整参数
+        state2: dict = {"args_seen": set()}
+        out4 = json.loads(responses_api._translate_event("data: " + json.dumps({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "fc_2", "type": "function_call", "call_id": "fc_2",
+                     "name": "get_weather", "arguments": "{}"}}), state2))
+        self.assertEqual(
+            out4["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"], "{}")
 
     def test_responses_input_to_messages_roundtrip(self):
         from services import responses_api
@@ -757,6 +961,67 @@ class ResponsesTranslateTests(TestCase):
         self.assertEqual(chat["messages"][0]["role"], "user")
         self.assertEqual(chat["messages"][1]["role"], "tool")
         self.assertEqual(chat["messages"][1]["tool_call_id"], "c1")
+
+    @staticmethod
+    def _translate(ev: dict) -> dict | None:
+        from services import responses_api
+        out = responses_api._translate_event(
+            "data: " + json.dumps(ev, ensure_ascii=False))
+        return json.loads(out) if out else None
+
+    def test_encrypted_reasoning_passed_through(self):
+        """上游把推理内容加密时，原样透传 encrypted_content 供下游解密，不替换。"""
+        out = self._translate({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "rs_1", "type": "reasoning", "status": "completed",
+                     "encrypted_content": "Q-PaDgG1qC1DLLFH_xxxx", "summary": []}})
+        self.assertIsNotNone(out)
+        delta = out["choices"][0]["delta"]
+        self.assertEqual(delta["reasoning_content"], "Q-PaDgG1qC1DLLFH_xxxx")
+
+    def test_plaintext_summary_reasoning_translated(self):
+        """OpenAI 标准明文 summary 推理事件 -> reasoning_content。"""
+        out = self._translate({
+            "type": "response.reasoning_summary_text.delta", "output_index": 0,
+            "delta": "先计算 1+1"})
+        self.assertEqual(out["choices"][0]["delta"]["reasoning_content"], "先计算 1+1")
+        # 汇总事件（reasoning item done，带明文 summary）
+        out = self._translate({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"id": "rs_1", "type": "reasoning", "status": "completed",
+                     "summary": [{"type": "summary_text", "text": "先计算 1+1"}]}})
+        self.assertEqual(out["choices"][0]["delta"]["reasoning_content"], "先计算 1+1")
+
+    def test_responses_payload_to_chat_carries_reasoning(self):
+        """非流式 responses 响应中的推理条目 -> message.reasoning_content。"""
+        from services import responses_api
+        chat = responses_api.responses_payload_to_chat({
+            "id": "resp_1", "object": "response", "created_at": 1,
+            "model": "m", "status": "completed",
+            "output": [
+                {"id": "rs_1", "type": "reasoning", "status": "completed",
+                 "encrypted_content": "Q-PaDgG1qC1DLLFH_xxxx", "summary": []},
+                {"id": "m_1", "type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "答案是 2"}]},
+            ],
+            "usage": {"total_tokens": 8}})
+        msg = chat["choices"][0]["message"]
+        self.assertEqual(msg["content"], "答案是 2")
+        self.assertEqual(msg["reasoning_content"], "Q-PaDgG1qC1DLLFH_xxxx")
+
+    def test_chat_sse_to_responses_emits_reasoning_event(self):
+        """内部 chat SSE 含 reasoning_content 时，/v1/responses 出口发出推理事件。"""
+        from services import responses_api
+        chat_iter = iter([
+            'data: {"id":"c1","choices":[{"delta":{"role":"assistant",'
+            '"reasoning_content":"思考中","content":""},"finish_reason":null}]}\n\n',
+            'data: {"id":"c1","choices":[{"delta":{"content":"结果"},'
+            '"finish_reason":null}]}\n\n',
+            'data: [DONE]\n\n',
+        ])
+        out = "".join(list(responses_api.iter_chat_sse_as_responses(chat_iter)))
+        self.assertIn("response.reasoning_summary_text.delta", out)
+        self.assertIn("思考中", out)
 
 
 class BatchApiTests(TestCase):

@@ -147,13 +147,9 @@ function ChannelsInner() {
 
   async function switchTo(c: Channel) {
     if (c.slug === current) return;
-    setChannel(c.slug);
+    setChannel(c.slug); // setChannel 内部已派发 channel-change，layout 据此重挂载
     setCurrent(c.slug);
     toast.success(`已切换到渠道「${c.name}」`);
-    // 以 key 重挂载，各页面按新渠道重新加载
-    window.dispatchEvent(
-      new CustomEvent("nvidia2api:channel-change", { detail: c.slug })
-    );
   }
 
   async function makeDefault(c: Channel) {
@@ -196,9 +192,9 @@ function ChannelsInner() {
   async function syncModels(c: Channel) {
     setBusyId(c.id);
     try {
-      setChannel(c.slug);
+      // 通过 body 指定目标渠道，不切换全局渠道，避免整台控制台重挂载
       const res = await api.post<{ created?: number; total?: number }>(
-        `/api/admin/models/sync?channel=${encodeURIComponent(c.slug)}`, {}
+        `/api/admin/models/sync`, { channel: c.slug }
       );
       toast.success(`同步完成：新增 ${res.created ?? 0} 个，共 ${res.total ?? 0} 个`);
       await load();

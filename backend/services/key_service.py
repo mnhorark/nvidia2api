@@ -11,6 +11,7 @@ from django.utils import timezone
 
 from apps.core.models import AuthScheme, Channel, ChannelKey, ChannelKeyStatus
 from services import sysconfig
+from services.crypto import decrypt_secret
 
 logger = logging.getLogger("nvidia2api.keys")
 
@@ -27,6 +28,16 @@ def mask_key(key: str) -> str:
     if len(key) <= 10:
         return key[:4] + "****"
     return key[:10] + "*" * 8 + key[-4:]
+
+
+def _key_stored_in_channel(channel: Channel, plain_key: str) -> bool:
+    """按明文判断渠道里是否已存在该 Key（存储为加密值，需解密后比较）。"""
+    if not plain_key:
+        return False
+    for stored in channel.keys.values_list("api_key", flat=True):
+        if decrypt_secret(stored or "") == plain_key:
+            return True
+    return False
 
 
 def parse_import_text(text: str) -> list[tuple[str, str, str | None]]:
@@ -91,7 +102,7 @@ def bulk_import_keys(text: str, channel: Channel) -> dict:
         # 匿名线路每个都是独立槽位，跳过重复检查（允许多条并存）
         allow_dup = bool(getattr(channel, "allow_duplicate_keys", False))
         if not anonymous and not allow_dup and (
-            key in seen_in_batch or channel.keys.filter(api_key=key).exists()
+            key in seen_in_batch or _key_stored_in_channel(channel, key)
         ):
             result["duplicate"] += 1
             continue
@@ -114,7 +125,17 @@ def bulk_import_keys(text: str, channel: Channel) -> dict:
 
 
 def available_keys(channel: Channel) -> list[ChannelKey]:
-    """Keys eligible for scheduling: enabled status + not in cooldown + under RPM."""
+    """Keys eligible for scheduling: enabled status + not in cooldown + under RPM.
+
+    渠道处于熔断冷却时直接返回空列表（该渠道不参与线路构建），
+    请求会流向其他渠道 / 默认渠道。
+    """
+    from services.channel_health import is_open
+
+    if is_open(channel):
+        logger.warning("channel %s in circuit-breaker cooldown, skipping keys",
+                       channel.slug)
+        return []
     now = timezone.now()
     out = []
     for k in channel.keys.all():
@@ -247,7 +268,7 @@ def test_key(key: ChannelKey) -> dict:
     if channel is None:
         return {"ok": False, "error": "key 未绑定渠道"}
     try:
-        result = upstream_service.probe(channel, key.api_key)
+        result = upstream_service.probe(channel, decrypt_secret(key.api_key))
         if result.get("ok"):
             report_success(key.id)
             return {"ok": True, "http_status": result.get("http_status", 0),

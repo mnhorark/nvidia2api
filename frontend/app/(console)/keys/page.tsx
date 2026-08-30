@@ -97,7 +97,7 @@ export default function ChannelKeysPage() {
     if (editItem.api_key && !editItem.api_key.includes("••") && !editItem.api_key.includes("*")) {
       body.api_key = editItem.api_key;
     }
-    if (editItem.rpm_limit) body.rpm_limit = editItem.rpm_limit;
+    if (editItem.rpm_limit != null) body.rpm_limit = editItem.rpm_limit;
     try {
       if (editItem.id) {
         await api.patch(`/api/admin/keys/${editItem.id}`, body);
@@ -451,12 +451,13 @@ export default function ChannelKeysPage() {
           <Field label="RPM 限制">
             <Input
               type="number"
-              min={1}
+              min={0}
               value={editItem?.rpm_limit ?? 40}
               onChange={(e) =>
                 setEditItem((p) => ({ ...p, rpm_limit: Number(e.target.value) }))
               }
             />
+            <p className="mt-1 text-xs text-faint">0 = 不限流</p>
           </Field>
           <div className="flex justify-end gap-2 pt-2">
             <Button type="button" onClick={() => setEditItem(null)}>

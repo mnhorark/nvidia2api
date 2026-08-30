@@ -46,6 +46,8 @@ DATA_DIR = _resolve_path(os.environ.get("DATA_DIR", "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-insecure-secret-change-me")
+# 敏感字段加密专用密钥（crypto._fernet 优先取它，其次回落到 SECRET_KEY 派生）
+ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY")
 DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
 ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "*").split(",")
 
@@ -117,4 +119,11 @@ if ADMIN_PASSWORD == "admin123" or ADMIN_TOKEN == "dev-admin-token":
         "【安全警告】正在使用默认管理凭据（ADMIN_PASSWORD=admin123 / "
         "ADMIN_TOKEN=dev-admin-token）。请勿在生产环境使用，"
         "请通过环境变量修改 ADMIN_PASSWORD 和 ADMIN_TOKEN。"
+    )
+
+if not os.environ.get("ENCRYPTION_KEY") and SECRET_KEY == "dev-insecure-secret-change-me":
+    _logging.getLogger("django").warning(
+        "【安全警告】未配置 ENCRYPTION_KEY 且 SECRET_KEY 为默认值，"
+        "入库的 NVIDIA Key / 代理密码加密使用可被推导的密钥。"
+        "生产环境请设置环境变量 ENCRYPTION_KEY；且 SECRET_KEY 变更后旧密文将无法解密。"
     )

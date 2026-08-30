@@ -56,7 +56,8 @@ function extractErrorMessage(data: unknown, status: number): string {
 
 export async function request<T = unknown>(
   path: string,
-  options: RequestInit = {}
+  options: RequestInit = {},
+  timeoutMs = 60_000
 ): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = {
@@ -68,7 +69,22 @@ export async function request<T = unknown>(
   const channel = getChannel();
   if (channel) headers["X-Channel"] = channel;
 
-  const res = await fetch(`${API_BASE_URL}${path}`, { ...options, headers });
+  // 超时兜底：后端挂起时不让按钮永远停在 loading
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const signal = options.signal ?? controller.signal;
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE_URL}${path}`, { ...options, headers, signal });
+  } catch (e) {
+    if ((e as Error)?.name === "AbortError") {
+      throw new ApiError(`请求超时（${Math.round(timeoutMs / 1000)}s）`, 0);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 
   if (res.status === 401 || res.status === 403) {
     if (typeof window !== "undefined" && !window.location.pathname.startsWith("/login")) {
@@ -105,12 +121,17 @@ export function asList<T = Record<string, unknown>>(data: unknown): T[] {
 }
 
 export const api = {
-  get: <T = unknown>(path: string) => request<T>(path, { method: "GET" }),
-  post: <T = unknown>(path: string, body?: unknown) =>
-    request<T>(path, { method: "POST", body: body !== undefined ? JSON.stringify(body) : undefined }),
-  patch: <T = unknown>(path: string, body: unknown) =>
-    request<T>(path, { method: "PATCH", body: JSON.stringify(body) }),
-  del: <T = unknown>(path: string) => request<T>(path, { method: "DELETE" }),
+  get: <T = unknown>(path: string, timeoutMs?: number) =>
+    request<T>(path, { method: "GET" }, timeoutMs),
+  post: <T = unknown>(path: string, body?: unknown, timeoutMs?: number) =>
+    request<T>(path, {
+      method: "POST",
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    }, timeoutMs),
+  patch: <T = unknown>(path: string, body: unknown, timeoutMs?: number) =>
+    request<T>(path, { method: "PATCH", body: JSON.stringify(body) }, timeoutMs),
+  del: <T = unknown>(path: string, timeoutMs?: number) =>
+    request<T>(path, { method: "DELETE" }, timeoutMs),
 };
 
 // ---------- Types ----------
@@ -183,8 +204,8 @@ export interface Proxy {
   city?: string;
   enabled: boolean;
   status: string;
-  latency: number | null;
-  last_check_time: string | null;
+  latency_ms: number | null;
+  last_check_at: string | null;
   public_ip?: string;
   success_count: number;
   failure_count: number;
@@ -197,6 +218,7 @@ export interface Model {
   model_name: string;
   display_name?: string;
   alias?: string;
+  aliases?: string[];
   route_priority?: number;
   public_name?: string;
   description?: string;
@@ -216,6 +238,8 @@ export interface UserApiKey {
   key_prefix: string;
   enabled: boolean;
   rate_limit: number;
+  quota: number;
+  used_quota: number;
   total_requests: number;
   success_requests: number;
   failed_requests: number;
@@ -255,6 +279,7 @@ export interface RequestLog {
   total_tokens?: number;
   cached_tokens?: number;
   first_token_ms?: number;
+  generation_speed?: number | null;
   created_at: string;
   // 客户端实际传入的思考参数
   client_thinking?: Record<string, unknown>;

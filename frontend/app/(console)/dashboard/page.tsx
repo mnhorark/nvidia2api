@@ -17,6 +17,7 @@ import {
   Zap,
 } from "lucide-react";
 import { api, DashboardStats, UsageResponse } from "@/lib/api";
+import { useLocalStorage } from "@/lib/use-local-storage";
 import { Button, Card, PageHeader, StatusDot, cx } from "@/components/ui";
 
 /* ==================== KPI 大卡 ==================== */
@@ -235,7 +236,7 @@ function ShareBar({ value, max, color }: { value: number; max: number; color: st
 export default function DashboardPage() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [usage, setUsage] = useState<UsageResponse | null>(null);
-  const [days, setDays] = useState(1);
+  const [days, setDays] = useLocalStorage("dashboardDays", 1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -264,12 +265,28 @@ export default function DashboardPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 轻量轮询：每 10s 刷新运行指标（实时并发等），不重拉用量图
+  useEffect(() => {
+    const timer = window.setInterval(async () => {
+      try {
+        const s = await api.get<DashboardStats>("/api/admin/dashboard");
+        setStats(s);
+      } catch {
+        /* 静默，等待下一次轮询 */
+      }
+    }, 10_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
   function changeDays(d: number) {
     setDays(d);
     load(d);
   }
 
-  const maxProxies = Math.max((stats?.nvidia_keys ?? 0) - 1, 0);
+  const maxProxies = Math.max(
+    stats?.max_enabled_proxies ?? (stats?.nvidia_keys ?? 0) - 1,
+    0
+  );
   const keyTotal = stats?.nvidia_keys ?? 0;
   const proxyTotal = stats?.proxies ?? 0;
   const modelTotal = stats?.models ?? 0;
@@ -350,7 +367,7 @@ export default function DashboardPage() {
           current={stats?.enabled_proxies ?? 0}
           total={maxProxies}
           warn={(stats?.enabled_proxies ?? 0) >= maxProxies && maxProxies > 0}
-          hint={`共 ${proxyTotal} 个代理，启用上限 ${maxProxies}（Key 数 - 1）`}
+          hint={`共 ${proxyTotal} 个代理，启用上限 ${maxProxies}（可用 Key 数 - 1）`}
         />
         <ResourceRow
           icon={Boxes}

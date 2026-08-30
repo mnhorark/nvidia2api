@@ -46,8 +46,101 @@ _EFFORT_ALIASES = {
     "max": "max", "maximum": "max", "ultra": "max", "xhigh": "max",
 }
 
+# 档位强度顺序，用于"钳制"到模型支持的档位集合
+_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "max", "xhigh")
+
 _TRUE = {"1", "true", "yes", "on", "enabled"}
 _FALSE = {"0", "false", "no", "off", "disabled", "none"}
+
+
+# ---------------------------------------------------------------------------
+# 模型族思考能力知识库
+# ---------------------------------------------------------------------------
+# 不同 LLM 用不同的关键字控制思考强度，传入模型不认识的字段会直接 400。
+# 参考 vLLM reasoning_outputs / Featherless chat-template-kwargs / 各家官方文档：
+#   Qwen3        -> chat_template_kwargs.enable_thinking（默认开启）
+#   GLM 4.5+/5   -> enable_thinking + reasoning_effort(low/high/max)
+#   Gemma 4      -> enable_thinking（默认关闭）
+#   DeepSeek     -> chat_template_kwargs.thinking + reasoning_effort(high/max)
+#   Kimi K3      -> 仅顶层 reasoning_effort(low/high/max)，传 thinking 会报错
+#   Kimi K2.x    -> thinking.type(enabled/disabled) + thinking.keep
+#   MiniMax M3   -> chat_template_kwargs.thinking（混合思考）
+#   Doubao 2.0   -> 顶层 reasoning_effort(minimal/low/medium/high)
+#   Stepfun      -> enable_thinking
+#   常开思考模型（DeepSeek-R1/Kimi-K2.7/grok-oss 等）无需也不应传关闭开关。
+
+@dataclass(frozen=True)
+class ThinkingCapability:
+    """某个模型族支持的思考控制方式。"""
+    # chat_template_kwargs 里使用的开关键；空元组表示不使用该机制
+    toggle_keys: tuple[str, ...] = ("thinking", "enable_thinking")
+    # 档位字段名（如 reasoning_effort）；None 表示该模型不支持档位
+    effort_key: str | None = "reasoning_effort"
+    # 允许的档位值（按强度升序）；用于把非法档位钳制到合法区间
+    effort_values: tuple[str, ...] = ("low", "medium", "high", "max")
+    supports_budget: bool = True          # 是否接受 reasoning_budget
+    always_on: bool = False               # 始终思考，无法关闭
+    thinking_type: bool = False           # Kimi 风格 thinking.type 开关
+    default_effort: str | None = None     # 只开启未指定档位时的默认档位
+
+
+# 按子串匹配，顺序优先（先精确后宽泛）
+_THINKING_CAPABILITIES: list[tuple[str, ThinkingCapability]] = [
+    ("kimi-k3", ThinkingCapability(
+        always_on=True, effort_key="reasoning_effort",
+        effort_values=("low", "high", "max"), default_effort="max")),
+    ("kimi-k2.7", ThinkingCapability(always_on=True, thinking_type=True)),
+    ("kimi-k2", ThinkingCapability(thinking_type=True)),
+    ("kimi", ThinkingCapability(thinking_type=True)),
+    ("moonshot", ThinkingCapability(thinking_type=True)),
+    ("deepseek-r1", ThinkingCapability(
+        always_on=True, effort_key="reasoning_effort",
+        effort_values=("high", "max"), default_effort="max")),
+    ("deepseek", ThinkingCapability(
+        toggle_keys=("thinking",), effort_key="reasoning_effort",
+        effort_values=("high", "max"))),
+    ("glm", ThinkingCapability(
+        toggle_keys=("enable_thinking",), effort_key="reasoning_effort",
+        effort_values=("low", "high", "max"))),
+    ("qwen", ThinkingCapability(toggle_keys=("enable_thinking",))),
+    ("gemma", ThinkingCapability(toggle_keys=("enable_thinking",))),
+    ("minimax", ThinkingCapability(
+        toggle_keys=("thinking",), effort_key="reasoning_effort",
+        effort_values=("low", "medium", "high"))),
+    ("step", ThinkingCapability(toggle_keys=("enable_thinking",))),
+    ("doubao", ThinkingCapability(
+        effort_key="reasoning_effort", effort_values=("minimal", "low", "medium", "high"),
+        default_effort="medium")),
+    ("grok", ThinkingCapability(always_on=True)),
+]
+
+_DEFAULT_CAPABILITY = ThinkingCapability()
+
+
+def resolve_capability(model_name: str = "") -> ThinkingCapability:
+    """按模型名解析思考能力；未命中时回落到通用默认（双开关 + 档位）。"""
+    name = (model_name or "").lower()
+    for pattern, cap in _THINKING_CAPABILITIES:
+        if pattern in name:
+            return cap
+    return _DEFAULT_CAPABILITY
+
+
+def _clamp_effort(effort: str, allowed: tuple[str, ...]) -> str | None:
+    """把档位钳制到模型允许的集合；无法识别且不允许时返回 None（不下发，避免 400）。"""
+    if not allowed:
+        return None
+    if effort in allowed:
+        return effort
+    if effort not in _EFFORT_ORDER:
+        return None
+    ei = _EFFORT_ORDER.index(effort)
+    idxs = [i for i, v in enumerate(_EFFORT_ORDER) if v in allowed]
+    if not idxs:
+        return None
+    # 强度最接近的允许值；平局时取更高档（如 medium 在 low/high 之间 -> high）
+    nearest = min(idxs, key=lambda i: (abs(i - ei), -i))
+    return _EFFORT_ORDER[nearest]
 
 
 @dataclass
@@ -246,7 +339,14 @@ def _default_effort() -> str:
 
 
 def to_upstream(spec: ThinkingSpec, model_name: str = "") -> dict:
-    """把思考意图转成上游 body 片段；无需下发时返回空 dict。"""
+    """把思考意图转成上游 body 片段；无需下发时返回空 dict。
+
+    按模型族能力（resolve_capability）选择下发关键字：
+    - 只发该模型认识的开关键（Qwen/GLM 用 enable_thinking、DeepSeek 用 thinking、
+      Kimi K2.x 用 thinking.type、常开模型不传开关）；
+    - 档位钳制到模型允许的取值（如 DeepSeek 只支持 high/max，客户端传 low 就提为 high），
+      避免"非法关键字/非法取值"导致整个请求 400。
+    """
     if not spec.is_set():
         return {}
     if not _passthrough_enabled():
@@ -256,22 +356,39 @@ def to_upstream(spec: ThinkingSpec, model_name: str = "") -> dict:
         logger.info("thinking params dropped: model %s is in strip list", model_name)
         return {}
 
+    cap = resolve_capability(model_name)
     out: dict = {}
-    kwargs = dict(spec.template_kwargs)
-    if spec.enabled is not None:
-        # 两种开关都写：DeepSeek/Nemotron 系认 thinking，Qwen/GLM 系认 enable_thinking
-        kwargs["thinking"] = spec.enabled
-        kwargs["enable_thinking"] = spec.enabled
-    if kwargs:
-        out["chat_template_kwargs"] = kwargs
-    if spec.effort:
-        out["reasoning_effort"] = spec.effort
-    elif spec.enabled is True:
-        # 客户端只开启思考未指定档位时，自动映射默认档位（如 Trae 只传 {"type":"enabled"}）
-        effort = _default_effort()
-        if effort and effort != "off":
-            out["reasoning_effort"] = effort
-    if spec.budget is not None:
+    enabled = spec.enabled
+
+    if cap.always_on and enabled is False:
+        # 常开思考模型无法关闭：不发关闭开关，仅保留档位意图
+        enabled = None
+
+    if cap.thinking_type:
+        # Kimi 风格 thinking.type 开关（仅 enabled/disabled）
+        if enabled is True:
+            out["thinking"] = {"type": "enabled"}
+        elif enabled is False and not cap.always_on:
+            out["thinking"] = {"type": "disabled"}
+    elif not cap.always_on:
+        # 非"常开"模型才发开关键；常开模型（K3/R1/grok 等）传开关会报错
+        kwargs = dict(spec.template_kwargs)
+        if enabled is not None:
+            for key in cap.toggle_keys:
+                kwargs[key] = enabled
+        if kwargs:
+            out["chat_template_kwargs"] = kwargs
+
+    if cap.effort_key:
+        effort = spec.effort
+        if effort is None and spec.enabled is True and spec.budget is None:
+            # 客户端只开启思考未指定档位时，自动映射默认档位
+            effort = cap.default_effort or _default_effort()
+        if effort:
+            eff = _clamp_effort(effort, cap.effort_values)
+            if eff:
+                out[cap.effort_key] = eff
+    if spec.budget is not None and cap.supports_budget:
         out["reasoning_budget"] = spec.budget
     return out
 

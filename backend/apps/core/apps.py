@@ -15,6 +15,8 @@ class CoreConfig(AppConfig):
             return
         try:
             call_command("migrate", run_syncdb=True, verbosity=0)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # 启动阶段迁移失败不能静默吞掉：记录日志，避免运行期才报 "no such table"
+            import logging
+            logging.getLogger("django").error("启动时自动迁移失败: %s", exc)
 

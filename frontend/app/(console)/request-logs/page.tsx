@@ -1,8 +1,9 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, RefreshCw, Search } from "lucide-react";
-import { api, asList, RequestLog } from "@/lib/api";
+import { api, RequestLog } from "@/lib/api";
+import { useLocalStorage } from "@/lib/use-local-storage";
 import {
   Badge,
   Button,
@@ -14,38 +15,110 @@ import {
   Select,
   Td,
   Th,
+  Toggle,
 } from "@/components/ui";
+import { toast } from "@/components/toaster";
 
 export default function RequestLogsPage() {
   const [logs, setLogs] = useState<RequestLog[]>([]);
-  const [modelInput, setModelInput] = useState(""); // 输入框即时值
-  const [model, setModel] = useState(""); // 300ms 防抖后真正参与查询的值
-  const [status, setStatus] = useState("");
+  const [modelInput, setModelInput] = useLocalStorage("requestLogsModelFilter", ""); // 输入框即时值
+  const [model, setModel] = useState(() =>
+    typeof window === "undefined"
+      ? ""
+      : (window.localStorage.getItem("requestLogsModelFilter") ?? "")
+  ); // 300ms 防抖后真正参与查询的值
+  const [status, setStatus] = useLocalStorage("requestLogsStatusFilter", "");
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+  const [total, setTotal] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [autoRefresh, setAutoRefresh] = useLocalStorage("requestLogsAutoRefresh", false);
+  const [refreshSec, setRefreshSec] = useLocalStorage("requestLogsRefreshSec", 10);
+
+  const PAGE_SIZE = 100;
+  // 请求序号：筛选/刷新变更时递增，过期的分页响应直接丢弃，避免跨筛选追加错乱
+  const seqRef = useRef(0);
 
   const load = useCallback(async () => {
     setLoading(true);
+    setLoadingMore(false);
     setError("");
+    const seq = ++seqRef.current;
     try {
-      const params = new URLSearchParams();
+      const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
       if (model) params.set("model", model);
       if (status) params.set("status", status);
       const qs = params.toString();
-      setLogs(asList<RequestLog>(await api.get(`/api/admin/logs${qs ? `?${qs}` : ""}`)));
+      const data = await api.get<{
+        results: RequestLog[];
+        total: number;
+        has_more: boolean;
+      }>(`/api/admin/logs${qs ? `?${qs}` : ""}`);
+      if (seq !== seqRef.current) return; // 筛选已变，丢弃过期结果
+      setLogs(data.results ?? []);
+      setTotal(data.total ?? null);
+      setHasMore(Boolean(data.has_more));
     } catch (e) {
+      if (seq !== seqRef.current) return;
       setError(e instanceof Error ? e.message : "加载失败");
     } finally {
-      setLoading(false);
+      if (seq === seqRef.current) setLoading(false);
     }
   }, [model, status]);
+
+  async function loadMore() {
+    if (loadingMore || !hasMore) return;
+    setLoadingMore(true);
+    const seq = ++seqRef.current;
+    // 快照当前筛选与 offset，防止在途请求期间筛选被修改导致错位追加
+    const offset = logs.length;
+    const m = model;
+    const s = status;
+    try {
+      const params = new URLSearchParams({
+        limit: String(PAGE_SIZE),
+        offset: String(offset),
+      });
+      if (m) params.set("model", m);
+      if (s) params.set("status", s);
+      const data = await api.get<{
+        results: RequestLog[];
+        total: number;
+        has_more: boolean;
+      }>(`/api/admin/logs?${params.toString()}`);
+      if (seq !== seqRef.current) return; // 期间筛选/刷新已重置列表，丢弃过期分页
+      setLogs((prev) => [...prev, ...(data.results ?? [])]);
+      setTotal(data.total ?? null);
+      setHasMore(Boolean(data.has_more));
+    } catch (e) {
+      if (seq !== seqRef.current) return;
+      toast.error(e instanceof Error ? e.message : "加载更多失败");
+    } finally {
+      if (seq === seqRef.current) setLoadingMore(false);
+    }
+  }
 
   // 模型关键字防抖：停止输入 300ms 后才应用到查询条件
   useEffect(() => {
     const t = window.setTimeout(() => setModel(modelInput), 300);
     return () => window.clearTimeout(t);
   }, [modelInput]);
+
+  // 自动刷新：开启后按间隔重新加载（加载中状态复用，不打断展开明细）
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const t = window.setInterval(() => load(), refreshSec * 1000);
+    return () => window.clearInterval(t);
+  }, [autoRefresh, refreshSec, load]);
+
+  // token 生成速度（tokens/s），参考主流中转网关日志面板的「速度」列
+  function fmtSpeed(s?: number | null) {
+    if (s == null || !isFinite(s) || s <= 0) return "—";
+    if (s >= 1000) return `${(s / 1000).toFixed(2)}k tok/s`;
+    return `${s} tok/s`;
+  }
 
   useEffect(() => {
     load();
@@ -57,9 +130,27 @@ export default function RequestLogsPage() {
         title="请求日志"
         subtitle="用户请求与线路竞速记录"
         actions={
-          <Button onClick={load} loading={loading}>
-            <RefreshCw size={14} /> 刷新
-          </Button>
+          <>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-mute">自动刷新</span>
+              <Toggle checked={autoRefresh} onChange={setAutoRefresh} />
+              <Select
+                value={String(refreshSec)}
+                onChange={(e) => setRefreshSec(Number(e.target.value))}
+                className="w-[74px]"
+                disabled={!autoRefresh}
+                aria-label="刷新间隔"
+              >
+                <option value="5">5s</option>
+                <option value="10">10s</option>
+                <option value="30">30s</option>
+                <option value="60">60s</option>
+              </Select>
+            </div>
+            <Button onClick={load} loading={loading}>
+              <RefreshCw size={14} /> 刷新
+            </Button>
+          </>
         }
       />
 
@@ -144,6 +235,14 @@ export default function RequestLogsPage() {
                       {(l.cached_tokens ?? 0) > 0 && (
                         <div className="text-[10px] text-faint">缓存↓{l.cached_tokens}</div>
                       )}
+                      {l.status === "success" && (
+                        <div
+                          className="text-[10px] text-info"
+                          title={l.generation_speed != null ? "输出 tokens / 生成耗时（流式已扣除首字延迟）" : undefined}
+                        >
+                          {fmtSpeed(l.generation_speed)}
+                        </div>
+                      )}
                     </>
                   ) : (
                     <span className="text-faint">—</span>
@@ -158,6 +257,7 @@ export default function RequestLogsPage() {
                         <span className="font-medium text-gray-300">请求明细</span>
                         <span className="tabular-nums">耗时 {l.duration_ms ?? 0}ms</span>
                         <span className="tabular-nums">首字 {l.first_token_ms ?? "—"}ms</span>
+                        <span className="tabular-nums text-info">速度 {l.status === "success" ? fmtSpeed(l.generation_speed) : "—"}</span>
                         <span className="tabular-nums">输入 {l.prompt_tokens ?? 0}</span>
                         <span className="tabular-nums">输出 {l.completion_tokens ?? 0}</span>
                         <span className="tabular-nums">缓存 {l.cached_tokens ?? 0}</span>
@@ -224,6 +324,17 @@ export default function RequestLogsPage() {
           );
         })}
       </DataTable>
+
+      {(hasMore || total != null) && (
+        <div className="mt-3 flex items-center justify-center gap-3 text-xs text-faint">
+          <span className="tabular-nums">共 {total ?? "—"} 条，已加载 {logs.length}</span>
+          {hasMore && (
+            <Button onClick={loadMore} loading={loadingMore} size="sm" variant="ghost">
+              {loadingMore ? "加载中…" : "加载更多"}
+            </Button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

@@ -26,6 +26,9 @@ RUNTIME_PARAMS: dict[str, tuple[str, object, str]] = {
     "proxy_failure_cooldown_seconds": ("int", 60, "代理连续失败后的冷却时间（秒）"),
     "proxy_unhealthy_threshold": ("int", 3, "代理连续失败多少次后标记为 unhealthy"),
     "key_cooldown_seconds": ("int", 60, "渠道 Key 失败后冷却时间（秒）"),
+    "channel_cooldown_failures": ("int", 5, "渠道连续系统级失败多少次后自动熔断"),
+    "channel_cooldown_seconds": ("int", 120, "渠道熔断冷却时间（秒）"),
+    "log_retention_days": ("int", 30, "请求日志保留天数（0 = 永不清理，超过此期限的日志会被 cleanlogs 清理）"),
     "thinking_passthrough": ("bool", True, "透传客户端的思考强度参数（reasoning_effort / chat_template_kwargs 等）"),
     "thinking_strip_models": ("str", "", "不支持思考参数的模型名子串，英文逗号分隔；命中时剥离思考参数"),
     "default_thinking_effort": ("str", "max", "客户端只开启思考但未指定档位时，自动映射的思考强度（off/low/medium/high/max）"),
@@ -51,6 +54,13 @@ def _cast(raw: str, type_name: str):
 
 def _resolve_channel(channel):
     if channel is None:
+        # 平台级参数应锚定在 is_default 渠道，而不是 default_channel()——
+        # 后者在默认渠道熔断时会动态回落到别的渠道，导致「写入渠道 A、读取渠道 B」，
+        # 平台级配置（thinking_passthrough / proxy_timeout 等）被静默忽略。
+        from apps.core.models import Channel
+        anchor = Channel.objects.filter(is_default=True).first()
+        if anchor is not None:
+            return anchor
         from services import channel_service
         return channel_service.default_channel()
     return channel

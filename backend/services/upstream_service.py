@@ -58,8 +58,12 @@ def list_models_raw(channel: Channel, api_key: str, timeout: float = 30) -> tupl
         return 0, {}
 
 
-def sync_models(channel: Channel, api_key: str | None = None) -> dict:
-    """拉取渠道的模型列表并幂等 upsert 到 AIModel。"""
+def sync_models(channel: Channel, api_key: str | None = None,
+                prune: bool = False) -> dict:
+    """拉取渠道的模型列表并幂等 upsert 到 AIModel。
+
+    `prune=True` 时清理"上游已不存在的同步来源模型"（详见下方裁剪逻辑）。
+    """
     from apps.core.models import ChannelKey, ChannelKeyStatus
 
     key = api_key
@@ -71,17 +75,20 @@ def sync_models(channel: Channel, api_key: str | None = None) -> dict:
         )
         if not rec:
             raise ValueError("no_available_key")
-        key = rec.api_key
+        from services.crypto import decrypt_secret
+        key = decrypt_secret(rec.api_key)
 
     status_code, body = list_models_raw(channel, key)
     if status_code != 200 or "data" not in body:
         raise ValueError(f"upstream_error:{status_code}")
 
     created = existing = 0
+    upstream_names: list[str] = []
     for item in body.get("data", []):
         name = item.get("id")
         if not name:
             continue
+        upstream_names.append(name)
         _, was_created = channel.models.get_or_create(
             model_name=name, defaults={"provider": channel.slug}
         )
@@ -89,8 +96,20 @@ def sync_models(channel: Channel, api_key: str | None = None) -> dict:
             created += 1
         else:
             existing += 1
-    return {"created": created, "existing": existing,
-            "total": len(body.get("data", [])), "channel": channel.slug}
+
+    result = {"created": created, "existing": existing,
+              "total": len(body.get("data", [])), "channel": channel.slug,
+              "pruned": 0}
+
+    # 裁剪失效模型：只删「同步来源是本站（provider==channel.slug）且已禁用」
+    # 且上游已不存在的模型。手动添加/仍在启用的模型一律保留。
+    if prune:
+        stale = channel.models.filter(
+            provider=channel.slug, enabled=False,
+        ).exclude(model_name__in=upstream_names)
+        pruned, _ = stale.delete()
+        result["pruned"] = pruned
+    return result
 
 
 def probe(channel: Channel, api_key: str, timeout: float = 15) -> dict:

@@ -17,4 +17,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY backend/ .
 COPY --from=fe /fe/out /app/static/frontend
 EXPOSE 8000
-CMD ["sh", "-c", "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"]
+CMD ["sh", "-c", "python manage.py migrate && python manage.py cleanlogs && uvicorn config.asgi:application --host 0.0.0.0 --port 8000"]

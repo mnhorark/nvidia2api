@@ -138,12 +138,14 @@ def _route_url(route: Route) -> str:
 
 def _route_headers(route: Route) -> dict:
     from services import upstream_service
+    from services.crypto import decrypt_secret
 
     channel = route.key.channel
+    key_value = decrypt_secret(route.key.api_key)
     if channel is None:
-        return {"Authorization": f"Bearer {route.key.api_key}",
+        return {"Authorization": f"Bearer {key_value}",
                 "Content-Type": "application/json"}
-    return upstream_service.auth_headers(channel, route.key.api_key)
+    return upstream_service.auth_headers(channel, key_value)
 
 
 def _classify_error(exc: Exception) -> tuple[str, int]:

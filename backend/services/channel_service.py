@@ -47,14 +47,21 @@ def ensure_default_channel() -> Channel:
 
 
 def default_channel() -> Channel:
-    """默认渠道：优先 is_default，其次第一个启用的，最后强制创建。"""
-    channel = (
-        Channel.objects.filter(is_default=True).first()
-        or Channel.objects.filter(enabled=True).order_by("id").first()
-    )
-    if channel is None:
-        channel = ensure_default_channel()
-    return channel
+    """默认渠道：优先非熔断渠道（is_default 优先），全部熔断时回落第一个。
+
+    熔断冷却中的渠道不参与调度，请求自动转向其他可用渠道，避免打到
+    已知故障上游。
+    """
+    from services.channel_health import is_open
+
+    candidates = Channel.objects.filter(enabled=True).order_by("-is_default", "id")
+    for channel in candidates:
+        if not is_open(channel):
+            return channel
+    first = candidates.first()
+    if first is None:
+        return ensure_default_channel()
+    return first
 
 
 def resolve(slug: str | None = None) -> Channel:
@@ -102,10 +109,12 @@ def test_channel(channel: Channel) -> dict:
     """探测渠道连通性：用该渠道下第一个可用 Key 打一次 /models。"""
     from services import upstream_service
 
+    from services.crypto import decrypt_secret
+
     key = channel.keys.exclude(status="invalid").exclude(status="disabled").first()
     if key is None:
         return {"ok": False, "error": "该渠道下没有可用的 Key"}
-    return upstream_service.probe(channel, key.api_key)
+    return upstream_service.probe(channel, decrypt_secret(key.api_key))
 
 
 def channel_summary(channel: Channel) -> dict:

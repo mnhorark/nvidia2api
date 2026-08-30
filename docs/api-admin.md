@@ -88,24 +88,40 @@ import 返回 `{success, duplicate, invalid, failed, errors[]}`。
 | POST | `/api/admin/models` | 新建 |
 | PATCH | `/api/admin/models/{id}` | display_name/description/enabled |
 | DELETE | `/api/admin/models/{id}` | 删除 |
-| POST | `/api/admin/models/sync` | 从当前渠道的 models 端点拉取并 upsert |
+| POST | `/api/admin/models/sync` | 从当前渠道的 models 端点拉取并 upsert；body 带 `{"prune":true}` 时同时清理「上游已下线且已禁用的同步来源模型」 |
 
 ## 用户 API Key（跨渠道共享）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/admin/api-keys` | 列表（不含 hash） |
-| POST | `/api/admin/api-keys` | 创建 `{name, rate_limit}`（0=不限），**响应含完整 Key 一次** |
-| PATCH | `/api/admin/api-keys/{id}` | `{enabled, rate_limit, name}` |
+| POST | `/api/admin/api-keys` | 创建 `{name, rate_limit, quota}`（0=不限），**响应含完整 Key 一次** |
+| PATCH | `/api/admin/api-keys/{id}` | `{enabled, rate_limit, quota, name}` |
 | DELETE | `/api/admin/api-keys/{id}` | 删除 |
 
 ## 日志
 
 ```
-GET /api/admin/logs?model=&status=success|error
+GET /api/admin/logs?model=&status=success|failed&limit=100&offset=0
 ```
 
-返回最多 200 条（仅当前渠道），字段含 `first_token_ms`、`prompt/completion/total/cached_tokens`、`routes[]`、`winner_*`。
+分页参数：`limit`（默认 100，上限 500）、`offset`。响应含 `total`、`has_more`，前端据此做「加载更多」。
+字段含 `first_token_ms`、`prompt/completion/total/cached_tokens`、`routes[]`、`winner_*`。
+
+```
+POST /api/admin/logs/clean   {"days": 30, "all": false}
+```
+
+清理早于保留期限的请求日志。`days` 显式覆盖系统参数 `log_retention_days`（0=不清理）；
+`all=true` 清理所有渠道，默认只清理当前渠道。返回 `{deleted, retention_days}`。
+
+## 健康检查 / 指标
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/healthz` | 存活探针（无需鉴权），数据库可达返回 200 |
+| GET | `/api/admin/health` | 全量健康：资源计数、渠道状态、Key/Proxy 状态分布 |
+| GET | `/metrics` | Prometheus 文本指标：请求量、token 用量、各资源状态计数 |
 
 ## 对话测试
 

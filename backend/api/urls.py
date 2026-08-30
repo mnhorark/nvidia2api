@@ -1,17 +1,26 @@
 from django.urls import path
 
-from . import admin_views, openai_views
+from . import admin_views, health_views, openai_views
 
 urlpatterns = [
+    # 健康检查 / 可观测性
+    path("healthz", health_views.liveness),
+    path("metrics", health_views.metrics),
+    path("api/admin/health", health_views.admin_health),
+
     # OpenAI-compatible
     # /v1/*                      -> 平台默认渠道
     # /c/<slug>/v1/*             -> 指定渠道，例如 /c/zen/v1/chat/completions
     path("v1/models", openai_views.list_models),
     path("v1/chat/completions", openai_views.chat_completions),
     path("v1/responses", openai_views.responses),
+    path("v1/messages", openai_views.anthropic_messages),
+    path("v1/messages/count_tokens", openai_views.anthropic_count_tokens),
     path("c/<slug:channel_slug>/v1/models", openai_views.list_models),
     path("c/<slug:channel_slug>/v1/chat/completions", openai_views.chat_completions),
     path("c/<slug:channel_slug>/v1/responses", openai_views.responses),
+    path("c/<slug:channel_slug>/v1/messages", openai_views.anthropic_messages),
+    path("c/<slug:channel_slug>/v1/messages/count_tokens", openai_views.anthropic_count_tokens),
 
     # Admin
     path("api/admin/login", admin_views.LoginView.as_view()),
@@ -56,4 +65,5 @@ urlpatterns = [
     path("api/admin/api-keys/<int:pk>", admin_views.UserApiKeyDetailView.as_view()),
 
     path("api/admin/logs", admin_views.LogListView.as_view()),
+    path("api/admin/logs/clean", admin_views.LogCleanView.as_view()),
 ]

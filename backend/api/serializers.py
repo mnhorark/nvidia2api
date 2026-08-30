@@ -16,6 +16,7 @@ class ChannelSerializer(serializers.ModelSerializer):
     enabled_proxy_count = serializers.IntegerField(read_only=True, default=0)
     model_count = serializers.IntegerField(read_only=True, default=0)
     enabled_model_count = serializers.IntegerField(read_only=True, default=0)
+    in_cooldown = serializers.SerializerMethodField()
 
     class Meta:
         model = Channel
@@ -25,10 +26,15 @@ class ChannelSerializer(serializers.ModelSerializer):
             "allow_duplicate_keys",
             "disable_key_invalid",
             "enabled", "is_default", "notes",
+            "consecutive_failures", "cooldown_until", "in_cooldown",
             "key_count", "enabled_key_count", "proxy_count", "enabled_proxy_count",
             "model_count", "enabled_model_count", "created_at", "updated_at",
         ]
         read_only_fields = ["slug"]
+
+    def get_in_cooldown(self, obj) -> bool:
+        from services.channel_health import is_open
+        return is_open(obj)
 
 
 class ChannelKeySerializer(serializers.ModelSerializer):
@@ -47,7 +53,8 @@ class ChannelKeySerializer(serializers.ModelSerializer):
     def get_api_key(self, obj):
         if not obj.api_key:
             return ""
-        return mask_key(obj.api_key)
+        from services.crypto import decrypt_secret
+        return mask_key(decrypt_secret(obj.api_key))
 
     def get_is_anonymous(self, obj):
         return not obj.api_key
@@ -102,10 +109,12 @@ class ModelSerializer(serializers.ModelSerializer):
     public_name = serializers.CharField(read_only=True)
     proxy_group_name = serializers.CharField(
         source="proxy_group.name", read_only=True, default="")
+    # 附加对外名（多别名）：与 alias 一起构成该模型的全部可调用名字
+    aliases = serializers.JSONField(required=False)
 
     class Meta:
         model = AIModel
-        fields = ["id", "channel", "model_name", "display_name", "alias",
+        fields = ["id", "channel", "model_name", "display_name", "alias", "aliases",
                   "route_priority", "public_name", "description",
                   "proxy_group", "proxy_group_name", "endpoint",
                   "provider", "status", "enabled", "created_at", "updated_at"]
@@ -114,20 +123,45 @@ class ModelSerializer(serializers.ModelSerializer):
 class UserApiKeySerializer(serializers.ModelSerializer):
     class Meta:
         model = UserApiKey
-        fields = ["id", "name", "key_prefix", "enabled", "rate_limit", "total_requests",
-                  "success_requests", "failed_requests", "last_used_at", "created_at",
-                  "updated_at"]
+        fields = ["id", "name", "key_prefix", "enabled", "rate_limit", "quota",
+                  "used_quota", "total_requests", "success_requests", "failed_requests",
+                  "last_used_at", "created_at", "updated_at"]
 
 
 class RequestLogSerializer(serializers.ModelSerializer):
+    # token 生成速度（tokens/s）：输出 tokens / 生成耗时。
+    # 口径与 new-api 日志「速度」列一致：流式扣除首字耗时（TTFT），非流式用总耗时。
+    # 补充保护：流式生成阶段过短（首字≈总耗时、输出一次性涌入）时样本无统计意义，
+    # 会算出虚高的 tok/s，此时不展示。new-api 仅做 genTime>0 判断，本实现更稳健。
+    generation_speed = serializers.SerializerMethodField()
+
     class Meta:
         model = RequestLog
         fields = ["id", "channel", "request_id", "model", "created_at", "duration_ms",
                   "status", "http_status", "error_type", "winner_route_type",
                   "winner_key_name", "winner_proxy_name", "proxy_public_ip", "is_stream",
                   "routes_count", "prompt_tokens", "completion_tokens", "total_tokens",
-                  "cached_tokens", "first_token_ms", "routes", "client_thinking",
-                  "upstream_thinking"]
+                  "cached_tokens", "first_token_ms", "generation_speed", "routes",
+                  "client_thinking", "upstream_thinking"]
+
+    # 流式生成阶段的最小统计窗口：低于该值（毫秒）视为样本不可靠，不展示速度
+    _MIN_STREAM_GEN_MS = 500
+
+    def get_generation_speed(self, obj) -> float | None:
+        duration_ms = obj.duration_ms or 0
+        if duration_ms <= 0:
+            return None
+        completion = obj.completion_tokens or 0
+        if completion <= 0:
+            return None
+        gen_ms = duration_ms
+        if obj.is_stream and obj.first_token_ms:
+            if obj.first_token_ms >= duration_ms:
+                return None
+            gen_ms = duration_ms - obj.first_token_ms
+            if gen_ms < self._MIN_STREAM_GEN_MS:
+                return None
+        return round(completion / (gen_ms / 1000.0), 1)
 
 
 class SettingSerializer(serializers.ModelSerializer):

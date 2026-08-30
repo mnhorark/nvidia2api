@@ -33,6 +33,14 @@ export default function ModelsPage() {
   const [busyId, setBusyId] = useState<number | null>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
+  // 附加别名输入框保存原始字符串（避免受控 split 吃掉用户输入的英文逗号），
+  // 保存时才解析成数组
+  const [aliasText, setAliasText] = useState("");
+
+  const openEdit = (m?: Partial<Model>) => {
+    setEdit(m ?? { model_name: "" });
+    setAliasText((m?.aliases ?? []).join(", "));
+  };
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -63,11 +71,15 @@ export default function ModelsPage() {
       (m.display_name || "").toLowerCase().includes(q.toLowerCase())
   );
 
-  async function sync() {
+  async function sync(prune = false) {
     setSyncing(true);
     try {
-      await api.post("/api/admin/models/sync", {});
+      const res = await api.post<{ pruned?: number }>("/api/admin/models/sync",
+                                                      prune ? { prune: true } : {});
       await load();
+      if (prune && (res?.pruned ?? 0) > 0) {
+        toast.success(`同步完成，已清理 ${res.pruned} 个失效模型`);
+      }
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "同步失败");
     } finally {
@@ -122,6 +134,16 @@ export default function ModelsPage() {
     });
   }
 
+  // 端点的紧凑标记：完整值放在 title 里悬停查看，避免表格被长 URL 撑宽
+  function endpointLabel(ep?: string) {
+    if (!ep) return null;
+    const s = ep.trim();
+    if (s.includes("/responses")) return "responses";
+    if (s.includes("/messages")) return "messages";
+    if (/^https?:\/\//i.test(s)) return "自定义 URL";
+    return s;
+  }
+
   async function batch(action: "enable" | "disable" | "delete") {
     if (selected.size === 0) return;
     if (action === "delete" && !confirm(`确认删除选中的 ${selected.size} 个模型？`)) return;
@@ -145,6 +167,10 @@ export default function ModelsPage() {
         model_name: edit.model_name,
         display_name: edit.display_name ?? "",
         alias: edit.alias ?? "",
+        aliases: aliasText
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean),
         description: edit.description ?? "",
         proxy_group: edit.proxy_group ?? null,
         endpoint: edit.endpoint ?? "",
@@ -165,13 +191,16 @@ export default function ModelsPage() {
         subtitle="只有启用的模型才会通过 OpenAI API 对外提供"
         actions={
           <>
-            <Button onClick={sync} loading={syncing}>
+            <Button onClick={() => sync()} loading={syncing}>
               <Download size={14} /> 同步渠道模型
+            </Button>
+            <Button onClick={() => sync(true)} loading={syncing} title="同步并删除上游已下线的模型">
+              <Download size={14} /> 同步并清理
             </Button>
             <Button onClick={load} loading={loading}>
               <RefreshCw size={14} /> 刷新
             </Button>
-            <Button variant="primary" onClick={() => setEdit({ model_name: "" })}>
+            <Button variant="primary" onClick={() => openEdit()}>
               <Plus size={14} /> 添加模型
             </Button>
           </>
@@ -218,12 +247,9 @@ export default function ModelsPage() {
                 onChange={toggleAll}
               />
             </Th>
-            <Th>模型名称</Th>
-            <Th>对外名称</Th>
-            <Th>显示名称</Th>
+            <Th>模型</Th>
             <Th>代理分组</Th>
             <Th>端点</Th>
-            <Th>来源</Th>
             <Th>状态</Th>
             <Th>启用</Th>
             <Th>更新时间</Th>
@@ -240,9 +266,36 @@ export default function ModelsPage() {
                 onChange={() => toggleOne(m.id)}
               />
             </Td>
-            <Td className="font-mono text-xs text-gray-200">{m.model_name}</Td>
-            <Td className="font-mono text-xs text-accent">{m.public_name || m.model_name}</Td>
-            <Td className="text-mute">{m.display_name || "—"}</Td>
+            <Td className="max-w-[320px]">
+              <div
+                className="truncate font-mono text-xs text-gray-200"
+                title={m.model_name}
+              >
+                {m.model_name}
+              </div>
+              {m.public_name && m.public_name !== m.model_name && (
+                <div className="truncate text-[10px] text-accent" title={m.public_name}>
+                  对外 {m.public_name}
+                </div>
+              )}
+              {(m.aliases ?? []).length > 0 && (
+                <div className="mt-0.5 flex flex-wrap gap-1">
+                  {m.aliases!.map((a) => (
+                    <span
+                      key={a}
+                      className="rounded border border-line bg-white/[0.03] px-1 py-px text-[9px] text-info"
+                    >
+                      {a}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {m.display_name && m.display_name !== m.model_name && (
+                <div className="truncate text-[10px] text-mute" title={m.display_name}>
+                  {m.display_name}
+                </div>
+              )}
+            </Td>
             <Td>
               {m.proxy_group_name ? (
                 <span className="rounded border border-line bg-white/[0.03] px-1.5 py-0.5 text-xs text-info">
@@ -254,14 +307,16 @@ export default function ModelsPage() {
             </Td>
             <Td>
               {m.endpoint ? (
-                <span className="rounded border border-line bg-white/[0.03] px-1.5 py-0.5 text-xs text-accent">
-                  {m.endpoint}
+                <span
+                  className="rounded border border-line bg-white/[0.03] px-1.5 py-0.5 text-xs text-accent"
+                  title={m.endpoint}
+                >
+                  {endpointLabel(m.endpoint)}
                 </span>
               ) : (
                 <span className="text-faint">chat</span>
               )}
             </Td>
-            <Td className="text-mute">{m.provider || "—"}</Td>
             <Td>
               <Badge status={m.enabled ? "enabled" : "disabled"} />
             </Td>
@@ -272,13 +327,13 @@ export default function ModelsPage() {
                 onChange={(v) => setEnabled(m, v)}
               />
             </Td>
-            <Td className="text-xs text-faint">{fmtTime(m.updated_at)}</Td>
+            <Td className="whitespace-nowrap text-xs text-faint">{fmtTime(m.updated_at)}</Td>
             <Td>
               <div className="flex items-center gap-0.5">
                 <IconButton
                   title="编辑"
                   aria-label="编辑"
-                  onClick={() => setEdit(m)}
+                  onClick={() => openEdit(m)}
                 >
                   <Pencil size={14} />
                 </IconButton>
@@ -319,6 +374,17 @@ export default function ModelsPage() {
             />
             <p className="mt-1 text-xs text-faint">
               /v1/models 返回及 chat 请求时的模型名：别名 &gt; 显示名称 &gt; 原始模型名
+            </p>
+          </Field>
+          <Field label="附加对外名（多个别名，英文逗号分隔）">
+            <Input
+              placeholder="如：gpt-4o-mini, my-llm, chat-assistant"
+              value={aliasText}
+              onChange={(e) => setAliasText(e.target.value)}
+            />
+            <p className="mt-1 text-xs text-faint">
+              一个模型可暴露多个可调用名字（类似模型映射）：所有对外名都会出现在 /v1/models，
+              客户端可用其中任意一个调用，路由到同一个上游模型
             </p>
           </Field>
           <Field label="描述">

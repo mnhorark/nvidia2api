@@ -26,28 +26,61 @@ class ParseTests(TestCase):
     def test_top_level_thinking_bool(self):
         spec = parse({"thinking": True})
         self.assertTrue(spec.enabled)
-        out = to_upstream(spec, "deepseek-ai/deepseek-r1")
+        out = to_upstream(spec, "any/model")  # 未命中知识库 -> 通用默认：双开关
         self.assertEqual(
             out["chat_template_kwargs"], {"thinking": True, "enable_thinking": True},
         )
-        # 客户端只开启思考未指定档位时，自动映射默认档位(default_thinking_effort)
-        self.assertEqual(out["reasoning_effort"], "max")
 
-    def test_top_level_enable_thinking(self):
+    def test_deepseek_uses_thinking_only(self):
+        # DeepSeek 族只认 chat_template_kwargs.thinking（不认 enable_thinking）
+        spec = parse({"thinking": True})
+        out = to_upstream(spec, "deepseek-ai/deepseek-v4-pro-0813")
+        self.assertEqual(out["chat_template_kwargs"], {"thinking": True})
+        self.assertNotIn("enable_thinking", out["chat_template_kwargs"])
+
+    def test_qwen_uses_enable_thinking_only(self):
         spec = parse({"enable_thinking": False})
-        self.assertFalse(spec.enabled)
-        self.assertEqual(
-            to_upstream(spec, "qwen/qwen3-235b-a22b")["chat_template_kwargs"]["thinking"],
-            False,
-        )
+        out = to_upstream(spec, "qwen/qwen3-235b-a22b")
+        self.assertEqual(out["chat_template_kwargs"], {"enable_thinking": False})
 
-    def test_effort_implies_enabled(self):
+    def test_kimi_k3_never_sends_thinking(self):
+        # K3 始终思考、仅认顶层 reasoning_effort；传 thinking 会报错
         spec = parse({"reasoning_effort": "high"})
-        self.assertEqual(spec.effort, "high")
-        self.assertTrue(spec.enabled)
+        out = to_upstream(spec, "moonshotai/kimi-k3")
+        self.assertNotIn("chat_template_kwargs", out)
+        self.assertNotIn("thinking", out)
+        self.assertEqual(out["reasoning_effort"], "high")
+
+    def test_kimi_k2_uses_thinking_type(self):
+        spec = parse({"thinking": False})
+        out = to_upstream(spec, "moonshotai/kimi-k2.6")
+        self.assertEqual(out["thinking"], {"type": "disabled"})
+
+    def test_always_on_model_ignores_disable(self):
+        spec = parse({"thinking": False})
         out = to_upstream(spec, "deepseek-ai/deepseek-r1")
+        # 常开模型：不发送关闭开关，也不发档位
+        self.assertEqual(out, {})
+
+    def test_effort_implied_enabled_on_deepseek(self):
+        spec = parse({"reasoning_effort": "high"})
+        self.assertTrue(spec.enabled)
+        out = to_upstream(spec, "deepseek-ai/deepseek-v4-pro")
         self.assertEqual(out["reasoning_effort"], "high")
         self.assertTrue(out["chat_template_kwargs"]["thinking"])
+
+    def test_effort_clamped_to_model_supported(self):
+        # DeepSeek 只支持 high/max：客户端 low 提到 high，max 保持
+        out_low = to_upstream(parse({"reasoning_effort": "low"}),
+                              "deepseek-ai/deepseek-v4-flash-0731")
+        self.assertEqual(out_low["reasoning_effort"], "high")
+        out_max = to_upstream(parse({"reasoning_effort": "max"}),
+                              "deepseek-ai/deepseek-v4-flash-0731")
+        self.assertEqual(out_max["reasoning_effort"], "max")
+        # GLM 支持 low/high/max：medium 就近落到 high
+        out_med = to_upstream(parse({"reasoning_effort": "medium"}),
+                              "z-ai/glm-5.1")
+        self.assertEqual(out_med["reasoning_effort"], "high")
 
     def test_effort_aliases(self):
         cases = {
@@ -63,7 +96,7 @@ class ParseTests(TestCase):
         spec = parse({"reasoning_effort": "none"})
         self.assertFalse(spec.enabled)
         self.assertIsNone(spec.effort)
-        out = to_upstream(spec, "deepseek-ai/deepseek-r1")
+        out = to_upstream(spec, "deepseek-ai/deepseek-v4-pro")
         self.assertNotIn("reasoning_effort", out)
         self.assertFalse(out["chat_template_kwargs"]["thinking"])
 
@@ -150,7 +183,7 @@ class ViewIntegrationTests(TestCase):
         from api.openai_views import _build_upstream_body
 
         body = {
-            "model": "deepseek-ai/deepseek-r1",
+            "model": "deepseek-ai/deepseek-v4-pro-0813",
             "messages": [{"role": "user", "content": "hi"}],
             "temperature": 0.5,
             "stream": True,
@@ -159,13 +192,14 @@ class ViewIntegrationTests(TestCase):
             "bogus_param": 1,
         }
         out = _build_upstream_body(body, body["model"])
-        self.assertEqual(out["model"], "deepseek-ai/deepseek-r1")
+        self.assertEqual(out["model"], "deepseek-ai/deepseek-v4-pro-0813")
         self.assertEqual(out["temperature"], 0.5)
         self.assertTrue(out["stream"])
         self.assertNotIn("bogus_param", out)
         self.assertEqual(out["reasoning_effort"], "high")
+        # DeepSeek 族：只发 thinking 开关，避免 enable_thinking 这种非法关键字
         self.assertTrue(out["chat_template_kwargs"]["thinking"])
-        self.assertTrue(out["chat_template_kwargs"]["enable_thinking"])
+        self.assertNotIn("enable_thinking", out["chat_template_kwargs"])
 
     def test_openai_view_without_thinking_adds_nothing(self):
         from api.openai_views import _build_upstream_body
@@ -204,7 +238,7 @@ class UpstreamWireTests(TransactionTestCase):
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
             })
 
-        model_name = "deepseek-ai/deepseek-r1"
+        model_name = "deepseek-ai/deepseek-v4-pro-0813"
         channel = Channel.objects.create(
             name="Test", slug="test", base_url="https://upstream.test/v1")
         ChannelKey.objects.create(channel=channel, name="k1", api_key="nvapi-test")
@@ -234,28 +268,30 @@ class UpstreamWireTests(TransactionTestCase):
 
     def test_reasoning_effort_reaches_upstream(self):
         body = self._call_upstream({
-            "model": "deepseek-ai/deepseek-r1",
+            "model": "deepseek-ai/deepseek-v4-pro-0813",
             "messages": [{"role": "user", "content": "hi"}],
             "reasoning_effort": "high",
         })
         self.assertEqual(body["reasoning_effort"], "high")
+        # DeepSeek 族只发 thinking 开关，不发 enable_thinking（避免非法关键字）
         self.assertTrue(body["chat_template_kwargs"]["thinking"])
-        self.assertTrue(body["chat_template_kwargs"]["enable_thinking"])
+        self.assertNotIn("enable_thinking", body["chat_template_kwargs"])
 
     def test_extra_body_chat_template_kwargs_reaches_upstream(self):
         body = self._call_upstream({
-            "model": "deepseek-ai/deepseek-r1",
+            "model": "deepseek-ai/deepseek-v4-pro-0813",
             "messages": [{"role": "user", "content": "hi"}],
             "extra_body": {"chat_template_kwargs": {"enable_thinking": True},
                            "reasoning_budget": 8192},
         })
-        self.assertTrue(body["chat_template_kwargs"]["enable_thinking"])
+        # 客户端用 enable_thinking 表达意图，DeepSeek 族转译为 thinking
         self.assertTrue(body["chat_template_kwargs"]["thinking"])
+        self.assertNotIn("enable_thinking", body["chat_template_kwargs"])
         self.assertEqual(body["reasoning_budget"], 8192)
 
     def test_unknown_params_still_stripped(self):
         body = self._call_upstream({
-            "model": "deepseek-ai/deepseek-r1",
+            "model": "deepseek-ai/deepseek-v4-pro-0813",
             "messages": [{"role": "user", "content": "hi"}],
             "bogus_param": 1,
         })

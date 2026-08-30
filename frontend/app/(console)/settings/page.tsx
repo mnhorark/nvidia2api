@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { RefreshCw, RotateCcw, Save } from "lucide-react";
+import { Eraser, RefreshCw, RotateCcw, Save } from "lucide-react";
 import { api, RuntimeParam } from "@/lib/api";
 import { Button, Card, Input, PageHeader, Select } from "@/components/ui";
 import { toast } from "@/components/toaster";
@@ -12,6 +12,7 @@ export default function SettingsPage() {
   const [channel, setChannel] = useState("");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [cleaning, setCleaning] = useState(false);
   const [error, setError] = useState("");
 
   const load = useCallback(async () => {
@@ -72,6 +73,28 @@ export default function SettingsPage() {
     if (p) setDraft((d) => ({ ...d, [key]: String(p.default) }));
   }
 
+  async function cleanLogs() {
+    const retention = params.find((p) => p.key === "log_retention_days");
+    const days = Number(draft["log_retention_days"] ?? retention?.value ?? 30);
+    const label = days > 0 ? `当前渠道早于 ${days} 天的` : "过期的";
+    if (!confirm(`确认删除${label}请求日志？该操作不可恢复。`)) return;
+    setCleaning(true);
+    try {
+      const res = await api.post<{ deleted: number; retention_days: number }>(
+        "/api/admin/logs/clean", { days }
+      );
+      if (res.retention_days <= 0) {
+        toast.info("保留天数设置为 0，未清理任何日志");
+      } else {
+        toast.success(`已清理 ${res.deleted} 条日志`);
+      }
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "清理失败");
+    } finally {
+      setCleaning(false);
+    }
+  }
+
   const dirty = params.some((p) => draft[p.key] !== undefined && draft[p.key] !== String(p.value));
 
   return (
@@ -87,6 +110,9 @@ export default function SettingsPage() {
           <>
             <Button onClick={load} loading={loading}>
               <RefreshCw size={14} /> 刷新
+            </Button>
+            <Button onClick={cleanLogs} loading={cleaning}>
+              <Eraser size={14} /> 清理日志
             </Button>
             <Button variant="primary" onClick={save} loading={saving} disabled={!params.length}>
               <Save size={14} /> 保存{dirty ? " *" : ""}
@@ -133,8 +159,8 @@ export default function SettingsPage() {
                         onChange={(e) => setDraft((d) => ({ ...d, [p.key]: e.target.value }))}
                         className="w-40"
                       >
-                        <option value="True">开启</option>
-                        <option value="False">关闭</option>
+                        <option value="true">开启</option>
+                        <option value="false">关闭</option>
                       </Select>
                     ) : (
                       <Input

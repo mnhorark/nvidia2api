@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from django.db import models, transaction
 
+from services.crypto import decrypt_secret, encrypt_secret
+
 
 class Timestamped(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
@@ -101,6 +103,10 @@ class Channel(Timestamped):
     # 关闭"无效"标记：公共/匿名 Key 渠道（如 Zen 的 public、无鉴权渠道）不因
     # 单次上游 401/403 把 Key 永久标记为 invalid（限流 429 / 冷却仍保留，会自动恢复）。
     disable_key_invalid = models.BooleanField(default=False)
+    # 渠道级自动熔断：系统级连续失败（竞速全挂/5xx 等）达到阈值后进入冷却，
+    # 冷却期间该渠道不参与线路构建，冷却结束自动恢复。
+    consecutive_failures = models.IntegerField(default=0)
+    cooldown_until = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         db_table = "channel"
@@ -167,6 +173,12 @@ class ChannelKey(Timestamped):
         # 不建数据库层唯一约束:zen / kilo 等渠道允许导入重复 key,交由应用层控制
         constraints = []
         indexes = [models.Index(fields=["status", "last_used_at"])]
+
+    def save(self, *args, **kwargs):
+        # 敏感字段加密存储；幂等（已加密值跳过），旧明文在读取时自动回落
+        if self.api_key:
+            self.api_key = encrypt_secret(self.api_key)
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name
@@ -246,9 +258,15 @@ class Proxy(Timestamped):
     def __str__(self):
         return self.name
 
+    def save(self, *args, **kwargs):
+        # 敏感字段加密存储；幂等（已加密值跳过）
+        if self.password:
+            self.password = encrypt_secret(self.password)
+        super().save(*args, **kwargs)
+
     @property
     def url(self) -> str:
-        auth = f"{self.username}:{self.password}@" if self.username else ""
+        auth = f"{self.username}:{decrypt_secret(self.password)}@" if self.username else ""
         return f"{self.protocol}://{auth}{self.host}:{self.port}"
 
 
@@ -261,6 +279,9 @@ class AIModel(Timestamped):
     display_name = models.CharField(max_length=256, blank=True, default="")
     # 对外暴露的名字，参与 /v1 路由：留空则用 model_name
     alias = models.CharField(max_length=256, blank=True, default="", db_index=True)
+    # 附加对外名（多别名）：一个模型可暴露多个可调用名字（参考 one-api 的
+    # 模型映射思路）。全部对外名 = alias(主) + aliases(附加)。
+    aliases = models.JSONField(default=list, blank=True)
     description = models.TextField(blank=True, default="")
     provider = models.CharField(max_length=64, default="nvidia")
     status = models.CharField(max_length=16, default="active")
@@ -304,6 +325,11 @@ class UserApiKey(Timestamped):
     key_prefix = models.CharField(max_length=32)
     enabled = models.BooleanField(default=True)
     rate_limit = models.IntegerField(default=0, help_text="requests per minute, 0 = unlimited")
+    # Token 额度体系：quota 为该 Key 的总 token 额度（0 = 不限），
+    # used_quota 为累计消耗（input + output tokens，缓存部分按比例折算），
+    # 达到额度后拒绝新请求并返回 402，直到管理员充值（增加 quota）。
+    quota = models.BigIntegerField(default=0, help_text="total token quota, 0 = unlimited")
+    used_quota = models.BigIntegerField(default=0, help_text="accumulated token usage")
     total_requests = models.IntegerField(default=0)
     success_requests = models.IntegerField(default=0)
     failed_requests = models.IntegerField(default=0)

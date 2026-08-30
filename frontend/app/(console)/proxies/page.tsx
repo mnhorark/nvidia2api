@@ -29,6 +29,8 @@ export default function ProxiesPage() {
   const [groups, setGroups] = useState<ProxyGroup[]>([]);
   const [keyCount, setKeyCount] = useState(0);
   const [enabledCount, setEnabledCount] = useState(0);
+  // 代理启用上限：以接口返回的 max_enabled_proxies 为准（= 非禁用 Key 数 - 1）
+  const [maxAllowed, setMaxAllowed] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [importOpen, setImportOpen] = useState(false);
@@ -43,23 +45,25 @@ export default function ProxiesPage() {
   // 批量分组
   const [groupTarget, setGroupTarget] = useState("");
 
-  const maxProxies = Math.max(keyCount - 1, 0);
+  const maxProxies = maxAllowed;
 
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
       const [p, g, k] = await Promise.all([
-        api.get("/api/admin/proxies"),
+        api.get<{ results: Proxy[]; summary?: { max_enabled_proxies?: number } }>("/api/admin/proxies"),
         api.get("/api/admin/proxy-groups"),
         api.get("/api/admin/keys"),
       ]);
       const proxyList = asList<Proxy>(p);
+      const keyList = asList<ChannelKey>(k);
       setProxies(proxyList);
       setSelected(new Set());
       setEnabledCount(proxyList.filter((x) => x.enabled).length);
       setGroups(asList<ProxyGroup>(g));
-      setKeyCount(asList<ChannelKey>(k).length);
+      setKeyCount(keyList.length);
+      setMaxAllowed(Math.max(p.summary?.max_enabled_proxies ?? keyList.length - 1, 0));
     } catch (e) {
       setError(e instanceof Error ? e.message : "加载失败");
     } finally {
@@ -110,7 +114,8 @@ export default function ProxiesPage() {
   async function testAll() {
     setTestingAll(true);
     try {
-      await api.post("/api/admin/proxies/test-all", {});
+      // 全部测速是同步阻塞接口（并发 20 逐批），给足超时避免中途被打断
+      await api.post("/api/admin/proxies/test-all", {}, 300_000);
       await load();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "测速失败");
@@ -461,17 +466,17 @@ export default function ProxiesPage() {
             <Td className="text-mute">{p.country || "—"}</Td>
             <Td
               className="tabular-nums"
-              title={p.latency != null ? `${p.latency} ms` : undefined}
+              title={p.latency_ms != null ? `${p.latency_ms} ms` : undefined}
             >
               <span
                 className={
-                  p.latency == null ? "text-faint"
-                    : p.latency < 300 ? "text-ok"
-                    : p.latency < 1000 ? "text-gray-200"
+                  p.latency_ms == null ? "text-faint"
+                    : p.latency_ms < 300 ? "text-ok"
+                    : p.latency_ms < 1000 ? "text-gray-200"
                     : "text-warn"
                 }
               >
-                {fmtLatency(p.latency)}
+                {fmtLatency(p.latency_ms)}
               </span>
             </Td>
             <Td>
@@ -484,7 +489,7 @@ export default function ProxiesPage() {
                 onChange={(v) => setEnabled(p, v)}
               />
             </Td>
-            <Td className="text-xs text-faint">{fmtTime(p.last_check_time)}</Td>
+            <Td className="text-xs text-faint">{fmtTime(p.last_check_at)}</Td>
             <Td>
               <div className="flex items-center gap-0.5">
                 <IconButton

@@ -4,6 +4,8 @@ __pycache__/
 .env
 .env.local
 data/*.sqlite3
+# 个人工具配置（含明文 API Key），勿提交到版本库
+config.json
 data/*.bak*
 node_modules/
 .next/

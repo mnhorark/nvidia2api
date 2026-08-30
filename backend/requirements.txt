@@ -6,6 +6,7 @@ httpx[socks]>=0.27
 httpx-socks>=0.10
 curl-cffi>=0.10
 socksio>=1.0
+cryptography>=42.0
 pydantic>=2.0
 uvicorn>=0.29
 pytest>=8.0

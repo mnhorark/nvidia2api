@@ -244,7 +244,8 @@ class ChannelKeyListView(AdminRequiredMixin, APIView):
         if not name:
             name = f"{channel.name} Key {channel.keys.count() + 1:03d}"
         # 空 key = 匿名线路槽位（无鉴权渠道，如 LLM7 / Zen），允许多条并存
-        if key and channel.keys.filter(api_key=key).exists():
+        allow_dup = bool(getattr(channel, "allow_duplicate_keys", False))
+        if key and not allow_dup and key_service._key_stored_in_channel(channel, key):
             return Response({"error": {"message": "duplicate key", "code": "duplicate"}},
                             status=400)
         rec = ChannelKey.objects.create(channel=channel, name=name, api_key=key,
@@ -274,7 +275,8 @@ class ChannelKeyDetailView(AdminRequiredMixin, APIView):
             return Response({"detail": "not found"}, status=404)
         data = ChannelKeySerializer(rec).data
         if request.query_params.get("reveal") == "1":
-            data["api_key"] = rec.api_key
+            from services.crypto import decrypt_secret
+            data["api_key"] = decrypt_secret(rec.api_key)
         return Response(data)
 
     def patch(self, request, pk):
@@ -494,14 +496,24 @@ class ModelListView(AdminRequiredMixin, APIView):
         if not name:
             return Response({"error": {"message": "model_name required",
                                        "code": "bad_request"}}, status=400)
-        rec, created = channel.models.get_or_create(model_name=name, defaults={
+        defaults = {
             "display_name": request.data.get("display_name", ""),
+            "alias": (request.data.get("alias") or "").strip(),
+            "aliases": _normalize_aliases(request.data.get("aliases")),
             "description": request.data.get("description", ""),
             "provider": request.data.get("provider") or channel.slug,
             "endpoint": (request.data.get("endpoint") or "").strip(),
             "enabled": request.data.get("enabled", False),
-        })
+        }
+        rec, created = channel.models.get_or_create(model_name=name, defaults=defaults)
+        if not created:
+            # 重复添加：把新提交的展示名/别名等应用到已有模型
+            for f in ("display_name", "alias", "aliases", "description",
+                      "endpoint", "enabled"):
+                if f in request.data and request.data[f] is not None:
+                    setattr(rec, f, defaults[f])
         self._apply_proxy_group(rec, request)
+        rec.save()
         return Response(ModelSerializer(rec).data, status=201 if created else 200)
 
     @staticmethod
@@ -522,9 +534,16 @@ class ModelListView(AdminRequiredMixin, APIView):
 
 class ModelSyncView(AdminRequiredMixin, APIView):
     def post(self, request):
-        channel = current_channel(request)
+        # 请求体里的 channel 字段优先，其次 X-Channel 头（当前渠道作用域），
+        # 避免前端同步模型时必须切换全局渠道导致整台重挂载
+        channel_param = (request.data.get("channel") or "").strip()
+        channel = (
+            channel_service.resolve(channel_param) if channel_param
+            else current_channel(request)
+        )
+        prune = str(request.data.get("prune") or "").lower() in ("1", "true", "yes")
         try:
-            return Response(upstream_service.sync_models(channel))
+            return Response(upstream_service.sync_models(channel, prune=prune))
         except ValueError as exc:
             msg = str(exc)
             code = "no_available_key" if msg == "no_available_key" else "upstream_error"
@@ -543,6 +562,8 @@ class ModelDetailView(AdminRequiredMixin, APIView):
         rec = self._get(pk)
         if not rec:
             return Response({"detail": "not found"}, status=404)
+        if "aliases" in request.data:
+            rec.aliases = _normalize_aliases(request.data["aliases"])
         for f in ("display_name", "alias", "route_priority", "description",
                   "enabled", "status", "endpoint"):
             if f in request.data:
@@ -581,6 +602,20 @@ def _parse_ids(request) -> list[int]:
     if not isinstance(ids, list):
         return []
     return [int(i) for i in ids if str(i).isdigit()]
+
+
+def _normalize_aliases(value) -> list[str]:
+    """规范化附加别名：支持 JSON 数组或逗号分隔字符串；去空格、去空、去重。"""
+    if value is None:
+        return []
+    items = value if isinstance(value, list) else [value]
+    out: list[str] = []
+    for item in items:
+        for part in str(item or "").split(","):
+            p = part.strip()
+            if p and p not in out:
+                out.append(p)
+    return out
 
 
 class ModelBatchView(AdminRequiredMixin, APIView):
@@ -712,7 +747,11 @@ class UserApiKeyListView(AdminRequiredMixin, APIView):
         rate_limit = _parse_int(rl_raw) if rl_raw not in (None, "") else 0
         if rate_limit is None:
             return _bad_param("rate_limit")
-        rec, raw = api_key_service.create_key(name, rate_limit=rate_limit)
+        quota_raw = request.data.get("quota")
+        quota = _parse_int(quota_raw) if quota_raw not in (None, "") else 0
+        if quota is None or quota < 0:
+            return _bad_param("quota")
+        rec, raw = api_key_service.create_key(name, rate_limit=rate_limit, quota=quota)
         data = UserApiKeySerializer(rec).data
         data["key"] = raw  # full key shown once at creation only
         return Response(data, status=201)
@@ -736,6 +775,11 @@ class UserApiKeyDetailView(AdminRequiredMixin, APIView):
             if rl is None:
                 return _bad_param("rate_limit")
             rec.rate_limit = rl
+        if "quota" in request.data:
+            q = _parse_int(request.data["quota"])
+            if q is None or q < 0:
+                return _bad_param("quota")
+            rec.quota = q
         if "name" in request.data:
             rec.name = request.data["name"]
         rec.save()
@@ -761,9 +805,46 @@ class LogListView(AdminRequiredMixin, APIView):
             qs = qs.filter(model=model)
         if status:
             qs = qs.filter(status=status)
-        qs = qs[:200]
-        return Response({"results": RequestLogSerializer(qs, many=True).data,
-                         "channel": channel.slug})
+        # 分页：limit 默认 100，上限 500；offset 用于"加载更多"
+        limit_raw = request.query_params.get("limit")
+        limit = _parse_int(limit_raw) if limit_raw not in (None, "") else 100
+        if limit is None:
+            return _bad_param("limit")
+        limit = max(1, min(limit, 500))
+        offset_raw = request.query_params.get("offset")
+        offset = _parse_int(offset_raw) if offset_raw not in (None, "") else 0
+        if offset is None:
+            return _bad_param("offset")
+        offset = max(offset, 0)
+        total = qs.count()
+        page = list(qs[offset: offset + limit])
+        return Response({
+            "results": RequestLogSerializer(page, many=True).data,
+            "channel": channel.slug,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(page) < total,
+        })
+
+
+class LogCleanView(AdminRequiredMixin, APIView):
+    """清理过期请求日志。默认清理当前渠道；`all=1` 清理所有渠道。
+
+    `days` 可显式覆盖系统参数 log_retention_days；0 表示本次不清理。
+    """
+
+    def post(self, request):
+        from services import cleanup
+
+        all_channels = str(request.data.get("all") or "").lower() in ("1", "true", "yes")
+        days_raw = request.data.get("days")
+        days = _parse_int(days_raw) if days_raw not in (None, "") else None
+        if days is None and days_raw not in (None, ""):
+            return _bad_param("days")
+        channel = None if all_channels else current_channel(request)
+        result = cleanup.clean_old_logs(days=days, channel=channel)
+        return Response(result)
 
 
 class DashboardView(AdminRequiredMixin, APIView):
@@ -787,9 +868,11 @@ class DashboardView(AdminRequiredMixin, APIView):
         today_count = agg["n"] or 0
 
         n_active_keys = keys.exclude(status=ChannelKeyStatus.DISABLED).count()
+        from api.openai_views import active_requests
         return Response({
             "channel": channel.slug,
             "channel_name": channel.name,
+            "active_requests": active_requests(),
             "nvidia_keys": keys.count(),
             "enabled_keys": keys.exclude(
                 status__in=[ChannelKeyStatus.DISABLED, ChannelKeyStatus.INVALID]).count(),
@@ -1055,7 +1138,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
                                         client_thinking=client_thinking,
                                         upstream_thinking=upstream_thinking)
         if not routes:
-            log.status, log.http_status, log.error_type = "error", 503, "no_available_route"
+            log.status, log.http_status, log.error_type = "failed", 503, "no_available_route"
             log.save()
             return Response({"error": {"message": "当前没有可用线路（没有可用的渠道 Key）",
                                        "code": "no_available_route"}}, status=503)
@@ -1064,7 +1147,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
         try:
             result = race_chat(routes, body)
         except AllRoutesFailed as exc:
-            log.status, log.error_type = "error", "all_routes_failed"
+            log.status, log.error_type = "failed", "all_routes_failed"
             log.http_status = 502
             log.routes = exc.report
             log.save()
@@ -1072,7 +1155,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
                                        "code": "upstream_error"},
                              "routes": exc.report}, status=502)
         except NoRouteAvailable:
-            log.status, log.error_type = "error", "no_available_route"
+            log.status, log.error_type = "failed", "no_available_route"
             log.http_status = 503
             log.save()
             return Response({"error": {"message": "当前没有可用线路",
@@ -1133,7 +1216,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
         body = dict(body)
         body.setdefault("stream_options", {}).update({"include_usage": True})
         if not routes:
-            log.status, log.http_status, log.error_type = "error", 503, "no_available_route"
+            log.status, log.http_status, log.error_type = "failed", 503, "no_available_route"
             log.save()
             return Response({"error": {"message": "当前没有可用线路",
                                        "code": "no_available_route"}}, status=503)
@@ -1202,7 +1285,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
                     }
                 }) + "\n\n"
             except (NoRouteAvailable, AllRoutesFailed) as exc:
-                log.status, log.http_status, log.error_type = "error", 502, "all_routes_failed"
+                log.status, log.http_status, log.error_type = "failed", 502, "all_routes_failed"
                 if isinstance(exc, AllRoutesFailed):
                     log.routes = exc.report
                 log.save()
@@ -1212,7 +1295,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
                 }) + "\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as exc:  # noqa: BLE001
-                log.status, log.error_type = "error", "stream_error"
+                log.status, log.error_type = "failed", "stream_error"
                 log.save()
                 yield "data: " + json.dumps({
                     "error": {"message": f"stream error: {exc}", "type": "api_error",

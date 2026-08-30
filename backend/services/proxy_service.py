@@ -7,6 +7,7 @@ from datetime import timedelta
 from urllib.parse import urlparse
 
 from django.db import transaction
+from django.db.models import F
 from django.utils import timezone
 
 from apps.core.models import Channel, ChannelKey, ChannelKeyStatus, Proxy, ProxyGroup, ProxyStatus
@@ -112,30 +113,29 @@ def report_proxy_result(proxy_id: int, success: bool, latency_ms: float | None =
     unhealthy_threshold = sysconfig.get("proxy_unhealthy_threshold", channel)
     cooldown_seconds = sysconfig.get("proxy_failure_cooldown_seconds", channel)
     with transaction.atomic():
-        p = Proxy.objects.select_for_update().get(pk=proxy_id)
         if success:
-            p.success_count += 1
-            p.consecutive_failures = 0
-            p.status = ProxyStatus.HEALTHY
-            if latency_ms is not None:
-                p.latency_ms = latency_ms
-            p.cooldown_until = None
-            p.save(update_fields=[
-                "success_count", "consecutive_failures", "status",
-                "latency_ms", "cooldown_until", "updated_at",
-            ])
-        else:
-            p.failure_count += 1
-            p.consecutive_failures += 1
-            if p.consecutive_failures >= unhealthy_threshold:
-                p.status = ProxyStatus.UNHEALTHY
-                p.cooldown_until = now + timedelta(seconds=cooldown_seconds)
-            elif p.consecutive_failures >= 1:
-                p.status = ProxyStatus.DEGRADED
-            p.save(update_fields=[
-                "failure_count", "consecutive_failures", "status",
-                "cooldown_until", "updated_at",
-            ])
+            # 原子更新：避免并发下 read-modify-write 丢失计数/状态
+            Proxy.objects.filter(pk=proxy_id).update(
+                success_count=F("success_count") + 1,
+                consecutive_failures=0,
+                status=ProxyStatus.HEALTHY,
+                cooldown_until=None,
+                **(dict(latency_ms=latency_ms) if latency_ms is not None else {}),
+            )
+            return
+        # 原子递增计数后判定状态，保证并发失败也能准确进冷却
+        Proxy.objects.filter(pk=proxy_id).update(
+            failure_count=F("failure_count") + 1,
+            consecutive_failures=F("consecutive_failures") + 1,
+        )
+        p = Proxy.objects.get(pk=proxy_id)
+        if p.consecutive_failures >= unhealthy_threshold:
+            Proxy.objects.filter(pk=proxy_id).update(
+                status=ProxyStatus.UNHEALTHY,
+                cooldown_until=now + timedelta(seconds=cooldown_seconds),
+            )
+        elif p.consecutive_failures >= 1:
+            Proxy.objects.filter(pk=proxy_id).update(status=ProxyStatus.DEGRADED)
 
 
 def schedulable_proxies(channel: Channel, group: int | None = None) -> list[Proxy]:
