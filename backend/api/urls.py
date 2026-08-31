@@ -1,6 +1,6 @@
-from django.urls import path
+from django.urls import path, re_path
 
-from . import admin_views, health_views, openai_views
+from . import admin_views, frontend_views, health_views, openai_views
 
 urlpatterns = [
     # 健康检查 / 可观测性
@@ -66,4 +66,11 @@ urlpatterns = [
 
     path("api/admin/logs", admin_views.LogListView.as_view()),
     path("api/admin/logs/clean", admin_views.LogCleanView.as_view()),
+
+    # ---- 前端静态托管（all-in-one 镜像）----
+    # 必须放在最后，且用否定预查排除 API 前缀：未知 API 路径仍然要返回 404，
+    # 不能被前端 index.html 吞掉（否则客户端会把 404 HTML 当成 JSON 解析失败）。
+    path("", frontend_views.frontend_root),
+    re_path(r"^(?!api/|v1/|c/|healthz|metrics)(?P<path>.*)$",
+            frontend_views.serve_frontend),
 ]

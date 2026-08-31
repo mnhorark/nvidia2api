@@ -103,6 +103,9 @@ class Channel(Timestamped):
     # 关闭"无效"标记：公共/匿名 Key 渠道（如 Zen 的 public、无鉴权渠道）不因
     # 单次上游 401/403 把 Key 永久标记为 invalid（限流 429 / 冷却仍保留，会自动恢复）。
     disable_key_invalid = models.BooleanField(default=False)
+    # 关闭"异常"标记：公共/不稳定代理渠道不因连续失败把代理标记为 unhealthy 并踢出池、
+    # 进入冷却（失败计数仍保留，仅用于统计与降级展示）。
+    disable_proxy_unhealthy = models.BooleanField(default=False)
     # 渠道级自动熔断：系统级连续失败（竞速全挂/5xx 等）达到阈值后进入冷却，
     # 冷却期间该渠道不参与线路构建，冷却结束自动恢复。
     consecutive_failures = models.IntegerField(default=0)
@@ -154,7 +157,10 @@ class ChannelKey(Timestamped):
         null=True, blank=True, db_index=True,
     )
     name = models.CharField(max_length=128)
-    api_key = models.CharField(max_length=256)
+    # Fernet 密文约为明文长度的 1.4 倍再 base64 膨胀，JWT 型网关 Key 动辄
+    # 数百字符；256 在 SQLite 下不校验、迁到 PostgreSQL 会直接写入失败。
+    # 用 TextField 彻底摆脱上限。
+    api_key = models.TextField()
     status = models.CharField(
         max_length=16, choices=ChannelKeyStatus.choices,
         default=ChannelKeyStatus.AVAILABLE, db_index=True,
@@ -311,10 +317,11 @@ class AIModel(Timestamped):
 
     @property
     def public_name(self) -> str:
-        """对外暴露的模型名：别名 > 显示名称 > 上游原始名。"""
-        return ((self.alias or "").strip()
-                or (self.display_name or "").strip()
-                or self.model_name)
+        """对外暴露的主模型名：别名 > 上游原始名。
+
+        `display_name` 仅是管理后台的展示标签，不参与对外命名与解析。
+        """
+        return (self.alias or "").strip() or self.model_name
 
 
 class UserApiKey(Timestamped):
