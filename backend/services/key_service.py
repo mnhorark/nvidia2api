@@ -30,14 +30,14 @@ def mask_key(key: str) -> str:
     return key[:10] + "*" * 8 + key[-4:]
 
 
-def _key_stored_in_channel(channel: Channel, plain_key: str) -> bool:
-    """按明文判断渠道里是否已存在该 Key（存储为加密值，需解密后比较）。"""
-    if not plain_key:
-        return False
-    for stored in channel.keys.values_list("api_key", flat=True):
-        if decrypt_secret(stored or "") == plain_key:
-            return True
-    return False
+def _stored_plain_keys(channel: Channel) -> set[str]:
+    """渠道内已存 Key 的明文集合（存储为加密值，需逐条解密）。
+
+    批量导入时**只调用一次**再复用：原来每行都全量解密比对，导入 n 行、
+    渠道已有 m 把 Key 就是 O(n×m) 次 Fernet 解密，几百行时明显卡顿。
+    """
+    return {decrypt_secret(stored or "")
+            for stored in channel.keys.values_list("api_key", flat=True)}
 
 
 def parse_import_text(text: str) -> list[tuple[str, str, str | None]]:
@@ -68,6 +68,8 @@ def bulk_import_keys(text: str, channel: Channel) -> dict:
     seen_in_batch: set[str] = set()
     result = {"success": 0, "duplicate": 0, "invalid": 0, "failed": 0, "errors": []}
     label = channel.name
+    # 已有明文集合只解密构建一次（惰性：确实要做去重时才建）
+    existing: set[str] | None = None
     auto_idx = channel.keys.count() + 1
     default_rpm = sysconfig.get("default_upstream_rpm", channel)
     for ln in lines:
@@ -101,11 +103,12 @@ def bulk_import_keys(text: str, channel: Channel) -> dict:
             continue
         # 匿名线路每个都是独立槽位，跳过重复检查（允许多条并存）
         allow_dup = bool(getattr(channel, "allow_duplicate_keys", False))
-        if not anonymous and not allow_dup and (
-            key in seen_in_batch or _key_stored_in_channel(channel, key)
-        ):
-            result["duplicate"] += 1
-            continue
+        if not anonymous and not allow_dup:
+            if existing is None:
+                existing = _stored_plain_keys(channel)
+            if key in seen_in_batch or key in existing:
+                result["duplicate"] += 1
+                continue
         if allow_dup:
             seen_in_batch.add(key)
         try:
@@ -114,6 +117,8 @@ def bulk_import_keys(text: str, channel: Channel) -> dict:
                 rpm_limit=channel.default_rpm or default_rpm,
             )
             seen_in_batch.add(key)
+            if existing is not None:
+                existing.add(key)
             if auto_named:
                 auto_idx += 1
             result["success"] += 1
@@ -167,85 +172,103 @@ def _score(k: ChannelKey):
 def claim_rpm_slot(key_id: int) -> bool:
     """Atomically claim one RPM slot. Uses conditional UPDATEs (no SELECT ... FOR UPDATE)
     so it is safe under SQLite's serialized write locking across threads."""
-    limit = ChannelKey.objects.filter(pk=key_id).values_list(
-        "rpm_limit", flat=True).first()
-    if limit is None:
+    try:
+        limit = ChannelKey.objects.filter(pk=key_id).values_list(
+            "rpm_limit", flat=True).first()
+        if limit is None:
+            return False
+        if limit <= 0:
+            # rpm_limit <= 0 视为不限流：直接成功且不计数。
+            return True
+        now = timezone.now()
+        window_cutoff = now - timedelta(seconds=MINUTE_SECONDS)
+        ok_states = [ChannelKeyStatus.AVAILABLE, ChannelKeyStatus.RATE_LIMITED,
+                     ChannelKeyStatus.ERROR]
+        base = ChannelKey.objects.filter(pk=key_id, status__in=ok_states).filter(
+            Q(cooldown_until__isnull=True) | Q(cooldown_until__lte=now)
+        )
+        # Case 1: window stale -> reset window and claim first slot (recovers rate_limited too).
+        reset = base.filter(
+            Q(minute_window_start__isnull=True) | Q(minute_window_start__lte=window_cutoff)
+        ).update(
+            minute_window_start=now, minute_request_count=1, last_used_at=now,
+            status=ChannelKeyStatus.AVAILABLE,
+        )
+        if reset:
+            return True
+        # Case 2: window active -> claim only if under rpm_limit.
+        claimed = base.filter(
+            minute_window_start__gt=window_cutoff,
+            minute_request_count__lt=F("rpm_limit"),
+        ).update(minute_request_count=F("minute_request_count") + 1, last_used_at=now)
+        if claimed:
+            return True
+        # Over limit (or disabled/cooling): mark rate_limited if the limit was actually hit.
+        ChannelKey.objects.filter(
+            pk=key_id, status=ChannelKeyStatus.AVAILABLE,
+            minute_window_start__gt=window_cutoff,
+            minute_request_count__gte=F("rpm_limit"),
+            rpm_limit__gt=0,
+        ).update(status=ChannelKeyStatus.RATE_LIMITED)
         return False
-    if limit <= 0:
-        # rpm_limit <= 0 视为不限流：直接成功且不计数。
-        return True
-    now = timezone.now()
-    window_cutoff = now - timedelta(seconds=MINUTE_SECONDS)
-    ok_states = [ChannelKeyStatus.AVAILABLE, ChannelKeyStatus.RATE_LIMITED,
-                 ChannelKeyStatus.ERROR]
-    base = ChannelKey.objects.filter(pk=key_id, status__in=ok_states).filter(
-        Q(cooldown_until__isnull=True) | Q(cooldown_until__lte=now)
-    )
-    # Case 1: window stale -> reset window and claim first slot (recovers rate_limited too).
-    reset = base.filter(
-        Q(minute_window_start__isnull=True) | Q(minute_window_start__lte=window_cutoff)
-    ).update(
-        minute_window_start=now, minute_request_count=1, last_used_at=now,
-        status=ChannelKeyStatus.AVAILABLE,
-    )
-    if reset:
-        return True
-    # Case 2: window active -> claim only if under rpm_limit.
-    claimed = base.filter(
-        minute_window_start__gt=window_cutoff,
-        minute_request_count__lt=F("rpm_limit"),
-    ).update(minute_request_count=F("minute_request_count") + 1, last_used_at=now)
-    if claimed:
-        return True
-    # Over limit (or disabled/cooling): mark rate_limited if the limit was actually hit.
-    ChannelKey.objects.filter(
-        pk=key_id, status=ChannelKeyStatus.AVAILABLE,
-        minute_window_start__gt=window_cutoff,
-        minute_request_count__gte=F("rpm_limit"),
-        rpm_limit__gt=0,
-    ).update(status=ChannelKeyStatus.RATE_LIMITED)
-    return False
+    except Exception as exc:  # noqa: BLE001
+        # DB 锁等瞬时错误不应让线路构建崩溃：本槽位放弃，交由可用性判断兜底。
+        logger.warning("claim_rpm_slot %s failed (swallowed): %s", key_id, exc)
+        return False
 
 
 def report_success(key_id: int):
-    with transaction.atomic():
-        key = ChannelKey.objects.select_for_update().get(pk=key_id)
-        key.success_count += 1
-        key.cooldown_until = None
-        key.last_error = ""
-        if key.status == ChannelKeyStatus.RATE_LIMITED:
-            key.status = ChannelKeyStatus.AVAILABLE
-        key.save(update_fields=["success_count", "cooldown_until", "last_error", "status"])
+    """记录一次成功。统计写入失败（如 SQLite 锁）只记日志，绝不连带请求失败。"""
+    try:
+        with transaction.atomic():
+            ChannelKey.objects.filter(pk=key_id).update(
+                success_count=F("success_count") + 1,
+                cooldown_until=None,
+                last_error="",
+            )
+            # 限流/异常态随成功自动恢复为可用
+            ChannelKey.objects.filter(
+                pk=key_id,
+                status__in=[ChannelKeyStatus.RATE_LIMITED, ChannelKeyStatus.ERROR],
+            ).update(status=ChannelKeyStatus.AVAILABLE)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("report_success %s failed (swallowed): %s", key_id, exc)
 
 
 def report_failure(key_id: int, error_type: str, http_status: int = 0):
-    now = timezone.now()
-    cooldown_seconds = _cooldown_for(error_type, http_status, key_id)
-    new_status = None
-    if http_status in (401, 403):
-        new_status = ChannelKeyStatus.INVALID
-    elif http_status == 429:
-        new_status = ChannelKeyStatus.RATE_LIMITED
-    with transaction.atomic():
-        key = ChannelKey.objects.select_for_update().select_related("channel").get(pk=key_id)
-        breaker_off = bool(key.channel and key.channel.disable_key_invalid)
-        # 匿名线路（api_key 为空）的 401/403 是"上游必须鉴权"的确定性信号：
-        # 空 key 永远无法通过鉴权。不受 disable_key_invalid 影响，一律标 invalid，
-        # 否则会一直留在调度池里反复 401（"开了禁用无效还是没用"的根因）。
-        is_anonymous = not key.api_key
-        if breaker_off and new_status == ChannelKeyStatus.INVALID and not is_anonymous:
-            new_status = None
-        key.failure_count += 1
-        key.last_error = f"{error_type}:{http_status}" if http_status else error_type
-        fields = ["failure_count", "last_error"]
-        if new_status:
-            key.status = new_status
-            fields.append("status")
-        if cooldown_seconds:
-            key.cooldown_until = now + timedelta(seconds=cooldown_seconds)
-            fields.append("cooldown_until")
-        key.save(update_fields=fields)
-    logger.info("key %s marked failure type=%s http=%s", key_id, error_type, http_status)
+    """记录一次失败（计数/状态/冷却）。统计写入失败只记日志，绝不连带请求失败。"""
+    try:
+        now = timezone.now()
+        cooldown_seconds = _cooldown_for(error_type, http_status, key_id)
+        new_status = None
+        if http_status in (401, 403):
+            new_status = ChannelKeyStatus.INVALID
+        elif http_status == 429:
+            new_status = ChannelKeyStatus.RATE_LIMITED
+        with transaction.atomic():
+            ChannelKey.objects.filter(pk=key_id).update(
+                failure_count=F("failure_count") + 1,
+                last_error=f"{error_type}:{http_status}" if http_status else error_type,
+            )
+            key = ChannelKey.objects.select_related("channel").get(pk=key_id)
+            breaker_off = bool(key.channel and key.channel.disable_key_invalid)
+            # disable_key_invalid 打开（公共/匿名 Key 渠道）时，401/403 一律不标无效，
+            # 匿名空 Key 同样适用：公共上游的 401/403 常是间歇性的（限流伪装/公共端
+            # 波动），永久踢出会掏空号池。改为保留"限流与冷却"——cooldown_until 照常
+            # 设置、failure_count 照常累计，因此不会无限 401：冷却期间不调度、失败率
+            # 升高后排到线路末尾，冷却结束自动回归调度池。
+            if breaker_off and new_status == ChannelKeyStatus.INVALID:
+                new_status = None
+            fields: dict = {}
+            if new_status:
+                fields["status"] = new_status
+            if cooldown_seconds:
+                fields["cooldown_until"] = now + timedelta(seconds=cooldown_seconds)
+            if fields:
+                ChannelKey.objects.filter(pk=key_id).update(**fields)
+        logger.info("key %s marked failure type=%s http=%s", key_id, error_type, http_status)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("report_failure %s failed (swallowed): %s", key_id, exc)
 
 
 def _cooldown_for(error_type: str, http_status: int, key_id: int) -> int:

@@ -333,9 +333,14 @@ def _is_stripped(model_name: str) -> bool:
 
 
 def _default_effort() -> str:
-    """客户端只开启思考但未指定档位时使用的默认档位。"""
+    """客户端只开启思考但未指定档位时使用的默认档位。
+
+    默认 high：NVIDIA/DeepSeek 官方 API 的 reasoning_effort 默认值即 high，
+    且 DeepSeek/Kimi/GLM 均不接受 medium（medium 会被映射/钳制成 high）。
+    具体模型的默认档位由能力表内建（cap.default_effort）优先。
+    """
     from services import sysconfig
-    return str(sysconfig.get("default_thinking_effort") or "medium").strip().lower()
+    return str(sysconfig.get("default_thinking_effort") or "high").strip().lower()
 
 
 def to_upstream(spec: ThinkingSpec, model_name: str = "") -> dict:

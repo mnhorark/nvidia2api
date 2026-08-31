@@ -21,6 +21,11 @@ from services import sysconfig
 
 logger = logging.getLogger("nvidia2api.cleanup")
 
+# 单批删除条数。一次 DELETE 几十万行会在单个事务里长期持有 SQLite 写锁，
+# 期间所有写入（正在处理的请求日志、Key 计数等）全部阻塞。分批提交让读写
+# 交替进行，代价只是清理变慢一点。
+_BATCH_SIZE = 5000
+
 
 def effective_retention_days(channel=None, explicit: int | None = None) -> int:
     """实际生效的保留天数：显式传入优先，否则读系统参数；0 表示不清理。"""
@@ -45,8 +50,17 @@ def clean_old_logs(days: int | None = None, channel=None, dry_run: bool = False)
     if dry_run:
         return {"deleted": qs.count(), "retention_days": retention, "dry_run": True,
                 "cutoff": cutoff.isoformat()}
-    with transaction.atomic():
-        deleted, _ = qs.delete()
+    deleted = 0
+    while True:
+        # 每批只取主键再按主键删：避免大 OFFSET 分页与全条件扫描
+        ids = list(qs.values_list("pk", flat=True)[:_BATCH_SIZE])
+        if not ids:
+            break
+        with transaction.atomic():
+            removed, _ = RequestLog.objects.filter(pk__in=ids).delete()
+        deleted += removed
+        if len(ids) < _BATCH_SIZE:
+            break
     logger.info("cleaned %d request logs older than %d days", deleted, retention)
     return {"deleted": deleted, "retention_days": retention, "dry_run": False,
             "cutoff": cutoff.isoformat()}

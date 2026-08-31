@@ -14,28 +14,68 @@ from django.conf import settings
 
 from apps.core.models import SystemSetting
 
-# key -> (type, default, description)
-RUNTIME_PARAMS: dict[str, tuple[str, object, str]] = {
-    "default_upstream_rpm": ("int", lambda: settings.DEFAULT_NVIDIA_RPM, "渠道 Key 默认每分钟请求数"),
-    "max_routes_per_request": ("int", lambda: settings.MAX_ROUTES_PER_REQUEST, "单次请求最大并行线路数"),
-    "retry_count": ("int", 0, "请求失败后的自动重试次数（竞速全部失败后重试，上限 5，0=不重试）"),
-    "proxy_timeout": ("float", lambda: settings.PROXY_TIMEOUT, "代理测速超时（秒）"),
-    "upstream_connect_timeout": ("float", lambda: settings.UPSTREAM_CONNECT_TIMEOUT, "上游连接超时（秒）"),
-    "upstream_read_timeout": ("float", lambda: settings.UPSTREAM_READ_TIMEOUT, "上游读超时（秒）"),
-    "max_concurrent_requests": ("int", lambda: settings.MAX_CONCURRENT_REQUESTS, "平台最大并发请求数（需重启生效）"),
-    "proxy_failure_cooldown_seconds": ("int", 60, "代理连续失败后的冷却时间（秒）"),
-    "proxy_unhealthy_threshold": ("int", 3, "代理连续失败多少次后标记为 unhealthy"),
-    "key_cooldown_seconds": ("int", 60, "渠道 Key 失败后冷却时间（秒）"),
-    "channel_cooldown_failures": ("int", 5, "渠道连续系统级失败多少次后自动熔断"),
-    "channel_cooldown_seconds": ("int", 120, "渠道熔断冷却时间（秒）"),
-    "log_retention_days": ("int", 30, "请求日志保留天数（0 = 永不清理，超过此期限的日志会被 cleanlogs 清理）"),
-    "thinking_passthrough": ("bool", True, "透传客户端的思考强度参数（reasoning_effort / chat_template_kwargs 等）"),
-    "thinking_strip_models": ("str", "", "不支持思考参数的模型名子串，英文逗号分隔；命中时剥离思考参数"),
-    "default_thinking_effort": ("str", "max", "客户端只开启思考但未指定档位时，自动映射的思考强度（off/low/medium/high/max）"),
+# key -> (type, default, description, group)
+# 分组用于后台设置页分区展示，避免平铺一团：
+#   request=请求与重试  timeout=超时控制  stream=流式保活与掐线
+#   health=健康检查与冷却  thinking=思考参数  logs=日志
+RUNTIME_PARAMS: dict[str, tuple[str, object, str, str]] = {
+    "default_upstream_rpm": ("int", lambda: settings.DEFAULT_NVIDIA_RPM,
+                             "渠道 Key 默认每分钟请求数（RPM）", "request"),
+    "max_routes_per_request": ("int", lambda: settings.MAX_ROUTES_PER_REQUEST,
+                               "单次请求最大并行线路数（1 直连 + N 代理，受可用 Key 数约束）", "request"),
+    "retry_count": ("int", 1,
+                    "竞速全部线路失败后的自动重试次数（上限 5，0=不重试）。"
+                    "竞速架构下全线路失败已属小概率，默认 1 次重试换取一次换线机会，成本极低", "request"),
+    "proxy_timeout": ("float", lambda: settings.PROXY_TIMEOUT,
+                      "代理测速超时（秒）", "health"),
+    "upstream_connect_timeout": ("float", lambda: settings.UPSTREAM_CONNECT_TIMEOUT,
+                                 "上游连接超时（秒），覆盖连接阶段（DNS/建连/代理握手）", "timeout"),
+    "upstream_read_timeout": ("float", lambda: settings.UPSTREAM_READ_TIMEOUT,
+                              "非流式请求的上游读超时（秒），也是该线路请求的总读预算", "timeout"),
+    "stream_first_byte_timeout": ("float", 60,
+                                  "流式竞速：连接成功后等待首个有效 SSE 块的最长超时（秒）。"
+                                  "超时视为该线路死线（可换线重试）；0=不限制", "timeout"),
+    "stream_heartbeat_interval": ("float", 15,
+                                  "流式请求：上游静默超过该时长时向客户端发送 SSE 心跳（: keep-alive），"
+                                  "防止 NAT/负载均衡/客户端把连接误判为死；0=关闭", "stream"),
+    "stream_stall_timeout": ("float", 300,
+                             "流式请求：竞速胜出后上游连续无任何数据的最长时长（秒）。"
+                             "思考模型会持续吐 reasoning token，正常思考不会被误掐；"
+                             "超过则判定线路死亡：未交付正文可重建线路重试，已交付正文则干净收尾 [DONE]；"
+                             "0=不掐断（只发心跳）", "stream"),
+    "stream_max_duration": ("float", 0,
+                            "流式请求总时长上限（秒），兜底防僵尸流；0=不限制", "stream"),
+    "proxy_failure_cooldown_seconds": ("int", 60,
+                                       "代理连续失败后的冷却时间（秒）", "health"),
+    "proxy_unhealthy_threshold": ("int", 3,
+                                  "代理连续失败多少次后标记为 unhealthy", "health"),
+    "key_cooldown_seconds": ("int", 60,
+                             "渠道 Key 失败后冷却时间（秒）", "health"),
+    "channel_cooldown_failures": ("int", 5,
+                                  "渠道连续系统级失败多少次后自动熔断", "health"),
+    "channel_cooldown_seconds": ("int", 120,
+                                 "渠道熔断冷却时间（秒）", "health"),
+    "log_retention_days": ("int", 30,
+                           "请求日志保留天数（0 = 永不清理，超过此期限的日志会被 cleanlogs 清理）", "logs"),
+    "thinking_passthrough": ("bool", True,
+                             "透传客户端的思考强度参数（reasoning_effort / chat_template_kwargs 等）", "thinking"),
+    "thinking_strip_models": ("str", "",
+                              "不支持思考参数的模型名子串，英文逗号分隔；命中时剥离思考参数", "thinking"),
+    "default_thinking_effort": ("str", "high",
+                                "客户端只开启思考但未指定档位时，自动映射的思考强度"
+                                "（off/low/medium/high/max）。默认 high 与 NVIDIA/DeepSeek 官方默认一致；"
+                                "Kimi-K3/DeepSeek-R1 等模型由能力表内建默认（max）优先，无需在此配置", "thinking"),
 }
 
 # 兼容旧库里已经写入的 key
-LEGACY_KEY_ALIASES = {"default_nvidia_rpm": "default_upstream_rpm"}
+# first_content_timeout(旧) -> stream_first_byte_timeout(新)：旧语义是"流式等待首个正文超时"，
+# 新版拆分为 首字节超时(竞速阶段) + 心跳/停滞超时(胜出后阶段)，旧配置自动映射到首字节超时。
+# 已下线的 key（max_concurrent_requests 运行时版 / stream_read_timeout）在旧库里可能残留
+# SystemSetting 行，它们已不再被注册表引用，get()/all_params() 会自动忽略，无需手工清理。
+LEGACY_KEY_ALIASES = {
+    "default_nvidia_rpm": "default_upstream_rpm",
+    "first_content_timeout": "stream_first_byte_timeout",
+}
 
 
 def _normalize_key(key: str) -> str:
@@ -69,7 +109,7 @@ def _resolve_channel(channel):
 def get(key: str, channel=None):
     """Current effective value for a runtime param."""
     key = _normalize_key(key)
-    type_name, default, _desc = RUNTIME_PARAMS[key]
+    type_name, default, _desc, _group = RUNTIME_PARAMS[key]
     ch = _resolve_channel(channel)
     rec = SystemSetting.objects.filter(channel=ch, key=key).first()
     if rec is None or rec.value == "":
@@ -93,6 +133,7 @@ def all_params(channel=None) -> list[dict]:
             "value": value,
             "default": meta[1]() if callable(meta[1]) else meta[1],
             "description": meta[2],
+            "group": meta[3],
             # 空串表示「回落默认值」，前端据此显示未覆盖状态
             "overridden": bool(raw not in (None, "")),
         })

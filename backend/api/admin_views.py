@@ -15,8 +15,8 @@ from apps.core.models import (
     RequestLog, SystemSetting, UserApiKey,
 )
 from services import (
-    api_key_service, channel_service, key_service, proxy_service, thinking,
-    upstream_service,
+    api_key_service, channel_service, key_service, model_registry, proxy_service,
+    thinking, upstream_service,
 )
 from services.proxy_checker import check_all, check_proxy
 
@@ -34,6 +34,10 @@ def current_channel(request) -> Channel:
 
 def _parse_int(value):
     """宽松转 int；非法值返回 None（由调用方决定返回 400）。"""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
     try:
         return int(str(value).strip())
     except (TypeError, ValueError):
@@ -45,22 +49,108 @@ def _bad_param(name: str) -> Response:
                                "code": "bad_request"}}, status=400)
 
 
-# 登录接口内存限流：每 IP 每分钟最多 10 次失败
+def _bad_bool(name: str) -> Response:
+    return Response({"error": {"message": f"参数 {name} 必须是布尔值",
+                               "code": "bad_request"}}, status=400)
+
+
+_TRUE_LITERALS = {"1", "true", "yes", "on"}
+_FALSE_LITERALS = {"0", "false", "no", "off", ""}
+
+
+def _parse_bool(value):
+    """显式解析布尔值；无法识别返回 None。
+
+    不能用 `bool(value)`：Python 里 `bool("false")` 是 True，前端传字符串
+    "false" 意为关闭，却会被静默当成开启。
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in _TRUE_LITERALS:
+        return True
+    if text in _FALSE_LITERALS:
+        return False
+    return None
+
+
+def _require_bool(data: dict, name: str):
+    """从请求数据取布尔字段；非法返回 (None, error_response)。"""
+    if name not in data:
+        return None, None
+    parsed = _parse_bool(data[name])
+    if parsed is None:
+        return None, _bad_bool(name)
+    return parsed, None
+
+
+def _apply_bool(data: dict, name: str, obj, field: str | None = None):
+    """把请求里的布尔字段写到对象上；非法返回 error_response，成功返回 None。"""
+    parsed, err = _require_bool(data, name)
+    if err is not None:
+        return err
+    if parsed is not None:
+        setattr(obj, field or name, parsed)
+    return None
+
+
+def _require_int(data: dict, name: str, *, minimum: int | None = None,
+                 maximum: int | None = None):
+    """从请求数据取整数字段；非法/越界返回 (None, error_response)。"""
+    if name not in data:
+        return None, None
+    parsed = _parse_int(data[name])
+    if parsed is None:
+        return None, _bad_param(name)
+    if minimum is not None and parsed < minimum:
+        return None, Response({"error": {"message": f"参数 {name} 不能小于 {minimum}",
+                                         "code": "bad_request"}}, status=400)
+    if maximum is not None and parsed > maximum:
+        return None, Response({"error": {"message": f"参数 {name} 不能大于 {maximum}",
+                                         "code": "bad_request"}}, status=400)
+    return parsed, None
+
+
+# 登录接口内存限流：每来源每分钟最多 10 次失败
 _LOGIN_FAIL_LIMIT = 10
 _LOGIN_FAIL_WINDOW = 60.0
+# 清理节流：桶数量超过该值时才做一次全量清扫，避免每次失败都 O(n) 遍历
+_LOGIN_FAIL_SWEEP_THRESHOLD = 256
 _login_fail_lock = threading.Lock()
 _login_fail_bucket: dict[str, list[float]] = {}
 
 
-def _login_fail_exceeded(ip: str) -> bool:
+def _login_client_key(request) -> str:
+    """限流维度：反代后 REMOTE_ADDR 全是网关地址，全员共桶会被他人拖累锁定。
+
+    取 X-Forwarded-For 首跳参与分桶，使反代后的不同真实客户端各自计数。
+    该值可被伪造，因此只作为"防误伤"的可用性措施，不作为防爆破的唯一手段
+    ——真正的防线是强口令（生产环境已由 settings 门禁强制非默认凭据）。
+    """
+    remote = request.META.get("REMOTE_ADDR", "") or "unknown"
+    xff = request.META.get("HTTP_X_FORWARDED_FOR", "") or ""
+    hop = xff.split(",")[0].strip() if xff else ""
+    return f"{remote}|{hop}" if hop else remote
+
+
+def _login_fail_exceeded(key: str) -> bool:
     now = time.monotonic()
     with _login_fail_lock:
-        bucket = [t for t in _login_fail_bucket.get(ip, []) if now - t < _LOGIN_FAIL_WINDOW]
+        bucket = [t for t in _login_fail_bucket.get(key, []) if now - t < _LOGIN_FAIL_WINDOW]
         if len(bucket) >= _LOGIN_FAIL_LIMIT:
-            _login_fail_bucket[ip] = bucket
+            _login_fail_bucket[key] = bucket
             return True
         bucket.append(now)
-        _login_fail_bucket[ip] = bucket
+        _login_fail_bucket[key] = bucket
+        # 过期桶不清会慢性膨胀：源 IP 多变时（尤其带 XFF 分桶后）增长更快
+        if len(_login_fail_bucket) > _LOGIN_FAIL_SWEEP_THRESHOLD:
+            for k in [k for k, v in _login_fail_bucket.items()
+                      if not v or now - v[-1] >= _LOGIN_FAIL_WINDOW]:
+                _login_fail_bucket.pop(k, None)
         return False
 
 
@@ -72,10 +162,13 @@ class LoginView(APIView):
         u = request.data.get("username", "")
         p = request.data.get("password", "")
         from django.conf import settings
-        if u == settings.ADMIN_USERNAME and p == settings.ADMIN_PASSWORD:
+        import hmac
+        # 常量时间比较：普通 `==` 在首字符不同即返回，可被计时侧信道逐字节猜口令
+        ok_user = hmac.compare_digest(str(u), str(settings.ADMIN_USERNAME))
+        ok_pass = hmac.compare_digest(str(p), str(settings.ADMIN_PASSWORD))
+        if ok_user and ok_pass:
             return Response({"token": settings.ADMIN_TOKEN})
-        ip = request.META.get("REMOTE_ADDR", "")
-        if _login_fail_exceeded(ip):
+        if _login_fail_exceeded(_login_client_key(request)):
             return Response({"detail": "Too many failed attempts, try again later"},
                             status=429)
         return Response({"detail": "Invalid credentials"}, status=401)
@@ -135,6 +228,9 @@ class ChannelListView(AdminRequiredMixin, APIView):
         if not name:
             return Response({"error": {"message": "name required", "code": "bad_request"}},
                             status=400)
+        rpm, err = _require_int(request.data, "default_rpm", minimum=0)
+        if err:
+            return err
         slug = (request.data.get("slug") or "").strip() or _slugify(name)
         if Channel.objects.filter(slug=slug).exists():
             return Response({"error": {"message": f"渠道标识 {slug} 已存在",
@@ -143,19 +239,39 @@ class ChannelListView(AdminRequiredMixin, APIView):
         if not base_url:
             return Response({"error": {"message": "base_url required", "code": "bad_request"}},
                             status=400)
-        make_default = bool(request.data.get("is_default")) or not Channel.objects.exists()
+        # 严格解析：与下面 enabled / allow_dup 等保持一致，非法布尔值返回 400，
+        # 而不是被 `or` 静默吞成 False（传 "maybe" 应报错，不该悄悄关掉开关）。
+        make_default, err = _require_bool(request.data, "is_default")
+        if err:
+            return err
+        # 首个渠道自动成为默认渠道
+        make_default = bool(make_default) or not Channel.objects.exists()
+        enabled = _parse_bool(request.data.get("enabled", True))
+        if enabled is None:
+            return _bad_bool("enabled")
+        allow_dup = _parse_bool(request.data.get("allow_duplicate_keys", False))
+        if allow_dup is None:
+            return _bad_bool("allow_duplicate_keys")
+        disable_key_invalid = _parse_bool(request.data.get("disable_key_invalid", False))
+        if disable_key_invalid is None:
+            return _bad_bool("disable_key_invalid")
+        disable_proxy_unhealthy = _parse_bool(
+            request.data.get("disable_proxy_unhealthy", False))
+        if disable_proxy_unhealthy is None:
+            return _bad_bool("disable_proxy_unhealthy")
         channel = Channel(
             name=name, slug=slug, base_url=base_url,
             chat_path=(request.data.get("chat_path") or "/chat/completions").strip(),
             models_path=(request.data.get("models_path") or "/models").strip(),
             key_prefix=(request.data.get("key_prefix") or "").strip(),
             auth_scheme=request.data.get("auth_scheme") or "bearer",
-            default_rpm=int(request.data.get("default_rpm") or 40),
-            enabled=bool(request.data.get("enabled", True)),
+            default_rpm=40 if rpm is None else rpm,
+            enabled=enabled,
             is_default=make_default,
             notes=request.data.get("notes") or "",
-            allow_duplicate_keys=bool(request.data.get("allow_duplicate_keys", False)),
-            disable_key_invalid=bool(request.data.get("disable_key_invalid", False)),
+            allow_duplicate_keys=allow_dup,
+            disable_key_invalid=disable_key_invalid,
+            disable_proxy_unhealthy=disable_proxy_unhealthy,
         )
         channel.save()
         return Response(ChannelSerializer(channel).data, status=201)
@@ -177,17 +293,29 @@ class ChannelDetailView(AdminRequiredMixin, APIView):
             if f in request.data:
                 setattr(channel, f, (request.data[f] or "").strip()
                         if isinstance(request.data[f], str) else request.data[f])
-        if "allow_duplicate_keys" in request.data:
-            channel.allow_duplicate_keys = bool(request.data["allow_duplicate_keys"])
-        if "disable_key_invalid" in request.data:
-            channel.disable_key_invalid = bool(request.data["disable_key_invalid"])
+        for flag in ("allow_duplicate_keys", "disable_key_invalid",
+                     "disable_proxy_unhealthy"):
+            err = _apply_bool(request.data, flag, channel)
+            if err is not None:
+                return err
+        if "disable_proxy_unhealthy" in request.data and channel.disable_proxy_unhealthy:
+            # 立即恢复存量"异常/冷却"代理，让开关即刻生效并持久化：
+            # 不因历史失败把代理继续排除在竞速池外。仅在显式提交该字段时执行，
+            # 避免改个渠道名就顺手清掉全部代理冷却。
+            channel.proxies.filter(status=ProxyStatus.UNHEALTHY).update(
+                status=ProxyStatus.DEGRADED, cooldown_until=None)
+            channel.proxies.exclude(cooldown_until=None).update(cooldown_until=None)
         if "default_rpm" in request.data:
-            channel.default_rpm = int(request.data["default_rpm"])
+            rpm, err = _require_int(request.data, "default_rpm", minimum=0)
+            if err:
+                return err
+            channel.default_rpm = rpm
             # 勾选"应用到现有 Key"时，把该渠道所有 Key 的独立 RPM 一并覆盖
             if request.data.get("apply_rpm_to_keys"):
                 channel.keys.update(rpm_limit=channel.default_rpm)
-        if "enabled" in request.data:
-            channel.enabled = bool(request.data["enabled"])
+        err = _apply_bool(request.data, "enabled", channel)
+        if err is not None:
+            return err
         if request.data.get("is_default"):
             channel.is_default = True
         elif "is_default" in request.data and not request.data["is_default"]:
@@ -385,6 +513,8 @@ class ProxyListView(AdminRequiredMixin, APIView):
             "results": ProxySerializer(qs, many=True).data,
             "summary": {
                 "channel": channel.slug,
+                "channel_id": channel.id,
+                "disable_proxy_unhealthy": channel.disable_proxy_unhealthy,
                 "nvidia_keys": n_keys,
                 "max_enabled_proxies": max_allowed,
                 "enabled_proxies": enabled,
@@ -427,8 +557,11 @@ class ProxyDetailView(AdminRequiredMixin, APIView):
         p = self._get(pk)
         if not p:
             return Response({"detail": "not found"}, status=404)
-        if "enabled" in request.data:
-            ok, msg = proxy_service.set_enabled(p, bool(request.data["enabled"]))
+        enabled, err = _require_bool(request.data, "enabled")
+        if err is not None:
+            return err
+        if enabled is not None:
+            ok, msg = proxy_service.set_enabled(p, enabled)
             if not ok:
                 return Response(
                     {"error": {"message": msg, "code": "proxy_limit_exceeded"}}, status=400
@@ -446,7 +579,12 @@ class ProxyDetailView(AdminRequiredMixin, APIView):
                     return Response({"error": {"message": "分组不属于该代理所在渠道",
                                                "code": "bad_request"}}, status=400)
                 p.group = g
-        for f in ("name", "protocol", "host", "port", "username", "password"):
+        if "port" in request.data:
+            port, err = _require_int(request.data, "port", minimum=1, maximum=65535)
+            if err:
+                return err
+            p.port = port
+        for f in ("name", "protocol", "host", "username", "password"):
             if f in request.data:
                 setattr(p, f, request.data[f])
         p.save()
@@ -496,6 +634,9 @@ class ModelListView(AdminRequiredMixin, APIView):
         if not name:
             return Response({"error": {"message": "model_name required",
                                        "code": "bad_request"}}, status=400)
+        enabled = _parse_bool(request.data.get("enabled", False))
+        if enabled is None:
+            return _bad_bool("enabled")
         defaults = {
             "display_name": request.data.get("display_name", ""),
             "alias": (request.data.get("alias") or "").strip(),
@@ -503,7 +644,7 @@ class ModelListView(AdminRequiredMixin, APIView):
             "description": request.data.get("description", ""),
             "provider": request.data.get("provider") or channel.slug,
             "endpoint": (request.data.get("endpoint") or "").strip(),
-            "enabled": request.data.get("enabled", False),
+            "enabled": enabled,
         }
         rec, created = channel.models.get_or_create(model_name=name, defaults=defaults)
         if not created:
@@ -564,8 +705,15 @@ class ModelDetailView(AdminRequiredMixin, APIView):
             return Response({"detail": "not found"}, status=404)
         if "aliases" in request.data:
             rec.aliases = _normalize_aliases(request.data["aliases"])
-        for f in ("display_name", "alias", "route_priority", "description",
-                  "enabled", "status", "endpoint"):
+        if "route_priority" in request.data:
+            priority, err = _require_int(request.data, "route_priority")
+            if err:
+                return err
+            rec.route_priority = priority
+        err = _apply_bool(request.data, "enabled", rec)
+        if err is not None:
+            return err
+        for f in ("display_name", "alias", "description", "status", "endpoint"):
             if f in request.data:
                 if f == "endpoint":
                     rec.endpoint = (request.data[f] or "").strip()
@@ -634,6 +782,9 @@ class ModelBatchView(AdminRequiredMixin, APIView):
             qs.delete()
         else:
             qs.update(enabled=(action == "enable"))
+        # queryset.update() 不触发 post_save 信号，注册表缓存需显式失效，
+        # 否则批量启停后 /v1/models 与解析结果会短暂停留在旧状态。
+        model_registry.invalidate()
         return Response({"matched": matched, "action": action})
 
 
@@ -768,17 +919,18 @@ class UserApiKeyDetailView(AdminRequiredMixin, APIView):
         rec = self._get(pk)
         if not rec:
             return Response({"detail": "not found"}, status=404)
-        if "enabled" in request.data:
-            rec.enabled = bool(request.data["enabled"])
+        err = _apply_bool(request.data, "enabled", rec)
+        if err is not None:
+            return err
         if "rate_limit" in request.data:
-            rl = _parse_int(request.data["rate_limit"])
-            if rl is None:
-                return _bad_param("rate_limit")
+            rl, err = _require_int(request.data, "rate_limit", minimum=0)
+            if err:
+                return err
             rec.rate_limit = rl
         if "quota" in request.data:
-            q = _parse_int(request.data["quota"])
-            if q is None or q < 0:
-                return _bad_param("quota")
+            q, err = _require_int(request.data, "quota", minimum=0)
+            if err:
+                return err
             rec.quota = q
         if "name" in request.data:
             rec.name = request.data["name"]
@@ -930,11 +1082,15 @@ class DashboardUsageView(AdminRequiredMixin, APIView):
                 buckets[key] = {**_bucket(), "date": key}
                 cur += timedelta(days=1)
 
+        # .iterator() 流式取：默认一次遍历会把整个区间的结果集缓存进内存，
+        # 30 天 × 大流量下是几十 MB 级的一次性占用；分块取只保留当前块。
+        # （真要做成 DB 侧 GROUP BY 需要按 SQLite 的 strftime 分桶，改动面大，
+        #  当前行数级别下按行聚合仍是最简单可靠的选择。）
         logs = RequestLog.objects.filter(created_at__gte=start).values(
             "created_at", "model", "prompt_tokens", "completion_tokens",
             "cached_tokens", "total_tokens", "status", "duration_ms",
             "first_token_ms", "channel__name", "user_api_key__name",
-        )
+        ).iterator(chunk_size=2000)
 
         totals = {"requests": 0, "success": 0, "total_tokens": 0,
                   "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
@@ -1191,10 +1347,20 @@ class AdminChatView(AdminRequiredMixin, APIView):
 
     def _stream(self, body, model, channel, proxy_group=None,
                 endpoint=None, client_thinking=None, upstream_thinking=None):
-        """SSE: race streaming connections, first valid chunk wins, rest cancelled.
+        """SSE（异步生成器）: 竞速胜出后逐块转发上游 SSE，实现真正 token-by-token 流式。
 
-        Emits a leading `data: {"meta": {...}}` event describing the winning route,
-        then relays upstream chunks verbatim, terminated by data: [DONE].
+        必须是 async 生成器：Django 对**同步**流式内容会用
+        `sync_to_async(list(...))` 一次性消费完整个生成器才下发，导致"假流式"——
+        思考 token 与正文全部攒到请求结束才一次性吐出。async 生成器则被 ASGI
+        逐块下发，思考（reasoning_content）与正文 token 边到边实时转发。
+
+        心跳与掐线（参考 new-api / sub-api / cliproxy 思路）：
+        - stream_heartbeat_interval：上游静默时向客户端发 `: keep-alive` 心跳，
+          防 NAT/负载均衡/客户端把连接误判为死，链路保活；
+        - stream_stall_timeout：上游连续无数据超过该时长才判定线路死亡——
+          思考模型会持续吐 reasoning token，正常"正在思考"不会被掐断；
+        - 已向客户端交付正文后断流：绝不发 error 事件（否则客户端 SSE 解析报
+          "error decoding response body"），干净收尾 [DONE]。
         """
         import asyncio
         import json
@@ -1202,8 +1368,11 @@ class AdminChatView(AdminRequiredMixin, APIView):
         from django.http import StreamingHttpResponse
 
         from services import key_service as ks
+        from services import sysconfig
         from services.load_balancer import build_routes
         from services.race_engine import AllRoutesFailed, NoRouteAvailable, race_stream
+
+        from .openai_views import _chunk_has_content, _drain
 
         routes = build_routes(channel, proxy_group=proxy_group, endpoint=endpoint)
         request_id = ks.new_request_id()
@@ -1212,7 +1381,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
             routes_count=len(routes), is_stream=True,
             client_thinking=client_thinking or {}, upstream_thinking=upstream_thinking or {},
         )
-        # Ask upstream for usage in the last SSE chunk so we can record tokens.
+        # 请求流式 usage：部分上游默认流式不返回 usage，需 include_usage 才在收尾 chunk 给出
         body = dict(body)
         body.setdefault("stream_options", {}).update({"include_usage": True})
         if not routes:
@@ -1221,17 +1390,20 @@ class AdminChatView(AdminRequiredMixin, APIView):
             return Response({"error": {"message": "当前没有可用线路",
                                        "code": "no_available_route"}}, status=503)
 
-        def gen():
-            import time
-            t0 = time.monotonic()
-            loop = asyncio.new_event_loop()
-            winner = None
-            try:
-                winner = loop.run_until_complete(race_stream(routes, body))
+        import time as _time
+        started = _time.monotonic()
+        stall_timeout = float(sysconfig.get("stream_stall_timeout", channel) or 0)
+        heartbeat = float(sysconfig.get("stream_heartbeat_interval", channel) or 0)
+        max_duration = float(sysconfig.get("stream_max_duration", channel) or 0)
 
-                duration = round((time.monotonic() - t0) * 1000, 1)
+        async def gen():
+            winner = None
+            sent_content = False
+            try:
+                winner = await race_stream(routes, body)
+
+                duration = round((_time.monotonic() - started) * 1000, 1)
                 log.status, log.http_status = "success", 200
-                log.duration_ms = duration
                 log.winner_route_type = winner.route.kind
                 log.winner_key_name = winner.route.key.name
                 log.winner_proxy_name = winner.route.proxy.name if winner.route.proxy else ""
@@ -1251,39 +1423,70 @@ class AdminChatView(AdminRequiredMixin, APIView):
                     }
                 }) + "\n\n"
 
-                stream = winner.lines()
                 usage: dict = {}
-                while True:
-                    chunk = loop.run_until_complete(_next_line(stream))
-                    if chunk is None:
-                        break
-                    try:
-                        payload = json.loads(chunk[5:].strip()) if chunk.startswith("data:") else {}
-                        if isinstance(payload, dict) and payload.get("usage"):
-                            usage = payload["usage"]
-                    except Exception:  # noqa: BLE001
-                        pass
-                    yield chunk
-
-                total_ms = round((time.monotonic() - t0) * 1000, 1)
-                log.duration_ms = total_ms
-                log.first_token_ms = duration
-                log.prompt_tokens = usage.get("prompt_tokens", 0) or 0
-                log.completion_tokens = usage.get("completion_tokens", 0) or 0
-                log.total_tokens = usage.get("total_tokens", 0) or 0
-                details = (usage.get("prompt_tokens_details") or {})
-                log.cached_tokens = details.get("cached_tokens", 0) or 0
-                log.save()
-                yield "data: " + json.dumps({
-                    "summary": {
-                        "duration_ms": total_ms,
-                        "first_token_ms": duration,
-                        "prompt_tokens": log.prompt_tokens,
-                        "completion_tokens": log.completion_tokens,
-                        "total_tokens": log.total_tokens,
-                        "cached_tokens": log.cached_tokens,
-                    }
-                }) + "\n\n"
+                completion_text: list[str] = []
+                stream_ok = False
+                done_sent = False
+                try:
+                    async for chunk in _drain(winner, stall_timeout, heartbeat,
+                                              max_duration):
+                        # 首字 = 首个正文（content/tool_calls）到达时间，非首个思考 chunk
+                        if _chunk_has_content(chunk):
+                            if not sent_content:
+                                log.first_token_ms = round(
+                                    (_time.monotonic() - started) * 1000, 1)
+                            sent_content = True
+                        if chunk.strip() == "data: [DONE]":
+                            done_sent = True
+                        try:
+                            if chunk.startswith("data:"):
+                                payload = json.loads(chunk[5:].strip())
+                                if isinstance(payload, dict):
+                                    if payload.get("usage"):
+                                        usage = payload["usage"]
+                                    # 累积正文，供上游未返回流式 usage 时本地估算 token
+                                    choices = payload.get("choices")
+                                    if choices:
+                                        delta = choices[0].get("delta") or {}
+                                        for key in ("content", "reasoning_content", "reasoning"):
+                                            v = delta.get(key)
+                                            if isinstance(v, str) and v:
+                                                completion_text.append(v)
+                                                break
+                        except Exception:  # noqa: BLE001
+                            pass
+                        yield chunk
+                    stream_ok = True
+                finally:
+                    total_ms = round((_time.monotonic() - started) * 1000, 1)
+                    log.duration_ms = total_ms
+                    log.prompt_tokens = usage.get("prompt_tokens", 0) or 0
+                    log.completion_tokens = usage.get("completion_tokens", 0) or 0
+                    if not log.prompt_tokens:
+                        from services import tokenizer
+                        log.prompt_tokens = tokenizer.estimate_messages_tokens(
+                            body.get("messages"))
+                    if not log.completion_tokens:
+                        from services import tokenizer
+                        log.completion_tokens = tokenizer.estimate_tokens(
+                            "".join(completion_text))
+                    log.total_tokens = (log.prompt_tokens or 0) + (log.completion_tokens or 0)
+                    details = usage.get("prompt_tokens_details") or {}
+                    log.cached_tokens = details.get("cached_tokens", 0) or 0
+                    log.save()
+                    # 仅正常走完整个流（未被超时/异常/客户端断开打断）才补 summary + [DONE]
+                    if stream_ok:
+                        yield "data: " + json.dumps({
+                            "summary": {
+                                "duration_ms": total_ms,
+                                "first_token_ms": log.first_token_ms or duration,
+                                "prompt_tokens": log.prompt_tokens,
+                                "completion_tokens": log.completion_tokens,
+                                "total_tokens": log.total_tokens,
+                                "cached_tokens": log.cached_tokens,
+                            }
+                        }) + "\n\n"
+                        yield "data: [DONE]\n\n"
             except (NoRouteAvailable, AllRoutesFailed) as exc:
                 log.status, log.http_status, log.error_type = "failed", 502, "all_routes_failed"
                 if isinstance(exc, AllRoutesFailed):
@@ -1294,27 +1497,37 @@ class AdminChatView(AdminRequiredMixin, APIView):
                               "param": None, "code": "upstream_error"}
                 }) + "\n\n"
                 yield "data: [DONE]\n\n"
-            except Exception as exc:  # noqa: BLE001
-                log.status, log.error_type = "failed", "stream_error"
+            except Exception as exc:  # noqa: BLE001  含 TimeoutError
+                # 已向客户端交付过正文：响应已提交。上游断流时绝不发 error 事件
+                # （会破坏客户端 SSE 解析），干净收尾 [DONE]。
+                if sent_content or done_sent:
+                    log.duration_ms = round((_time.monotonic() - started) * 1000, 1)
+                    log.save()
+                    if not done_sent:
+                        yield "data: [DONE]\n\n"
+                    return
+                # 未交付任何内容：按线路失败上报错误（可让客户端看到原因）
+                is_stall = isinstance(exc, TimeoutError)
+                log.status, log.http_status = "failed", 504 if is_stall else 502
+                log.error_type = "stream_idle_timeout" if is_stall else "stream_error"
+                log.duration_ms = round((_time.monotonic() - started) * 1000, 1)
                 log.save()
+                if is_stall:
+                    msg = (f"上游数据停滞（{round(stall_timeout or 0)} 秒未收到任何数据），"
+                           "已中断。可尝试调大 stream_stall_timeout")
+                else:
+                    msg = f"stream error: {exc}"
                 yield "data: " + json.dumps({
-                    "error": {"message": f"stream error: {exc}", "type": "api_error",
+                    "error": {"message": msg, "type": "api_error",
                               "param": None, "code": "stream_error"}
                 }) + "\n\n"
                 yield "data: [DONE]\n\n"
             finally:
-                try:
-                    if winner is not None:
-                        loop.run_until_complete(winner.close())
-                except Exception:  # noqa: BLE001
-                    pass
-                loop.close()
-
-        async def _next_line(ait):
-            try:
-                return await ait.__anext__()
-            except StopAsyncIteration:
-                return None
+                if winner is not None:
+                    try:
+                        await winner.close()
+                    except Exception:  # noqa: BLE001
+                        pass
 
         response = StreamingHttpResponse(gen(), content_type="text/event-stream")
         response["Cache-Control"] = "no-cache"

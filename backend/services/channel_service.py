@@ -64,19 +64,33 @@ def default_channel() -> Channel:
     return first
 
 
+def lookup(slug: str | None) -> Channel | None:
+    """按 slug 或主键查找渠道；找不到返回 None（不做任何回落）。"""
+    if not slug:
+        return None
+    key = str(slug).strip()
+    if not key:
+        return None
+    channel = None
+    if key.isdigit():
+        channel = Channel.objects.filter(pk=int(key)).first()
+    if channel is None:
+        channel = Channel.objects.filter(slug__iexact=key).first()
+    return channel
+
+
 def resolve(slug: str | None = None) -> Channel:
-    """按 slug 或主键解析渠道；解析不到回落到默认渠道。"""
-    if slug:
-        key = str(slug).strip()
-        if key:
-            channel = None
-            if key.isdigit():
-                channel = Channel.objects.filter(pk=int(key)).first()
-            if channel is None:
-                channel = Channel.objects.filter(slug__iexact=key).first()
-            if channel is not None:
-                return channel
-            logger.warning("unknown channel %r, falling back to default", key)
+    """按 slug 或主键解析渠道；解析不到回落到默认渠道。
+
+    注意：本函数用于「没有明确指定渠道」的通用场景（管理端作用域等）。
+    客户端显式通过 `/c/<slug>/` 指定渠道时**必须**用 `lookup` —— 那里静默
+    回落到默认渠道会把同名模型的请求路由到错误的上游，造成串渠道与错计费。
+    """
+    channel = lookup(slug)
+    if channel is not None:
+        return channel
+    if slug and str(slug).strip():
+        logger.warning("unknown channel %r, falling back to default", slug)
     return default_channel()
 
 

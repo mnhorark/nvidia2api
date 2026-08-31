@@ -28,20 +28,37 @@ def enabled_proxy_count(channel: Channel) -> int:
 
 
 def parse_proxy_url(url: str) -> dict | None:
-    """Parse socks5://user:pass@host:port etc."""
-    url = url.strip()
+    """Parse socks5://user:pass@host:port etc.
+
+    任何解析/取值异常都归一为「返回 None = 无效格式」——端口非数字或超出
+    1..65535 时 `urlparse` 的 `.port` 会抛 ValueError，过去会让整个批量导入
+    以 500 中断（且已导入的行不回滚）。
+    """
+    url = (url or "").strip()
+    if not url:
+        return None
     if "://" not in url:
         url = "socks5://" + url
-    p = urlparse(url)
-    proto = p.scheme.lower()
-    if proto not in SUPPORTED_PROTOCOLS:
+    try:
+        p = urlparse(url)
+        proto = p.scheme.lower()
+        if proto not in SUPPORTED_PROTOCOLS:
+            return None
+        if not p.hostname:
+            return None
+        port = p.port
+        if not port or not (0 < port < 65536):
+            return None
+    except ValueError:
+        # port 非数字 / 超范围：urlparse 在取值时抛出
         return None
-    if not p.hostname or not p.port:
+    except Exception:  # noqa: BLE001
+        # 其它畸形输入（非法 IPv6 字面量等）同样按无效格式处理
         return None
     return {
         "protocol": proto,
         "host": p.hostname,
-        "port": p.port,
+        "port": port,
         "username": (p.username or ""),
         "password": (p.password or ""),
     }
@@ -52,6 +69,18 @@ def bulk_import_proxies(text: str, channel: Channel) -> dict:
     result = {"success": 0, "duplicate": 0, "invalid": 0, "failed": 0, "errors": []}
     auto_idx = channel.proxies.count() + 1
     seen: set[tuple] = set()
+    # 整批导入放在一个事务里：任何一行写库异常都不会留下"导入了一半"的脏数据。
+    try:
+        with transaction.atomic():
+            return _bulk_import_proxies_locked(
+                lines, channel, result, seen, auto_idx)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("bulk import proxies aborted, rolled back")
+        return {"success": 0, "duplicate": 0, "invalid": result["invalid"],
+                "failed": len(lines), "errors": [{"reason": str(exc)}]}
+
+
+def _bulk_import_proxies_locked(lines, channel, result, seen, auto_idx) -> dict:
     for ln in lines:
         auto_named = False
         if "---" in ln:
@@ -112,30 +141,40 @@ def report_proxy_result(proxy_id: int, success: bool, latency_ms: float | None =
     channel = proxy.channel if proxy else None
     unhealthy_threshold = sysconfig.get("proxy_unhealthy_threshold", channel)
     cooldown_seconds = sysconfig.get("proxy_failure_cooldown_seconds", channel)
-    with transaction.atomic():
-        if success:
-            # 原子更新：避免并发下 read-modify-write 丢失计数/状态
+    cancel_unhealthy = bool(channel and channel.disable_proxy_unhealthy)
+    try:
+        with transaction.atomic():
+            if success:
+                # 原子更新：避免并发下 read-modify-write 丢失计数/状态
+                Proxy.objects.filter(pk=proxy_id).update(
+                    success_count=F("success_count") + 1,
+                    consecutive_failures=0,
+                    status=ProxyStatus.HEALTHY,
+                    cooldown_until=None,
+                    **(dict(latency_ms=latency_ms) if latency_ms is not None else {}),
+                )
+                return
+            # 原子递增计数后判定状态，保证并发失败也能准确进冷却
             Proxy.objects.filter(pk=proxy_id).update(
-                success_count=F("success_count") + 1,
-                consecutive_failures=0,
-                status=ProxyStatus.HEALTHY,
-                cooldown_until=None,
-                **(dict(latency_ms=latency_ms) if latency_ms is not None else {}),
+                failure_count=F("failure_count") + 1,
+                consecutive_failures=F("consecutive_failures") + 1,
             )
-            return
-        # 原子递增计数后判定状态，保证并发失败也能准确进冷却
-        Proxy.objects.filter(pk=proxy_id).update(
-            failure_count=F("failure_count") + 1,
-            consecutive_failures=F("consecutive_failures") + 1,
-        )
-        p = Proxy.objects.get(pk=proxy_id)
-        if p.consecutive_failures >= unhealthy_threshold:
-            Proxy.objects.filter(pk=proxy_id).update(
-                status=ProxyStatus.UNHEALTHY,
-                cooldown_until=now + timedelta(seconds=cooldown_seconds),
-            )
-        elif p.consecutive_failures >= 1:
-            Proxy.objects.filter(pk=proxy_id).update(status=ProxyStatus.DEGRADED)
+            p = Proxy.objects.get(pk=proxy_id)
+            if cancel_unhealthy:
+                # 关闭"异常"标记：公共/不稳定代理渠道不因间歇性失败标 unhealthy / 进冷却，
+                # 失败计数仍保留用于统计与降级展示，代理保持可调度。
+                if p.consecutive_failures >= 1:
+                    Proxy.objects.filter(pk=proxy_id).update(status=ProxyStatus.DEGRADED)
+            elif p.consecutive_failures >= unhealthy_threshold:
+                Proxy.objects.filter(pk=proxy_id).update(
+                    status=ProxyStatus.UNHEALTHY,
+                    cooldown_until=now + timedelta(seconds=cooldown_seconds),
+                )
+            elif p.consecutive_failures >= 1:
+                Proxy.objects.filter(pk=proxy_id).update(status=ProxyStatus.DEGRADED)
+    except Exception as exc:  # noqa: BLE001
+        # 统计写入失败（如 SQLite 锁）只记日志，绝不连带请求/线路判定失败。
+        logger.warning("report_proxy_result %s failed (swallowed): %s", proxy_id, exc)
 
 
 def schedulable_proxies(channel: Channel, group: int | None = None) -> list[Proxy]:
@@ -148,11 +187,13 @@ def schedulable_proxies(channel: Channel, group: int | None = None) -> list[Prox
     qs = channel.proxies.filter(enabled=True).select_related("group")
     if group is not None:
         qs = qs.filter(group_id=group)
+    cancel_unhealthy = bool(channel.disable_proxy_unhealthy)
     for p in qs:
-        if p.cooldown_until and p.cooldown_until > now:
-            continue
-        if p.status == ProxyStatus.UNHEALTHY:
-            continue
+        if not cancel_unhealthy:
+            if p.cooldown_until and p.cooldown_until > now:
+                continue
+            if p.status == ProxyStatus.UNHEALTHY:
+                continue
         out.append(p)
     out.sort(key=lambda p: (
         p.latency_ms if p.latency_ms is not None else float("inf"),

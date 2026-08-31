@@ -2,7 +2,11 @@
 
 - `GET /healthz`              存活探针（无需鉴权，供 Docker/K8s 使用）
 - `GET /api/admin/health`     全量健康信息（鉴权）
-- `GET /metrics`              Prometheus 文本格式指标（只读，无需鉴权）
+- `GET /metrics`              Prometheus 文本格式指标（鉴权）
+
+`/metrics` 之所以要鉴权：它对外暴露 Key / 代理 / 模型池规模与 24h 用量，
+属于可直接推断平台经营状况的情报；同时每次调用都会扫一遍 24h 日志做聚合，
+匿名开放时会被反复调用放大 SQLite 负载。
 """
 from __future__ import annotations
 
@@ -90,8 +94,9 @@ def _status_counts(model) -> dict[str, int]:
 # ---------------------------------------------------------------------------
 
 @csrf_exempt
+@admin_required
 def metrics(request):
-    """Prometheus 文本格式指标，从数据库实时汇总。
+    """Prometheus 文本格式指标，从数据库实时汇总（需管理 Token 鉴权）。
 
     覆盖：
     - 请求量与状态分布（最近 24h）

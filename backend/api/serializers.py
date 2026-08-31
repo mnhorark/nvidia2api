@@ -25,6 +25,7 @@ class ChannelSerializer(serializers.ModelSerializer):
             "chat_url", "models_url", "key_prefix", "auth_scheme", "default_rpm",
             "allow_duplicate_keys",
             "disable_key_invalid",
+            "disable_proxy_unhealthy",
             "enabled", "is_default", "notes",
             "consecutive_failures", "cooldown_until", "in_cooldown",
             "key_count", "enabled_key_count", "proxy_count", "enabled_proxy_count",

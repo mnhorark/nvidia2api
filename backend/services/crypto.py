@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 
 from cryptography.fernet import Fernet, InvalidToken
 
 from django.conf import settings
+
+logger = logging.getLogger("nvidia2api.crypto")
 
 _PREFIX = "enc:v1:"
 
@@ -33,10 +36,18 @@ def encrypt_secret(plain: str) -> str:
 
 
 def decrypt_secret(stored: str) -> str:
-    """解密敏感字符串；旧明文或解密失败时回落原值。"""
+    """解密敏感字符串；无前缀视为历史明文原样返回，解密失败返回空串。
+
+    解密失败（典型场景：换过 ENCRYPTION_KEY / SECRET_KEY，或数据被手工改动）
+    时**不能**回落原值——那会把密文当明文 Key 发往上游，等于把内部密文泄漏
+    给第三方接口，且失败原因被掩盖成"上游 401"。返回空串让上层立即以
+    "缺少凭据"失败，同时留下可定位的日志。
+    """
     if not stored or not stored.startswith(_PREFIX):
         return stored
     try:
         return _fernet().decrypt(stored[len(_PREFIX):].encode("utf-8")).decode("utf-8")
-    except (InvalidToken, ValueError):
-        return stored
+    except (InvalidToken, ValueError) as exc:
+        logger.error("解密敏感字段失败（ENCRYPTION_KEY 或 SECRET_KEY 与加密时不一致？）: %s",
+                     exc)
+        return ""
