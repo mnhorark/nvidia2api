@@ -155,9 +155,9 @@ class FailureStatusTests(TestCase):
         # 冷却仍保留（会自动恢复）
         self.assertIsNotNone(self.key.cooldown_until)
 
-    def test_anonymous_key_401_always_invalid_even_with_breaker_off(self):
-        # 匿名线路（空 api_key）的 401 是"上游必须鉴权"的确定性信号，
-        # 即使关闭了无效标记也必须标 invalid，否则会无限循环 401。
+    def test_anonymous_key_401_breaker_off_keeps_available_with_cooldown(self):
+        # disable_key_invalid 打开时，匿名空 Key 的 401/403 同样不标无效：
+        # 公共上游的 401/403 常是间歇性的，永久踢出会掏空号池；改用冷却兜底。
         anon = ChannelKey.objects.create(
             channel=self.key.channel, name="anon", api_key="", rpm_limit=40)
         ch = self.key.channel
@@ -165,15 +165,26 @@ class FailureStatusTests(TestCase):
         ch.save()
         key_service.report_failure(anon.id, "http_error", 401)
         anon.refresh_from_db()
-        self.assertEqual(anon.status, ChannelKeyStatus.INVALID)
+        self.assertNotEqual(anon.status, ChannelKeyStatus.INVALID)
+        self.assertIsNotNone(anon.cooldown_until)
 
-    def test_anonymous_key_403_always_invalid_even_with_breaker_off(self):
+    def test_anonymous_key_403_breaker_off_keeps_available_with_cooldown(self):
         anon = ChannelKey.objects.create(
             channel=self.key.channel, name="anon2", api_key="", rpm_limit=40)
         ch = self.key.channel
         ch.disable_key_invalid = True
         ch.save()
         key_service.report_failure(anon.id, "http_error", 403)
+        anon.refresh_from_db()
+        self.assertNotEqual(anon.status, ChannelKeyStatus.INVALID)
+        self.assertIsNotNone(anon.cooldown_until)
+
+    def test_anonymous_key_401_default_still_invalid(self):
+        # 未开启 disable_key_invalid 时，匿名空 Key 的 401 仍是"上游必须鉴权"的
+        # 确定性信号，照旧标 invalid，避免在普通渠道里反复 401。
+        anon = ChannelKey.objects.create(
+            channel=self.key.channel, name="anon3", api_key="", rpm_limit=40)
+        key_service.report_failure(anon.id, "http_error", 401)
         anon.refresh_from_db()
         self.assertEqual(anon.status, ChannelKeyStatus.INVALID)
 

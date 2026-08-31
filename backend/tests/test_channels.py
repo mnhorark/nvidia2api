@@ -1,4 +1,5 @@
 """多渠道：端点解析、渠道隔离、按渠道路由。"""
+import asyncio
 import json
 import types
 from unittest.mock import patch
@@ -13,6 +14,19 @@ from apps.core.models import AIModel, Channel, ChannelKey, Proxy, RequestLog, Sy
 from apps.core.models import split_endpoint
 from services import api_key_service, channel_service, key_service, proxy_service
 from services import race_engine as race_engine_module
+
+
+def _acollect(agen) -> list:
+    """同步消费异步生成器（streaming_content / SSE 转换器现为 async 生成器）。"""
+    async def _gather():
+        return [part async for part in agen]
+    return asyncio.run(_gather())
+
+
+def _consume_stream(resp) -> str:
+    """同步消费异步流式响应体（streaming_content 现为 async 生成器）。"""
+    return b"".join(_acollect(resp.streaming_content)).decode()
+
 
 
 class SplitEndpointTests(TestCase):
@@ -303,7 +317,7 @@ class OpenAiChannelRoutingTests(TransactionTestCase):
 
 
 class ModelAliasTests(TestCase):
-    """对外名称映射：alias > display_name > model_name，/v1 与 /c/<slug> 均生效。"""
+    """对外名称映射（仅保留别名系统）：alias > model_name；display_name 不参与对外。"""
 
     def setUp(self):
         self.channel = Channel.objects.create(
@@ -314,26 +328,36 @@ class ModelAliasTests(TestCase):
                                    display_name="显示名", alias="alias-name", enabled=True)
         self.assertEqual(m.public_name, "alias-name")
         m.alias = ""
-        self.assertEqual(m.public_name, "显示名")
-        m.display_name = ""
+        # display_name 只是后台标签，不再参与对外命名
         self.assertEqual(m.public_name, "raw/name")
 
-    def test_resolve_by_alias_and_display_name(self):
+    def test_resolve_by_alias_only(self):
         from services import model_registry
         AIModel.objects.create(channel=self.channel, model_name="raw/name",
                                display_name="显示名", alias="", enabled=True)
-        self.assertEqual(model_registry.resolve("显示名").model_name, "raw/name")
         self.assertEqual(model_registry.resolve("raw/name").model_name, "raw/name")
+        # display_name 不再可调用
+        self.assertIsNone(model_registry.resolve("显示名"))
         self.assertIsNone(model_registry.resolve("nope"))
 
-    def test_list_models_returns_public_name(self):
+    def test_list_models_ignores_display_name(self):
         AIModel.objects.create(channel=self.channel, model_name="raw/name",
                                display_name="显示名", enabled=True)
         _user, raw_key = api_key_service.create_key("tester")
         request = RequestFactory().get(
             "/v1/models", HTTP_AUTHORIZATION=f"Bearer {raw_key}")
         data = json.loads(openai_views.list_models(request).content)
-        self.assertEqual([m["id"] for m in data["data"]], ["显示名"])
+        # /v1/models 只暴露别名/原始名，display_name 不出现
+        self.assertEqual([m["id"] for m in data["data"]], ["raw/name"])
+
+    def test_upstream_body_uses_real_model_name(self):
+        """核心：客户端用别名调用时，上游必须收到真实上游模型名而非别名。"""
+        from api.openai_views import _build_upstream_body
+        body = {"model": "kimi-k3", "messages": [{"role": "user", "content": "hi"}]}
+        out = _build_upstream_body(body, "moonshotai/kimi-k3")
+        self.assertEqual(out["model"], "moonshotai/kimi-k3")
+        # 别名只存在于平台对外层，不进上游请求体
+        self.assertNotEqual(out["model"], "kimi-k3")
 
     def test_multiple_aliases(self):
         """一个模型可暴露多个对外名（主名 + 附加别名），/v1 与解析均生效。"""
@@ -471,7 +495,10 @@ class RetryTests(TransactionTestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(m.call_count, 2)
 
-    def test_no_retry_by_default(self):
+    def test_no_retry_when_disabled(self):
+        """retry_count=0：竞速失败后不重试（默认值已改为 1，此处显式关闭验证关闭语义）。"""
+        from services import sysconfig
+        sysconfig.set_params({"retry_count": 0}, self.channel)
         with patch.object(openai_views, "race_chat",
                           side_effect=race_engine_module.AllRoutesFailed(["boom"])) as m:
             resp = self._call()
@@ -525,7 +552,7 @@ class StreamRetryTests(TransactionTestCase):
 
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
             resp = self._call()
-            body = b"".join(list(resp.streaming_content)).decode()
+            body = _consume_stream(resp)
         self.assertEqual(calls["n"], 2)
         self.assertIn('data: {"choices"', body)
         self.assertIn("data: [DONE]", body)
@@ -550,7 +577,7 @@ class StreamRetryTests(TransactionTestCase):
 
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
             resp = self._call()
-            body = b"".join(list(resp.streaming_content)).decode()
+            body = _consume_stream(resp)
         self.assertEqual(calls["n"], 2)
         self.assertIn('data: {"choices"', body)
         self.assertIn("data: [DONE]", body)
@@ -575,7 +602,7 @@ class StreamRetryTests(TransactionTestCase):
 
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
             resp = self._call()
-            body = b"".join(list(resp.streaming_content)).decode()
+            body = _consume_stream(resp)
         self.assertEqual(calls["n"], 2)
         self.assertIn("thinking...", body)
         self.assertIn('data: {"choices"', body)
@@ -583,7 +610,9 @@ class StreamRetryTests(TransactionTestCase):
         self.assertNotIn("stream_error", body)
 
     def test_stream_no_retry_after_answer_content(self):
-        # 已交付正文 content 后才断流 → 响应已提交，不能重试
+        # 已交付正文 content 后才断流 → 响应已提交，不能重试；
+        # 且绝不能发 error 事件（否则客户端 SSE 解析报 "error decoding response body"），
+        # 应干净收尾 [DONE]。
         from services import sysconfig
         sysconfig.set_params({"retry_count": 3}, self.channel)
         answer = 'data: {"choices":[{"delta":{"content":"ans"}}]}\n\n'
@@ -598,16 +627,17 @@ class StreamRetryTests(TransactionTestCase):
 
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
             resp = self._call()
-            body = b"".join(list(resp.streaming_content)).decode()
+            body = _consume_stream(resp)
         self.assertEqual(calls["n"], 1)
-        self.assertIn("stream_error", body)
+        self.assertIn("data: [DONE]", body)
+        self.assertNotIn("stream_error", body)
 
     def test_stream_no_retry_after_first_byte_sent(self):
         from services import sysconfig
         sysconfig.set_params({"retry_count": 3}, self.channel)
         ok_chunk = 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
         behaviors = [
-            # 先吐出首字节，随后流中断 → 响应已提交，不能重试
+            # 先吐出首字节，随后流中断 → 响应已提交，不能重试，干净收尾
             _FakeStreamWinner(chunks=[ok_chunk], error_after=1),
         ]
         calls = {"n": 0}
@@ -618,9 +648,10 @@ class StreamRetryTests(TransactionTestCase):
 
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
             resp = self._call()
-            body = b"".join(list(resp.streaming_content)).decode()
+            body = _consume_stream(resp)
         self.assertEqual(calls["n"], 1)
-        self.assertIn("stream_error", body)
+        self.assertIn("data: [DONE]", body)
+        self.assertNotIn("stream_error", body)
 
     def test_stream_retry_exhausted_returns_stream_error(self):
         from services import sysconfig
@@ -634,7 +665,7 @@ class StreamRetryTests(TransactionTestCase):
 
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
             resp = self._call()
-            body = b"".join(list(resp.streaming_content)).decode()
+            body = _consume_stream(resp)
         self.assertEqual(calls["n"], 3)
         self.assertIn("stream_error", body)
 
@@ -745,7 +776,7 @@ class ResponsesEndpointTests(TransactionTestCase):
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
             resp = self._call({"model": "m1", "input": "hi", "stream": True})
             # streaming_content 是惰性生成器，必须在 patch 生效期间消费
-            body = b"".join(list(resp.streaming_content)).decode()
+            body = _consume_stream(resp)
         self.assertIn("event: response.created", body)
         self.assertIn("event: response.output_text.delta", body)
         self.assertIn('"delta": "he"', body)
@@ -1019,7 +1050,13 @@ class ResponsesTranslateTests(TestCase):
             '"finish_reason":null}]}\n\n',
             'data: [DONE]\n\n',
         ])
-        out = "".join(list(responses_api.iter_chat_sse_as_responses(chat_iter)))
+
+        async def _achunks():
+            for c in chat_iter:
+                yield c
+
+        out = "".join(_acollect(
+            responses_api.iter_chat_sse_as_responses(_achunks())))
         self.assertIn("response.reasoning_summary_text.delta", out)
         self.assertIn("思考中", out)
 

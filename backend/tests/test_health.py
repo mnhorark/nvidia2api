@@ -91,8 +91,17 @@ class HealthEndpointTests(TestCase):
         self.assertIn("counts", body)
         self.assertIn("key_status", body)
 
+    def test_metrics_requires_auth(self):
+        """/metrics 暴露池规模与用量情报，匿名必须拒绝（M6）。"""
+        self.assertEqual(
+            health_views.metrics(self.factory.get("/metrics")).status_code, 401)
+        self.assertEqual(
+            health_views.metrics(self.factory.get(
+                "/metrics", HTTP_AUTHORIZATION="Token wrong-token")).status_code, 401)
+
     def test_metrics_text(self):
-        resp = health_views.metrics(self.factory.get("/metrics"))
+        resp = health_views.metrics(self.factory.get(
+            "/metrics", HTTP_AUTHORIZATION=f"Token {settings.ADMIN_TOKEN}"))
         self.assertEqual(resp.status_code, 200)
         text = resp.content.decode()
         self.assertIn("nvidia2api_requests_total", text)

@@ -46,8 +46,32 @@ class ValidationTests(TestCase):
         self.assertIsNone(is_valid_stream_chunk("data: garbage"))
         self.assertIsNotNone(is_valid_stream_chunk(
             'data: {"choices":[{"delta":{"content":"h"}}]}'))
-        self.assertEqual(is_valid_stream_chunk("data: [DONE]"), {"done": True})
         self.assertIsNone(is_valid_stream_chunk('data: {"error":{"message":"x"}}'))
+
+    def test_bare_done_is_not_a_valid_first_chunk(self):
+        """上游首行裸发 `data: [DONE]` = 空响应，不能判为竞速胜者。
+
+        过去这里返回 {"done": True} 被当成有效首块，导致客户端收到空白回答且
+        因为"已成功"而不触发自动重试换线。
+        """
+        self.assertIsNone(is_valid_stream_chunk("data: [DONE]"))
+
+    def test_contentless_chunks_are_not_valid_first_chunks(self):
+        """空 delta 心跳 / 纯角色标记不算有效首块（线路尚未真正产出内容）。"""
+        self.assertIsNone(is_valid_stream_chunk('data: {"choices":[{"delta":{}}]}'))
+        self.assertIsNone(is_valid_stream_chunk(
+            'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}'))
+
+    def test_content_chunks_are_valid(self):
+        """正文 / 思考 / 工具调用 / usage / 结束原因都算有效内容。"""
+        for payload in (
+            '{"choices":[{"delta":{"content":"hi"}}]}',
+            '{"choices":[{"delta":{"reasoning_content":"think"}}]}',
+            '{"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}',
+            '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            '{"choices":[{"delta":{}}],"usage":{"prompt_tokens":1}}',
+        ):
+            self.assertIsNotNone(is_valid_stream_chunk("data: " + payload), payload)
 
 
 class RaceTests(TestCase):

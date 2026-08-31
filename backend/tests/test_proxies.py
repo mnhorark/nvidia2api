@@ -1,4 +1,7 @@
+from datetime import timedelta
+
 from django.test import TestCase
+from django.utils import timezone
 
 from apps.core.models import Channel, ChannelKey, Proxy, ProxyStatus
 from services import channel_service, proxy_service
@@ -100,6 +103,32 @@ class EnableLimitTests(TestCase):
         p.refresh_from_db()
         self.assertEqual(p.status, ProxyStatus.HEALTHY)
         self.assertEqual(p.latency_ms, 120)
+
+    def test_disable_proxy_unhealthy_no_unhealthy_or_cooldown(self):
+        # 开启"关闭代理异常标记"后：连续失败只降级，不标 unhealthy、不进冷却
+        self.channel.disable_proxy_unhealthy = True
+        self.channel.save(update_fields=["disable_proxy_unhealthy"])
+        p = Proxy.objects.create(channel=self.channel, name="p", protocol="socks5",
+                                 host="1.1.1.1", port=1, enabled=True)
+        for _ in range(5):
+            proxy_service.report_proxy_result(p.id, False)
+        p.refresh_from_db()
+        self.assertEqual(p.status, ProxyStatus.DEGRADED)
+        self.assertIsNone(p.cooldown_until)
+        # 仍可调度（未进冷却 / 未标 unhealthy）
+        self.assertIn(p.id, [x.id for x in proxy_service.schedulable_proxies(self.channel)])
+
+    def test_disable_proxy_unhealthy_schedules_existing_unhealthy(self):
+        # 存量"异常 + 冷却中"的代理：开关开启后无需等待冷却即可调度
+        p = Proxy.objects.create(channel=self.channel, name="p", protocol="socks5",
+                                 host="1.1.1.1", port=1, enabled=True,
+                                 status=ProxyStatus.UNHEALTHY,
+                                 cooldown_until=timezone.now() + timedelta(minutes=5))
+        # 关闭时不调度
+        self.assertNotIn(p.id, [x.id for x in proxy_service.schedulable_proxies(self.channel)])
+        self.channel.disable_proxy_unhealthy = True
+        self.channel.save(update_fields=["disable_proxy_unhealthy"])
+        self.assertIn(p.id, [x.id for x in proxy_service.schedulable_proxies(self.channel)])
 
 
 class ChannelServiceTests(TestCase):

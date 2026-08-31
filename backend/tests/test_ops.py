@@ -1,5 +1,6 @@
 """运维特性测试：日志分页、日志清理、模型同步裁剪、实时并发计数。"""
 import json
+import unittest
 from datetime import timedelta
 from unittest.mock import patch
 
@@ -10,6 +11,14 @@ from django.utils import timezone
 from api import admin_views, openai_views
 from apps.core.models import AIModel, Channel, RequestLog
 from services import cleanup
+
+
+async def _never_ends():
+    """永不出数据的异步生成器：用于测试无数据空闲超时。"""
+    import asyncio
+    await asyncio.Event().wait()
+    yield  # pragma: no cover
+
 
 
 def _make_channel(**kw) -> Channel:
@@ -228,3 +237,122 @@ class ResponsesConversionTests(TestCase):
         fc = next(i for i in out["input"] if i["type"] == "function_call")
         self.assertEqual(fc["call_id"], "call_1")
         self.assertEqual(fc["name"], "get_weather")
+
+
+class DrainFirstContentTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    """_drain 心跳 + 停滞超时：持续有数据（含思考 reasoning token）不掐断；
+    连续超过停滞阈值无任何数据才抛 TimeoutError；静默期内向客户端发心跳。"""
+
+    @staticmethod
+    def _winner(agen):
+        class FakeWinner:
+            def __init__(self, agen):
+                self._agen = agen()
+                self.gens = [self._agen]
+
+            def lines(self):
+                return self._agen
+        return FakeWinner(agen)
+
+    async def test_no_data_times_out(self):
+        from api.openai_views import _drain
+        winner = self._winner(lambda: _never_ends())
+        with self.assertRaises(TimeoutError):
+            async for _ in _drain(winner, stall_timeout=0.05):
+                pass
+
+    async def test_reasoning_flow_does_not_timeout(self):
+        """思考 token 持续流动即证明线路没死：即使总时长超过停滞阈值也不掐断。"""
+        import asyncio
+        from api.openai_views import _drain
+
+        async def stream():
+            for _ in range(5):
+                yield ('data: {"choices":[{"index":0,"delta":{"reasoning_content":"t"},'
+                       '"finish_reason":null}]}\n\n')
+                await asyncio.sleep(0.03)
+
+        winner = self._winner(stream)
+        got = 0
+        async for _ in _drain(winner, stall_timeout=0.05):
+            got += 1
+        # 总耗时 0.15s > 停滞阈值 0.05s：若按"无内容即掐断"早该被掐断，但思考 token
+        # 一直在流动，必须完整走完
+        self.assertGreaterEqual(got, 5)
+
+    async def test_heartbeat_emitted_during_silence(self):
+        """上游静默但未达停滞阈值时，向客户端周期性发 `: keep-alive` 心跳（流式保活）。"""
+        import asyncio
+        from api.openai_views import _drain
+
+        async def stream():
+            # 只发一行数据，然后一直静默
+            yield ('data: {"choices":[{"index":0,"delta":{"content":"hi"},'
+                   '"finish_reason":null}]}\n\n')
+            await asyncio.Event().wait()
+
+        winner = self._winner(stream)
+        got_beat = 0
+        try:
+            async for chunk in _drain(winner, stall_timeout=0.5, heartbeat=0.03,
+                                      max_duration=0.15):
+                # max_duration 0.15s 内应至少收到 2 次心跳，未触发停滞（0.5s）
+                if chunk.startswith(":"):
+                    got_beat += 1
+        except TimeoutError:
+            pass  # max_duration 到期触发 TimeoutError 即测试的预期结束方式
+        self.assertGreaterEqual(got_beat, 2)
+
+    async def test_content_arrives_within_timeout(self):
+        from api.openai_views import _drain
+        async def stream():
+            yield ('data: {"choices":[{"index":0,"delta":{"content":"hi"},'
+                   '"finish_reason":null}]}\n\n')
+        winner = self._winner(stream)
+        out = []
+        async for chunk in _drain(winner, stall_timeout=0.05):
+            out.append(chunk)
+        self.assertIn("hi", out[0])
+
+    async def test_zero_timeout_no_stall_limit(self):
+        """0 = 不限制：慢速（但有数据）的流不应被停滞超时打断。"""
+        import asyncio
+        from api.openai_views import _drain
+        async def stream():
+            await asyncio.sleep(0.05)
+            yield ('data: {"choices":[{"index":0,"delta":{"content":"x"},'
+                   '"finish_reason":null}]}\n\n')
+        winner = self._winner(stream)
+        out = []
+        async for chunk in _drain(winner, stall_timeout=0):
+            out.append(chunk)
+        self.assertIn("x", out[0])
+
+
+class UpstreamBodyAndTokenTests(TestCase):
+    """上游请求体与 token 统计：别名透传真实模型名、流式请求 usage、本地估算兜底。"""
+
+    def test_stream_options_and_real_model_name(self):
+        from api.openai_views import _build_upstream_body
+        # 客户端用别名调用，流式请求：上游必须带真实模型名 + include_usage
+        out = _build_upstream_body(
+            {"model": "kimi-k3", "messages": [{"role": "user", "content": "hi"}],
+             "stream": True},
+            "moonshotai/kimi-k3")
+        self.assertEqual(out["model"], "moonshotai/kimi-k3")
+        self.assertEqual(out["stream_options"], {"include_usage": True})
+
+    def test_no_stream_options_when_not_streaming(self):
+        from api.openai_views import _build_upstream_body
+        out = _build_upstream_body(
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}]}, "m")
+        self.assertNotIn("stream_options", out)
+
+    def test_token_estimation(self):
+        from services import tokenizer
+        # 空文本 -> 0；普通文本 > 0；messages 结构开销计入
+        self.assertEqual(tokenizer.estimate_tokens(""), 0)
+        self.assertGreater(tokenizer.estimate_tokens("hello world"), 0)
+        msgs = [{"role": "user", "content": "hello world"}]
+        self.assertGreater(tokenizer.estimate_messages_tokens(msgs),
+                           tokenizer.estimate_tokens("hello world"))

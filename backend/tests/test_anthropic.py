@@ -1,9 +1,23 @@
 """Anthropic Messages API 双向转换测试。"""
+import asyncio
 import json
 
 from django.test import TestCase
 
 from services import anthropic_api
+
+
+async def _achunks(gen):
+    """把同步生成器包成异步生成器（转换器入口现要求 async 可迭代对象）。"""
+    for c in gen:
+        yield c
+
+
+def _collect(agen) -> list:
+    """同步消费异步生成器（iter_chat_sse_as_anthropic 现为 async 生成器）。"""
+    async def _gather():
+        return [part async for part in agen]
+    return asyncio.run(_gather())
 
 
 class RequestConversionTests(TestCase):
@@ -154,7 +168,8 @@ class StreamConversionTests(TestCase):
 
     def test_event_lifecycle(self):
         events = []
-        for line in anthropic_api.iter_chat_sse_as_anthropic(self._chunks()):
+        for line in _collect(anthropic_api.iter_chat_sse_as_anthropic(
+                _achunks(self._chunks()))):
             if line.startswith("event: "):
                 events.append(line.split("\n")[0].split(": ", 1)[1])
         # 必须包含完整生命周期
@@ -165,7 +180,8 @@ class StreamConversionTests(TestCase):
 
     def test_text_block_accumulates(self):
         data_events = []
-        for line in anthropic_api.iter_chat_sse_as_anthropic(self._chunks()):
+        for line in _collect(anthropic_api.iter_chat_sse_as_anthropic(
+                _achunks(self._chunks()))):
             if line.startswith("event: content_block_delta"):
                 payload = json.loads(line.split("data: ", 1)[1].strip())
                 data_events.append(payload["delta"])
@@ -173,7 +189,8 @@ class StreamConversionTests(TestCase):
         self.assertEqual("".join(texts), "Hello")
 
     def test_stream_ends_with_message_stop(self):
-        out = list(anthropic_api.iter_chat_sse_as_anthropic(self._chunks()))
+        out = _collect(anthropic_api.iter_chat_sse_as_anthropic(
+            _achunks(self._chunks())))
         self.assertTrue(out[-1].startswith("event: message_stop"))
 
     def test_blocks_are_serialized_not_overlapping(self):
@@ -189,7 +206,8 @@ class StreamConversionTests(TestCase):
             yield "data: [DONE]\n\n"
 
         starts, stops = [], []
-        for line in anthropic_api.iter_chat_sse_as_anthropic(chunks()):
+        for line in _collect(anthropic_api.iter_chat_sse_as_anthropic(
+                _achunks(chunks()))):
             if line.startswith("event: content_block_start"):
                 idx = json.loads(line.split("data: ", 1)[1].strip())["index"]
                 starts.append(idx)
@@ -199,6 +217,45 @@ class StreamConversionTests(TestCase):
         # 串行：start 必须与 stop 一一配对、索引依次递增、不允许重叠打开
         self.assertEqual(starts, [0, 1])
         self.assertEqual(stops, [0, 1])
+
+
+class MessageIdTests(TestCase):
+    """message.id 必须每次请求唯一。
+
+    曾用「生成器局部计数器」实现，导致 id 恒为 `msg_1`：跨请求完全重复，
+    客户端（Claude Code 等）用它做去重与日志关联时会把不同轮次混在一起。
+    """
+
+    @staticmethod
+    def _chunks():
+        yield "data: " + json.dumps({"id": "c", "model": "m", "choices": [
+            {"delta": {"content": "hi"}, "finish_reason": None}]}) + "\n\n"
+        yield "data: " + json.dumps({"id": "c", "model": "m", "choices": [
+            {"delta": {}, "finish_reason": "stop"}]}) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    @staticmethod
+    def _message_id(events) -> str:
+        for line in events:
+            if line.startswith("event: message_start"):
+                payload = json.loads(line.split("data: ", 1)[1].strip())
+                return payload["message"]["id"]
+        return ""
+
+    def test_message_id_is_unique_per_request(self):
+        a = self._message_id(_collect(anthropic_api.iter_chat_sse_as_anthropic(
+            _achunks(self._chunks()))))
+        b = self._message_id(_collect(anthropic_api.iter_chat_sse_as_anthropic(
+            _achunks(self._chunks()))))
+        self.assertTrue(a.startswith("msg_"), a)
+        self.assertNotEqual(a, b, "两次请求的 message.id 相同，无法区分轮次")
+
+    def test_message_start_emitted_once(self):
+        """同一条流里 message_start 只能出现一次（重复会让客户端重置消息）。"""
+        events = _collect(anthropic_api.iter_chat_sse_as_anthropic(
+            _achunks(self._chunks())))
+        starts = [ln for ln in events if ln.startswith("event: message_start")]
+        self.assertEqual(len(starts), 1)
 
 
 class CountTokensTests(TestCase):

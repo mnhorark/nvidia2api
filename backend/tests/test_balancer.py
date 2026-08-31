@@ -58,6 +58,40 @@ class BalancerTests(TestCase):
                       if k.minute_request_count == 1)
         self.assertEqual(claimed, 1)
 
+    def test_exclude_skips_dead_key_proxy_combination(self):
+        """重试排除：被判定静止的 (key_id, proxy_id) 组合不再参与下一轮竞速。"""
+        # 3 keys -> 最多启用 2 个代理（启用数 <= Key 数 - 1）
+        keys, proxies = self._setup(3, 3)
+        for p in proxies[:2]:
+            ok, _ = proxy_service.set_enabled(p, True)
+            self.assertTrue(ok)
+
+        routes = build_routes(self.channel)
+        self.assertEqual(len(routes), 3)  # 2 proxies + 1 direct
+
+        # 排除第一条代线路（key0+proxy0）后，重新构建应少一条线路，且不包含该组合
+        first = routes[0]
+        first_comb = (first.key.id, first.proxy.id)
+        excluded = {first_comb}
+        routes2 = build_routes(self.channel, exclude=excluded)
+        self.assertEqual(len(routes2), len(routes) - 1)
+        for r in routes2:
+            self.assertNotEqual((r.key.id, r.proxy.id if r.proxy else None), first_comb)
+
+    def test_exclude_can_skip_direct_route(self):
+        """直连线路（proxy=None）同样可被排除。"""
+        # 2 keys -> 最多启用 1 个代理
+        keys, proxies = self._setup(2, 2)
+        ok, _ = proxy_service.set_enabled(proxies[0], True)
+        self.assertTrue(ok)
+        routes = build_routes(self.channel)
+        self.assertEqual(len(routes), 2)  # 1 proxy + 1 direct
+        direct = next(r for r in routes if r.proxy is None)
+        excluded = {(direct.key.id, None)}
+        routes2 = build_routes(self.channel, exclude=excluded)
+        self.assertEqual(len(routes2), len(routes) - 1)
+        self.assertFalse(any(r.proxy is None for r in routes2))
+
     def test_routes_are_channel_scoped(self):
         other = Channel.objects.create(name="Zen", slug="zen",
                                        base_url="https://opencode.ai/zen/v1")
