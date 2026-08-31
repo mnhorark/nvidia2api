@@ -73,22 +73,30 @@ cp .env.example .env
 cd backend
 pip install -r requirements.txt
 python manage.py migrate
-python -m pytest tests          # 182 个测试：导入/限流/代理限制/竞速/并发安全/思考强度/多渠道/额度/熔断
+python -m pytest tests          # 240 个测试：导入/限流/代理限制/竞速/并发安全/思考强度/多渠道/额度/熔断/回归守卫/前端静态托管
 python manage.py runserver 0.0.0.0:8000
 
 # 前端
 cd frontend
 npm install
 npm run dev                     # http://localhost:3000
+npm run typecheck               # 类型检查（Next 16 已移除 next lint，故 lint 指向 tsc）
 ```
 
-默认管理员：`admin / admin123`（用 `.env` 中 `ADMIN_USERNAME/ADMIN_PASSWORD/ADMIN_TOKEN` 修改）。
+管理员凭据来自 `.env` 的 `ADMIN_USERNAME/ADMIN_PASSWORD/ADMIN_TOKEN`。
+**出厂默认值 `admin123` / `dev-admin-token` 在 `DEBUG=false` 下会直接拒绝启动**，
+请先改成随机值（`.env.example` 里有生成命令）；`ADMIN_TOKEN` 支持逗号分隔多值以便无缝轮换。
 
 ## Docker
 
 ```bash
+cp .env.example .env
+# 把 ADMIN_PASSWORD / ADMIN_TOKEN 改成随机值（DEBUG=false 下拒绝使用出厂默认值）
 docker compose up -d
 ```
+
+单容器同时提供 API 与控制台（Next.js 静态导出产物打包进 `/app/static/frontend`，
+由 Django 在同一 8000 端口托管）：控制台为 `http://localhost:8000/`。
 
 SQLite 数据保存在 `./data`（已挂载到容器 `/app/data`）。
 
