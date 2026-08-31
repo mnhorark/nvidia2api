@@ -210,12 +210,23 @@ def _usage_to_responses(u: dict) -> dict:
 
 
 def _usage_to_chat(u: dict) -> dict:
-    """responses usage（input/output_tokens）-> chat（prompt/completion_tokens）。"""
-    out = dict(u)
+    """responses usage（input/output_tokens）-> chat（prompt/completion_tokens）。
+
+    同时把明细字段换成 chat 侧的键名（input_tokens_details.cached_tokens ->
+    prompt_tokens_details.cached_tokens），让缓存命中统计在两条协议下一致。
+    `total_tokens` 缺失时按输入输出求和补齐。
+    """
+    out = dict(u or {})
     if "input_tokens" in out and "prompt_tokens" not in out:
         out["prompt_tokens"] = out.pop("input_tokens")
     if "output_tokens" in out and "completion_tokens" not in out:
         out["completion_tokens"] = out.pop("output_tokens")
+    details = out.pop("input_tokens_details", None)
+    if isinstance(details, dict) and "prompt_tokens_details" not in out:
+        out["prompt_tokens_details"] = details
+    if not out.get("total_tokens"):
+        out["total_tokens"] = (out.get("prompt_tokens") or 0) + (
+            out.get("completion_tokens") or 0)
     return out
 
 
@@ -709,7 +720,8 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
         usage = data.get("usage")
         if usage:
             return json.dumps({"choices": [{"index": 0, "delta": {},
-                                            "finish_reason": "stop"}], "usage": usage})
+                                            "finish_reason": "stop"}],
+                               "usage": _usage_to_chat(usage)})
         return None
     if etype == "response.output_item.done":
         item = data.get("item")
@@ -741,7 +753,10 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
                                             "finish_reason": None}]})
         return None
     if etype == "response.completed":
-        usage = (data.get("response") or {}).get("usage") or {}
+        # usage 走 responses 键名（input/output_tokens），必须归一成 chat 键名，
+        # 否则下游按 prompt_tokens/completion_tokens 取值全部落空，日志与额度
+        # 统计会静默丢弃上游真实数值、退回本地估算。
+        usage = _usage_to_chat((data.get("response") or {}).get("usage") or {})
         inc = (data.get("response") or {}).get("incomplete_details") or {}
         reason = inc.get("reason")
         finish = _FINISH_FROM_RESPONSES.get(str(reason), "stop") if reason else "stop"
@@ -785,12 +800,12 @@ def _sse_event(name: str, obj: dict) -> str:
     return f"event: {name}\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-def iter_chat_sse_as_responses(chat_iter: Iterator[str]) -> Iterator[str]:
+async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIterator[str]:
     """把内部 chat 格式的 SSE 行流转成 Responses API SSE 事件流。
 
     忠实补全 Responses 生命周期：created/in_progress、各 output_item 的
     added/done（reasoning / message / function_call）、增量 delta 事件，
-    最后 completed + [DONE]。
+    最后 completed + [DONE]。异步生成器以保持真正的逐块流式。
     """
     emitted_created = False
     done_sent = False
@@ -803,7 +818,7 @@ def iter_chat_sse_as_responses(chat_iter: Iterator[str]) -> Iterator[str]:
     announced: set[str] = set()
     message_item_id = "msg_0"
 
-    def announce(item: dict) -> Iterator[str]:
+    async def announce(item: dict) -> AsyncIterator[str]:
         iid = item.get("id")
         if iid in announced:
             return
@@ -812,7 +827,11 @@ def iter_chat_sse_as_responses(chat_iter: Iterator[str]) -> Iterator[str]:
                          {"type": "response.output_item.added",
                           "output_index": 0, "item": item})
 
-    for chunk in chat_iter:
+    async for chunk in chat_iter:
+        # SSE 心跳注释（`: keep-alive`）原样透传：/v1/responses 出口同样保活
+        if chunk.startswith(":"):
+            yield chunk
+            continue
         if not chunk.startswith("data:"):
             continue
         payload = chunk[5:].strip().rstrip("\n")
@@ -852,8 +871,9 @@ def iter_chat_sse_as_responses(chat_iter: Iterator[str]) -> Iterator[str]:
         reasoning = delta.get("reasoning_content")
         if reasoning:
             reasoning_acc += str(reasoning)
-            yield from announce({"id": "rs_0", "type": "reasoning",
-                                 "status": "in_progress", "summary": []})
+            async for _ev in announce({"id": "rs_0", "type": "reasoning",
+                                       "status": "in_progress", "summary": []}):
+                yield _ev
             yield _sse_event("response.reasoning_summary_text.delta", {
                 "type": "response.reasoning_summary_text.delta", "output_index": 0,
                 "delta": str(reasoning),
@@ -861,9 +881,10 @@ def iter_chat_sse_as_responses(chat_iter: Iterator[str]) -> Iterator[str]:
         content = delta.get("content")
         if content:
             content_acc += str(content)
-            yield from announce({"id": message_item_id, "type": "message",
-                                 "role": "assistant", "status": "in_progress",
-                                 "content": []})
+            async for _ev in announce({"id": message_item_id, "type": "message",
+                                       "role": "assistant", "status": "in_progress",
+                                       "content": []}):
+                yield _ev
             yield _sse_event("response.output_text.delta", {
                 "type": "response.output_text.delta", "output_index": 0,
                 "delta": str(content),
@@ -874,10 +895,11 @@ def iter_chat_sse_as_responses(chat_iter: Iterator[str]) -> Iterator[str]:
                 iid = str(tc.get("id") or "")
                 fn = tc.get("function") or {}
                 if iid and iid not in announced:
-                    yield from announce({"id": iid, "type": "function_call",
-                                         "status": "in_progress", "call_id": iid,
-                                         "name": str(fn.get("name") or ""),
-                                         "arguments": ""})
+                    async for _ev in announce({"id": iid, "type": "function_call",
+                                               "status": "in_progress", "call_id": iid,
+                                               "name": str(fn.get("name") or ""),
+                                               "arguments": ""}):
+                        yield _ev
                 if iid:
                     if fn.get("name"):
                         tool_names[iid] = str(fn["name"])

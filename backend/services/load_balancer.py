@@ -63,11 +63,15 @@ def build_routes(channel: Channel | None = None,
     proxies = proxies[: route_count - 1]
 
     routes: list[Route] = []
+    # 代理按"下一个可用"的顺序发放，而不是按线路下标取。
+    # 过去若第 i 把 Key 占位（RPM claim）失败，proxies[i] 会被整轮跳过——
+    # 排头的启用代理因此永不中标，实际线路数也少于预期。
+    proxy_iter = iter(proxies)
     for i in range(route_count):
         key = keys[i]
         if not key_service.claim_rpm_slot(key.id):
             continue
-        proxy = proxies[i] if i < len(proxies) else None
+        proxy = next(proxy_iter, None)
         routes.append(Route(kind="proxy" if proxy else "direct", key=key,
                             proxy=proxy, url_override=endpoint or None))
 

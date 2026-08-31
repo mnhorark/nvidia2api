@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Iterator
+from typing import Any, AsyncIterator, Iterator
+from uuid import uuid4
 
 # 通用同名参数：忠实透传
 _COMMON = frozenset({
@@ -183,6 +184,11 @@ def messages_to_chat_body(body: dict) -> dict:
             role = str(msg.get("role") or "user")
             text, images, tool_calls, tool_results = _blocks_to_content(msg.get("content"))
             if role == "user" and tool_results:
+                # 一条 user 消息可以同时带正文与 tool_result 块（Claude Code 常
+                # 见：先说明意图再回传工具结果）。正文必须先落成一条 user 消息，
+                # 否则会被整体丢弃、模型看不到用户的说明。
+                if text.strip():
+                    messages.append({"role": "user", "content": text})
                 for tr in tool_results:
                     messages.append({"role": "tool", **tr})
                 continue
@@ -265,12 +271,13 @@ def _sse(name: str, obj: dict) -> str:
     return f"event: {name}\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-def iter_chat_sse_as_anthropic(chat_iter: Iterator[str]) -> Iterator[str]:
+async def iter_chat_sse_as_anthropic(chat_iter: AsyncIterator[str]) -> AsyncIterator[str]:
     """把内部 chat 格式的 SSE 行流转成 Anthropic Messages SSE 事件流。
 
     事件生命周期：message_start -> content_block_start -> content_block_delta
     xN -> content_block_stop -> message_delta -> message_stop。推理增量映射为
     thinking 块，正文映射为 text 块，工具调用映射为 tool_use 块。
+    异步生成器以保持真正的逐块流式。
     """
     seen_start = False
     done_sent = False
@@ -283,14 +290,15 @@ def iter_chat_sse_as_anthropic(chat_iter: Iterator[str]) -> Iterator[str]:
     tool_blocks: dict[int, dict] = {}
     usage: dict = {}
     model = ""
-    rid = "msg_x"
+    # 每次请求唯一：客户端（含 Claude Code）会用 message.id 做去重与日志关联，
+    # 恒定值会让不同轮次的响应互相混淆。
+    rid = "msg_" + uuid4().hex[:24]
 
-    def emit_start() -> Iterator[str]:
-        nonlocal seen_start, rid
+    async def emit_start() -> AsyncIterator[str]:
+        nonlocal seen_start
         if seen_start:
             return
         seen_start = True
-        rid = "msg_" + str(abs(hash(json.dumps(chat_iter, default=str)) % 10**15))[:24]
         yield _sse("message_start", {
             "type": "message_start",
             "message": {"id": rid, "type": "message", "role": "assistant",
@@ -299,13 +307,14 @@ def iter_chat_sse_as_anthropic(chat_iter: Iterator[str]) -> Iterator[str]:
                                                           "output_tokens": 0}},
         })
 
-    def open_block(btype: str) -> Iterator[str]:
+    async def open_block(btype: str) -> AsyncIterator[str]:
         nonlocal block_index
         # Anthropic 要求内容块严格串行：开新块前必须先关闭当前块，
         # 否则 thinking/text/tool_use 会同时处于打开状态，违反协议且
         # 后续 delta 会用最后一个打开的块索引发送（正文被归到工具块）。
         if opened:
-            yield from close_block(*opened[-1])
+            async for _e in close_block(*opened[-1]):
+                yield _e
             opened.clear()
         idx = block_index
         block_index += 1
@@ -323,18 +332,25 @@ def iter_chat_sse_as_anthropic(chat_iter: Iterator[str]) -> Iterator[str]:
                 "type": "content_block_start", "index": idx,
                 "content_block": {"type": "tool_use", "id": "", "name": "", "input": {}}})
 
-    def close_block(idx: int, btype: str) -> Iterator[str]:
+    async def close_block(idx: int, btype: str) -> AsyncIterator[str]:
         yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
 
-    for chunk in chat_iter:
+    async for chunk in chat_iter:
+        # SSE 心跳注释（`: keep-alive`）原样透传：/v1/messages 出口同样保活
+        if chunk.startswith(":"):
+            yield chunk
+            continue
         if not chunk.startswith("data:"):
             continue
         payload = chunk[5:].strip().rstrip("\n")
         if payload == "[DONE]":
             if not done_sent:
                 done_sent = True
+                async for _e in emit_start():
+                    yield _e
                 for idx, btype in opened:
-                    yield from close_block(idx, btype)
+                    async for _e in close_block(idx, btype):
+                        yield _e
                 stop = "end_turn"
                 yield _sse("message_delta", {
                     "type": "message_delta",
@@ -349,8 +365,15 @@ def iter_chat_sse_as_anthropic(chat_iter: Iterator[str]) -> Iterator[str]:
         if not isinstance(data, dict):
             continue
         if data.get("error"):
+            # 严格客户端（Claude Code 等）要求 error 事件也必须处在完整的消息
+            # 生命周期内：先 message_start、最后 message_stop。缺失 start 会让
+            # 客户端在未收到 message_start 的情况下收到 error 而直接抛错。
+            async for _e in emit_start():
+                yield _e
             yield _sse("error", {"type": "error", "error": data["error"]})
-            continue
+            yield _sse("message_stop", {"type": "message_stop"})
+            done_sent = True
+            return
         model = model or str(data.get("model") or "")
         choices = data.get("choices") or []
         if not choices:
@@ -358,14 +381,16 @@ def iter_chat_sse_as_anthropic(chat_iter: Iterator[str]) -> Iterator[str]:
                 usage = data["usage"]
             continue
         ch = choices[0]
-        yield from emit_start()
+        async for _e in emit_start():
+            yield _e
         delta = ch.get("delta") or {}
         finish = ch.get("finish_reason")
 
         reasoning = delta.get("reasoning_content")
         if reasoning:
             if not opened or opened[-1][1] != "thinking":
-                yield from open_block("thinking")
+                async for _e in open_block("thinking"):
+                    yield _e
             thinking_buf += str(reasoning)
             idx = opened[-1][0]
             yield _sse("content_block_delta", {
@@ -374,7 +399,8 @@ def iter_chat_sse_as_anthropic(chat_iter: Iterator[str]) -> Iterator[str]:
         content = delta.get("content")
         if content:
             if not opened or opened[-1][1] != "text":
-                yield from open_block("text")
+                async for _e in open_block("text"):
+                    yield _e
             text_buf += str(content)
             idx = opened[-1][0]
             yield _sse("content_block_delta", {
@@ -396,7 +422,8 @@ def iter_chat_sse_as_anthropic(chat_iter: Iterator[str]) -> Iterator[str]:
                 if target is None:
                     # 新工具开块前同样先关闭当前块，保持块严格串行
                     if opened:
-                        yield from close_block(*opened[-1])
+                        async for _e in close_block(*opened[-1]):
+                            yield _e
                         opened.clear()
                     target = block_index
                     block_index += 1
@@ -409,7 +436,8 @@ def iter_chat_sse_as_anthropic(chat_iter: Iterator[str]) -> Iterator[str]:
                 if target is not None:
                     # 若已有其他块（text/thinking）打开，先关闭再回到工具块
                     if opened and opened[-1][0] != target:
-                        yield from close_block(*opened[-1])
+                        async for _e in close_block(*opened[-1]):
+                            yield _e
                         opened.clear()
                         opened.append((target, "tool_use"))
                     if name:
@@ -423,7 +451,8 @@ def iter_chat_sse_as_anthropic(chat_iter: Iterator[str]) -> Iterator[str]:
         if finish:
             # 结束当前所有块
             for idx, btype in opened:
-                yield from close_block(idx, btype)
+                async for _e in close_block(idx, btype):
+                    yield _e
             opened.clear()
             stop = _STOP_TO_ANTHROPIC.get(str(finish), "end_turn")
             yield _sse("message_delta", {
@@ -433,8 +462,13 @@ def iter_chat_sse_as_anthropic(chat_iter: Iterator[str]) -> Iterator[str]:
             yield _sse("message_stop", {"type": "message_stop"})
             done_sent = True
     if not done_sent:
+        # 上游可能一条内容都没吐就结束（空流/立即失败）。此时仍需补一条
+        # message_start，否则客户端拿到 message_delta 时还没有 message 对象。
+        async for _e in emit_start():
+            yield _e
         for idx, btype in opened:
-            yield from close_block(idx, btype)
+            async for _e in close_block(idx, btype):
+                yield _e
         yield _sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": "end_turn", "stop_sequence": None},

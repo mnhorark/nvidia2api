@@ -16,7 +16,7 @@ from typing import Any, AnyStr, AsyncIterator
 import httpx
 from django.conf import settings
 
-from services import responses_api
+from services import responses_api, sysconfig
 from services.key_service import report_failure, report_success
 from services.load_balancer import Route
 from services.proxy_service import report_proxy_result
@@ -82,21 +82,54 @@ def is_valid_response(status_code: int, data: dict) -> bool:
     return True
 
 
+def _chunk_has_delta(data: dict) -> bool:
+    """该 chunk 是否携带实际交付内容（正文/思考/工具调用/usage/结束原因）。
+
+    空 delta、纯角色标记、只有 usage=0 的心跳都不算——它们不代表上游真的
+    在产出内容，不能作为竞速胜者的判据。
+    """
+    if data.get("usage"):
+        return True
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    first = choices[0]
+    if not isinstance(first, dict):
+        return False
+    if first.get("finish_reason"):
+        return True
+    if isinstance(first.get("text"), str) and first["text"]:
+        return True
+    delta = first.get("delta")
+    if isinstance(delta, dict):
+        for key in ("content", "reasoning_content", "reasoning", "tool_calls"):
+            if delta.get(key):
+                return True
+    return False
+
+
 def is_valid_stream_chunk(line: str) -> dict | None:
-    """Return parsed chunk dict if it is a valid SSE data line, else None."""
+    """Return parsed chunk dict if it is a valid SSE *content* line, else None.
+
+    关键：裸 `data: [DONE]`（上游空响应 / 内容被过滤 / 立即结束）**不是**有效
+    首 chunk。过去它被当作胜者，导致客户端收到完全空白的回答，且因为已经
+    "成功"而不再走自动重试换线。这里判为 None，交由调用方走 empty_stream
+    换线重试。
+    """
     if not line.startswith("data:"):
         return None
     payload = line[5:].strip()
     if payload == "[DONE]":
-        return {"done": True}
+        return None
     try:
         data = json.loads(payload)
     except Exception:  # noqa: BLE001
         return None
     if not isinstance(data, dict) or data.get("error"):
         return None
-    choices = data.get("choices")
-    if not choices:
+    if not _chunk_has_delta(data):
+        # 结构性合法但没有任何内容（空 delta 心跳、纯 role 标记）：
+        # 不算有效首块，避免"空响应"线路抢占胜者位置。
         return None
     return data
 
@@ -109,6 +142,11 @@ def _client_kwargs(route: Route, stream: bool) -> dict:
     from services import sysconfig
     channel = route.key.channel
     read = sysconfig.get("upstream_read_timeout", channel)
+    if stream:
+        # 流式请求不设每读超时（read=None）：思考模型可能合法停顿数十秒~数分钟，
+        # 固定读超时会在中途掐断（客户端报 "error decoding response body"）。
+        # 死线路统一由应用层 stream_stall_timeout 检测（见 openai_views._drain）。
+        read = None
     kwargs: dict[str, Any] = {
         "timeout": httpx.Timeout(
             connect=sysconfig.get("upstream_connect_timeout", channel),
@@ -243,7 +281,19 @@ async def _race(routes: list[Route], body: dict) -> RaceResult:
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
-                result = t.result()
+                try:
+                    result = t.result()
+                except asyncio.CancelledError:
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    # 任务内部异常（如极端情况下的 DB 写锁）不应杀死整个竞速：
+                    # 按失败线路处理，让其余线路继续竞速。
+                    r = tasks[t]
+                    err = getattr(exc, "code", "") or type(exc).__name__
+                    errors.append(f"{r.name}:task_error")
+                    report.append(route_info(
+                        r, "failed", (_time.monotonic() - t0) * 1000, err, 0))
+                    continue
                 if result.ok:
                     report.append(route_info(result.route, "winner",
                                              result.latency_ms, "", result.http_status))
@@ -261,9 +311,13 @@ async def _race(routes: list[Route], body: dict) -> RaceResult:
                 report.append(route_info(result.route, "failed", result.latency_ms,
                                          result.error_type, result.http_status))
     finally:
-        for t in tasks:
-            if not t.done():
-                t.cancel()
+        # 正常路径下走到这里所有任务都已结束；但若循环体内抛了意外异常，
+        # 未结束的任务必须先取消，否则 gather 会一直等下去。
+        if tasks:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks.keys(), return_exceptions=True)
     raise AllRoutesFailed(errors, report)
 
 
@@ -286,27 +340,61 @@ async def _stream_first_valid(route: Route, body: dict):
             return None, route_info(route, "failed", error=typ, http_status=resp.status_code)
         first_line: str | None = None
         ait = resp.aiter_lines()
-        async for line in ait:
-            if not line.strip():
-                continue
-            if is_resp:
-                if responses_api.parse_stream_event(line) is not None:
+        first_byte_timeout = float(
+            sysconfig.get("stream_first_byte_timeout", route.key.channel) or 0)
+        try:
+            while True:
+                if first_byte_timeout and first_byte_timeout > 0:
+                    try:
+                        line = await asyncio.wait_for(
+                            ait.__anext__(), timeout=first_byte_timeout)
+                    except asyncio.TimeoutError:
+                        # 连上但迟迟无数据 -> 死线路：按失败处理，竞速换线
+                        _mark_failure(route, "first_byte_timeout", 0)
+                        await req_cm.__aexit__(None, None, None)
+                        await cm.__aexit__(None, None, None)
+                        return None, route_info(route, "failed",
+                                                error="first_byte_timeout")
+                else:
+                    line = await ait.__anext__()
+                if not line.strip():
+                    continue
+                if is_resp:
+                    if responses_api.parse_stream_event(line) is not None:
+                        first_line = line
+                        break
+                elif is_valid_stream_chunk(line) is not None:
                     first_line = line
                     break
-            elif is_valid_stream_chunk(line) is not None:
-                first_line = line
-                break
-            # a data line present but invalid -> invalid response
-            if line.startswith("data:"):
-                _mark_failure(route, "invalid_response", 200)
-                await req_cm.__aexit__(None, None, None)
-                await cm.__aexit__(None, None, None)
-                return None, route_info(route, "failed", error="invalid_response", http_status=200)
+                # 非内容 data 行分两类，不能一律判死线路：
+                # - 裸 `data: [DONE]`：上游立即结束且无内容 -> empty_stream（可换线重试）
+                # - 空 delta 心跳 / 纯 role 标记：线路还在，继续等真实内容
+                # - 真正的错误事件（error / invalid JSON）-> invalid_response
+                if line.startswith("data:"):
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        # 上游首行即结束、没有任何内容：跳出后按 empty_stream 处理，
+                        # 让竞速换到其它线路，而不是把空响应当作胜者。
+                        break
+                    try:
+                        parsed = json.loads(payload)
+                    except Exception:  # noqa: BLE001
+                        parsed = None
+                    if parsed is None or (isinstance(parsed, dict) and parsed.get("error")):
+                        _mark_failure(route, "invalid_response", 200)
+                        await req_cm.__aexit__(None, None, None)
+                        await cm.__aexit__(None, None, None)
+                        return None, route_info(route, "failed", error="invalid_response",
+                                                http_status=200)
+                    # 其余（心跳等）继续读取下一行
+        except StopAsyncIteration:
+            pass
         if first_line is None:
             _mark_failure(route, "empty_stream", 200)
             await req_cm.__aexit__(None, None, None)
             await cm.__aexit__(None, None, None)
-            return None, route_info(route, "failed", error="empty_stream", http_status=200)
+            return None, route_info(route, "failed", error="empty_stream",
+                                    http_status=200)
         _mark_success(route)
         return (cm, req_cm, resp, ait, first_line), None
     except asyncio.CancelledError:

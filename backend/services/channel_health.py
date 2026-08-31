@@ -20,6 +20,7 @@ import logging
 from datetime import timedelta
 
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from apps.core.models import Channel
@@ -59,6 +60,7 @@ def record(channel: Channel | None, success: bool, http_status: int = 0,
 
     threshold = int(sysconfig.get("channel_cooldown_failures", channel) or 5)
     cooldown = int(sysconfig.get("channel_cooldown_seconds", channel) or 120)
+    now = timezone.now()
     with transaction.atomic():
         # SQLite 下 select_for_update 是空操作，read-modify-write 在并发下会
         # 丢计数（所有请求同时失败时最严重），改用原子 F() 递增再判定阈值。
@@ -66,12 +68,23 @@ def record(channel: Channel | None, success: bool, http_status: int = 0,
             consecutive_failures=F("consecutive_failures") + 1)
         ch = Channel.objects.get(pk=channel.pk)
         if ch.consecutive_failures >= threshold:
-            # 幂等设置冷却（已冷却不重复刷新，避免持续失败延长冷却窗口）
-            Channel.objects.filter(pk=channel.pk, cooldown_until__isnull=True).update(
-                cooldown_until=timezone.now() + timedelta(seconds=cooldown))
-            logger.warning("channel %s tripped circuit breaker (%d failures), "
-                           "cooldown %ds", ch.slug, ch.consecutive_failures, cooldown)
-            ch.refresh_from_db()  # cooldown 由上面 UPDATE 写入，重新读取同步给调用方
+            # 幂等设置冷却（已冷却不重复刷新，避免持续失败延长冷却窗口）。
+            # 关键：条件必须包含"冷却已过期"——只判 isnull 会让 cooldown_until
+            # 首次写入后永久非空，冷却过期后即便持续失败也无法再次熔断。
+            updated = Channel.objects.filter(
+                Q(pk=channel.pk) & (
+                    Q(cooldown_until__isnull=True) | Q(cooldown_until__lte=now))
+            ).update(cooldown_until=now + timedelta(seconds=cooldown))
+            if updated:
+                logger.warning("channel %s tripped circuit breaker (%d failures), "
+                               "cooldown %ds", ch.slug, ch.consecutive_failures,
+                               cooldown)
+                ch.refresh_from_db()  # 重新读取同步给调用方
+            elif ch.consecutive_failures % threshold == 0:
+                # 已在冷却窗口内且又累计了一轮失败：只提示，不延长冷却
+                logger.info("channel %s still failing during cooldown "
+                            "(%d consecutive failures), cooldown not extended",
+                            ch.slug, ch.consecutive_failures)
         # 同步传入对象，避免同进程内后续调度读到过期状态
         channel.consecutive_failures = ch.consecutive_failures
         channel.cooldown_until = ch.cooldown_until
