@@ -463,8 +463,9 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
     心跳与掐线（参考 new-api / sub-api / cliproxy 思路）：
     - stream_heartbeat_interval：上游静默时向客户端发 `: keep-alive` 心跳，
       防 NAT/负载均衡/客户端把连接误判为死，保持链路活性（流式保活）；
-    - stream_stall_timeout：上游连续无数据超过该时长才判定线路死亡——思考模型
-      会持续吐 reasoning token，正常"正在思考"绝不会被掐断；
+    - stream_probe_interval × stream_max_idle_probes：判死的"心跳机制"——
+      连续 N 个探测周期无任何数据（含思考 token）判定线路死亡，
+      思考模型持续吐 reasoning token 时不会被误掐；
     - stream_max_duration：整条流总时长兜底，防僵尸流；
     - 已向客户端交付正文后断流：绝不发 error 事件（会破坏 OpenAI SSE 解析，
       客户端报 "error decoding response body"），干净收尾 [DONE]；
@@ -476,9 +477,20 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
     sent_content = False
     done_sent = False
     last_exc: Exception | None = None
-    stall_timeout = float(sysconfig.get("stream_stall_timeout", channel) or 0)
+    # 判死：连续 stream_max_idle_probes 个 stream_probe_interval 周期无任何数据
+    # （含思考 token）视为"连续心跳失败"，总容忍 ≈ probe × count。
+    probe_interval = float(sysconfig.get("stream_probe_interval", channel) or 0)
+    max_idle_probes = int(sysconfig.get("stream_max_idle_probes", channel) or 0)
     heartbeat = float(sysconfig.get("stream_heartbeat_interval", channel) or 0)
     max_duration = float(sysconfig.get("stream_max_duration", channel) or 0)
+    # 被静默/断流掐断的死线路（Key_id, proxy_id）集合：重试时排除，
+    # 避免下一轮竞速又抽到同一假死线路（代理池质量差时尤其关键）。
+    excluded: set[tuple[int, int | None]] = set()
+    # 被判定死亡的坏代理集合：组合排除会被"同一代理换一把 Key"绕过，
+    # 代理才是坏源大头，因此被掐断/竞速失败的线路的代理也一并即时排除。
+    excluded_proxies: set[int] = set()
+    # 每轮尝试的竞速明细累积展示（用户可在日志页看到发生过几次换线重试）。
+    all_reports: list[dict] = []
 
     # 一次请求只能记一次成败。竞速胜出时并不代表请求成功：流式中途断流仍会
     # 走到失败分支，若两处各自 record_result，会出现 success/failed 各 +1 而
@@ -495,7 +507,8 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
     try:
         for attempt in range(max_attempts):
             rs = routes if attempt == 0 else build_routes(
-                channel, proxy_group=proxy_group, endpoint=endpoint)
+                channel, proxy_group=proxy_group, endpoint=endpoint,
+                exclude=excluded or None, exclude_proxies=excluded_proxies or None)
             if not rs:
                 last_exc = NoRouteAvailable()
                 continue
@@ -511,14 +524,16 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                 log.status = "success"
                 log.http_status = 200
                 # 首字 = 首个正文（content/tool_calls）到达时间，非首个思考 chunk
-                log.routes = w.report or []
+                all_reports.extend(w.report or [])
+                log.routes = all_reports
                 log.save()
                 # 注意：此处不结算成功。竞速胜出 ≠ 请求成功，流式中途断流仍会
                 # 计入失败；成功统一在流正常结束后由 settle(True) 结算。
                 usage: dict = {}
                 completion_text: list[str] = []
                 try:
-                    async for chunk in _drain(w, stall_timeout, heartbeat, max_duration):
+                    async for chunk in _drain(w, probe_interval, max_idle_probes,
+                                      heartbeat, max_duration):
                         if _chunk_has_content(chunk):
                             if not sent_content:
                                 log.first_token_ms = round(
@@ -573,7 +588,24 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                 return
             except (NoRouteAvailable, AllRoutesFailed) as exc:
                 # 竞速阶段全部失败（连接/超时/401/403/429/5xx/无效响应等）：
-                # 重建线路重新竞速（重试线路竞速）。
+                # 重建线路重新竞速（重试线路竞速）。失败线路（及其代理）即时
+                # 纳入排除，避免重试原样再打同一批已失败的线路。
+                if isinstance(exc, AllRoutesFailed):
+                    comb_by_name = {
+                        r.name: (getattr(r.key, "id", None),
+                                 getattr(r.proxy, "id", None)
+                                 if r.proxy is not None else None)
+                        for r in rs
+                    }
+                    for item in (exc.report or []):
+                        if item.get("status") != "failed":
+                            continue
+                        comb = comb_by_name.get(item.get("name"))
+                        if comb is None:
+                            continue
+                        excluded.add(comb)
+                        if comb[1] is not None:
+                            excluded_proxies.add(comb[1])
                 last_exc = exc
                 logger.info("stream attempt %d failed, retrying: %s",
                             attempt + 1, exc)
@@ -596,13 +628,24 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                         yield "data: [DONE]\n\n"
                     return
                 # 未交付任何内容：视为线路失败，重建线路重试。
-                if (w is not None and w.route is not None
-                        and w.route.proxy is not None):
+                if w is not None and w.route is not None:
                     try:
                         from services.proxy_service import report_proxy_result
-                        report_proxy_result(w.route.proxy.id, False)
+                        if w.route.proxy is not None:
+                            report_proxy_result(w.route.proxy.id, False)
                     except Exception:  # noqa: BLE001
                         pass
+                    # 被静默/断流掐断的死线路（Key+代理组合）加入排除集合，
+                    # 下一轮竞速不再抽到同一组合，避免立刻又打到死线路。
+                    # （getattr 兼容测试用 SimpleNamespace mock）
+                    excluded.add((getattr(w.route.key, "id", None),
+                                  getattr(w.route.proxy, "id", None)
+                                  if w.route.proxy is not None else None))
+                    # 组合排除会被"同一坏代理换一把 Key"绕过：代理才是坏源大头，
+                    # 掐断线路的代理也一并即时排除（代理池质量差时尤为关键）。
+                    if (w.route.proxy is not None
+                            and getattr(w.route.proxy, "id", None) is not None):
+                        excluded_proxies.add(w.route.proxy.id)
                 last_exc = exc
                 logger.info("stream attempt %d failed before any content, retrying: %s",
                             attempt + 1, exc)
@@ -615,12 +658,13 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
         # 所有尝试均失败：竞速失败重建线路也无济于事，直接回上游错误
         if isinstance(last_exc, TimeoutError):
             _finish_log(holder["log"], holder["started"], False, 504,
-                        "stream_idle_timeout")
+                        "stream_idle_timeout", routes=all_reports or None)
             settle(False)
             yield "data: " + json.dumps({
-                "error": {"message": "上游数据停滞（"
-                          f"{round(stall_timeout or 0)} 秒未收到任何数据），已中断。"
-                          "可尝试调大 stream_stall_timeout",
+                "error": {"message": "上游连续无响应（"
+                          f"{int(max_idle_probes or 0)}×{round(probe_interval or 0, 1)} 秒"
+                          "未收到任何数据），已判定线路死亡。可调大 stream_probe_interval"
+                          " / stream_max_idle_probes",
                           "type": "api_error", "param": None, "code": "stream_error"}
             }) + "\n\n"
         elif isinstance(last_exc, NoRouteAvailable):
@@ -633,7 +677,7 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
         else:
             report = getattr(last_exc, "report", None)
             _finish_log(holder["log"], holder["started"], False, 502,
-                        "stream_error", routes=report)
+                        "stream_error", routes=all_reports or report or None)
             settle(False)
             yield "data: " + json.dumps({
                 "error": {"message": "上游服务暂时不可用，请稍后重试", "type": "api_error",
@@ -669,21 +713,25 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
         _bump_active(-1)
 
 
-async def _drain(winner, stall_timeout: float = 0, heartbeat: float = 0,
-                 max_duration: float = 0):
-    """逐块转发上游 SSE：心跳保活 + 停滞(stall)掐线 + 总时长兜底。
+async def _drain(winner, probe_interval: float = 0, max_idle_probes: int = 0,
+                 heartbeat: float = 0, max_duration: float = 0):
+    """逐块转发上游 SSE：心跳保活 + 连续"心跳探测"失败判死 + 总时长兜底。
 
     - `heartbeat` > 0：上游静默超过该秒数时向客户端发送 SSE 注释心跳
       `: keep-alive`，证明平台↔客户端的连接仍然活着（NAT / 负载均衡 /
       客户端读超时不会误杀），实现"流式保活"；
-    - `stall_timeout` > 0：上游连续无任何数据（含思考 token）超过该秒数，
-      判定线路死亡并抛 TimeoutError。思考模型会持续吐 reasoning token，
-      正常"正在思考"不会触发；
+    - `probe_interval` / `max_idle_probes`：**判死的心跳机制**。SSE 是 HTTP 单向流，
+      没有 WebSocket 那种应用层 Pong 帧，平台无法向上游"发心跳等响应"；此处取其
+      在 HTTP 上的等价形式：上游在单个探测周期内没有任何字节（含思考 token）即
+      视为一次"心跳失败"，**连续 max_idle_probes 次失败**（总时长 ≈ probe_interval
+      × max_idle_probes）才判定连接真死——对应参考项目"连续 N 次 Pong 超时"的判死
+      逻辑，避免网络抖动一次误杀。任何数据（含 token 流）到达即清零重计：
+      生成慢但连接活着绝不误杀，"无 token 判死"与"心跳判死"互相辅助；
     - `max_duration` > 0：整条流超过该秒数强制收尾（僵尸流兜底）。
 
     实现要点：上游读取使用**常驻 read_task**，心跳期间不取消这个 pending read
     （asyncio.wait_for 会在超时瞬间取消底层读取，导致真实流被误杀）。因此
-    心跳/停滞只是"观察"read_task 是否完成，而永不打断它。
+    心跳/探测只是"观察"read_task 是否完成，而永不打断它。
 
     其余任何异常（连接被切断 / 解码失败等）原样上抛，由上层决定重试或收尾。
     """
@@ -711,12 +759,11 @@ async def _drain(winner, stall_timeout: float = 0, heartbeat: float = 0,
             else:
                 remaining = 0.0
 
-            # 本轮等待间隔：心跳节拍（若有）或停滞检测间隔（若无心跳）
+            # 本轮等待间隔 = 心跳节拍与探测节拍中较细的一个（有数据/心跳交错的粒度）
             interval = 0.0
-            if heartbeat and heartbeat > 0:
-                interval = heartbeat
-            elif stall_timeout and stall_timeout > 0:
-                interval = stall_timeout
+            for tick in (heartbeat, probe_interval):
+                if tick and tick > 0:
+                    interval = min(interval, tick) if interval > 0 else tick
             if remaining > 0:
                 interval = min(interval, remaining) if interval > 0 else remaining
 
@@ -730,15 +777,18 @@ async def _drain(winner, stall_timeout: float = 0, heartbeat: float = 0,
                 chunk = read_task.result()  # 异常（断流/解码失败）原样上抛
                 if chunk is None:
                     break
-                last_data = _time.monotonic()
+                last_data = _time.monotonic()  # 任何数据到达：心跳探测计数清零
                 read_task = None
                 yield chunk
             else:
-                # 静默期：先判"真死"（停滞超阈），再发心跳保活
-                if stall_timeout and stall_timeout > 0 and (
-                        _time.monotonic() - last_data) >= stall_timeout:
-                    raise TimeoutError(
-                        f"stream stalled {stall_timeout}s (no data)")
+                # 静默期：推进"心跳失败"计数，达到连续失败上限才判真死；期间发客户端保活
+                if probe_interval and probe_interval > 0 and max_idle_probes and max_idle_probes > 0:
+                    elapsed = _time.monotonic() - last_data
+                    misses = int(elapsed // probe_interval)
+                    if misses >= max_idle_probes:
+                        raise TimeoutError(
+                            "upstream unresponsive: no bytes for "
+                            f"{round(elapsed, 1)}s (> {max_idle_probes}×{probe_interval}s)")
                 if heartbeat and heartbeat > 0:
                     yield ": keep-alive\n\n"
     finally:

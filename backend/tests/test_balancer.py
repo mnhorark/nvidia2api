@@ -92,6 +92,20 @@ class BalancerTests(TestCase):
         self.assertEqual(len(routes2), len(routes) - 1)
         self.assertFalse(any(r.proxy is None for r in routes2))
 
+    def test_exclude_proxies_skips_bad_proxy(self):
+        """代理级排除：坏代理整个停用——即使换一把 Key 也不会再打回同一代理。"""
+        # 3 keys -> 最多启用 2 个代理
+        keys, proxies = self._setup(3, 3)
+        for p in proxies[:2]:
+            ok, _ = proxy_service.set_enabled(p, True)
+            self.assertTrue(ok)
+        routes = build_routes(self.channel)
+        self.assertEqual(len(routes), 3)  # 2 proxies + 1 direct
+        bad_proxy = next(r.proxy for r in routes if r.proxy)
+        routes2 = build_routes(self.channel, exclude_proxies={bad_proxy.id})
+        self.assertEqual(len(routes2), 2)  # 剩 1 proxy + 1 direct
+        self.assertFalse(any(r.proxy and r.proxy.id == bad_proxy.id for r in routes2))
+
     def test_routes_are_channel_scoped(self):
         other = Channel.objects.create(name="Zen", slug="zen",
                                        base_url="https://opencode.ai/zen/v1")

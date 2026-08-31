@@ -41,13 +41,20 @@ class Route:
 def build_routes(channel: Channel | None = None,
                  max_routes: int | None = None,
                  proxy_group: int | None = None,
-                 endpoint: str | None = None) -> list[Route]:
+                 endpoint: str | None = None,
+                 exclude: set | None = None,
+                 exclude_proxies: set | None = None) -> list[Route]:
     """Build race routes for a channel.
 
     Route count = min(启用代理数 + 1 直连, 可用 Key 数, max_routes_per_request)。
     每个代理占一条线路，再加上恰好 1 条直连；每条线路分配不同的 Key。
     `proxy_group` 非空时，仅使用该分组内的代理。
     `endpoint` 非空时，作为模型级端点覆盖写入每条线路（完整 URL 或相对路径）。
+    `exclude`：{(key_id, proxy_id|None)} 集合，跳过这些"Key+代理"组合——
+    用于重试时排除上一轮被判定静止的线路，避免立刻又抽到同一死线路。
+    `exclude_proxies`：{proxy_id} 集合，**整个代理**本轮不使用。组合级排除会被
+    "同一坏代理换一把 Key"绕过，代理才是坏源大头（代理池质量差场景尤为关键），
+    因此被静默掐断/竞速失败的线路，其代理也一并即时排除。
     """
     if channel is None:
         channel = channel_service.default_channel()
@@ -72,6 +79,15 @@ def build_routes(channel: Channel | None = None,
         if not key_service.claim_rpm_slot(key.id):
             continue
         proxy = next(proxy_iter, None)
+        if (exclude_proxies and proxy is not None
+                and getattr(proxy, "id", None) in exclude_proxies):
+            # 本轮已知坏代理：直接停用（即使换了 Key 也不打回同一代理）
+            continue
+        if exclude and (key.id, proxy.id if proxy else None) in exclude:
+            # 上一轮被判定死亡（静默掐断）的 Key+代理组合：本轮不参与竞速。
+            # 直连（proxy=None）也可被排除：被掐线路就是 winner，其 Key 被盗用
+            # 概率低，但组合级排除能同时换掉"Key 或代理"任一嫌疑。
+            continue
         routes.append(Route(kind="proxy" if proxy else "direct", key=key,
                             proxy=proxy, url_override=endpoint or None))
 

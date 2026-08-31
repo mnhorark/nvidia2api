@@ -258,11 +258,11 @@ class DrainFirstContentTimeoutTests(unittest.IsolatedAsyncioTestCase):
         from api.openai_views import _drain
         winner = self._winner(lambda: _never_ends())
         with self.assertRaises(TimeoutError):
-            async for _ in _drain(winner, stall_timeout=0.05):
+            async for _ in _drain(winner, probe_interval=0.03, max_idle_probes=2):
                 pass
 
     async def test_reasoning_flow_does_not_timeout(self):
-        """思考 token 持续流动即证明线路没死：即使总时长超过停滞阈值也不掐断。"""
+        """思考 token 持续流动即证明线路没死：即使总时长超过判死阈值也不掐断。"""
         import asyncio
         from api.openai_views import _drain
 
@@ -274,14 +274,36 @@ class DrainFirstContentTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
         winner = self._winner(stream)
         got = 0
-        async for _ in _drain(winner, stall_timeout=0.05):
+        async for _ in _drain(winner, probe_interval=0.03, max_idle_probes=2):
             got += 1
-        # 总耗时 0.15s > 停滞阈值 0.05s：若按"无内容即掐断"早该被掐断，但思考 token
-        # 一直在流动，必须完整走完
+        # 总耗时 0.15s > 判死阈值 0.06s：若按"连续无数据"早该被掐断，但思考 token
+        # 一直在流动（任一数据即清零重计），必须完整走完
         self.assertGreaterEqual(got, 5)
 
+    async def test_idle_count_resets_after_any_data(self):
+        """连续探测判死的容错核心：中途任何数据到达即清零失败计数——
+        生成慢但连接活（如两段思考之间）绝不被连续失败计数误杀。"""
+        import asyncio
+        from api.openai_views import _drain
+
+        async def stream():
+            yield ('data: {"choices":[{"index":0,"delta":{"content":"a"},'
+                   '"finish_reason":null}]}\n\n')
+            await asyncio.sleep(0.04)  # > probe(0.03)：计 1 次"心跳失败"
+            yield ('data: {"choices":[{"index":0,"delta":{"content":"b"},'
+                   '"finish_reason":null}]}\n\n')  # 数据到达 → 清零
+            await asyncio.sleep(0.04)  # 再静默一轮；若不清零累计 0.08>0.06 会误判
+            yield ('data: {"choices":[{"index":0,"delta":{"content":"c"},'
+                   '"finish_reason":null}]}\n\n')
+
+        winner = self._winner(stream)
+        got = []
+        async for chunk in _drain(winner, probe_interval=0.03, max_idle_probes=2):
+            got.append(chunk)
+        self.assertEqual(len(got), 3)
+
     async def test_heartbeat_emitted_during_silence(self):
-        """上游静默但未达停滞阈值时，向客户端周期性发 `: keep-alive` 心跳（流式保活）。"""
+        """上游静默但未达判死阈值时，向客户端周期性发 `: keep-alive` 心跳（流式保活）。"""
         import asyncio
         from api.openai_views import _drain
 
@@ -294,9 +316,9 @@ class DrainFirstContentTimeoutTests(unittest.IsolatedAsyncioTestCase):
         winner = self._winner(stream)
         got_beat = 0
         try:
-            async for chunk in _drain(winner, stall_timeout=0.5, heartbeat=0.03,
-                                      max_duration=0.15):
-                # max_duration 0.15s 内应至少收到 2 次心跳，未触发停滞（0.5s）
+            async for chunk in _drain(winner, probe_interval=1.0, max_idle_probes=3,
+                                      heartbeat=0.03, max_duration=0.15):
+                # max_duration 0.15s 内应至少收到 2 次心跳，未触发判死（1.0s×3）
                 if chunk.startswith(":"):
                     got_beat += 1
         except TimeoutError:
@@ -310,12 +332,12 @@ class DrainFirstContentTimeoutTests(unittest.IsolatedAsyncioTestCase):
                    '"finish_reason":null}]}\n\n')
         winner = self._winner(stream)
         out = []
-        async for chunk in _drain(winner, stall_timeout=0.05):
+        async for chunk in _drain(winner, probe_interval=0.05, max_idle_probes=2):
             out.append(chunk)
         self.assertIn("hi", out[0])
 
     async def test_zero_timeout_no_stall_limit(self):
-        """0 = 不限制：慢速（但有数据）的流不应被停滞超时打断。"""
+        """0 = 不限制：慢速（但有数据）的流不应被探测判死打断。"""
         import asyncio
         from api.openai_views import _drain
         async def stream():
@@ -324,7 +346,7 @@ class DrainFirstContentTimeoutTests(unittest.IsolatedAsyncioTestCase):
                    '"finish_reason":null}]}\n\n')
         winner = self._winner(stream)
         out = []
-        async for chunk in _drain(winner, stall_timeout=0):
+        async for chunk in _drain(winner, probe_interval=0, max_idle_probes=0):
             out.append(chunk)
         self.assertIn("x", out[0])
 

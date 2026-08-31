@@ -1357,7 +1357,8 @@ class AdminChatView(AdminRequiredMixin, APIView):
         心跳与掐线（参考 new-api / sub-api / cliproxy 思路）：
         - stream_heartbeat_interval：上游静默时向客户端发 `: keep-alive` 心跳，
           防 NAT/负载均衡/客户端把连接误判为死，链路保活；
-        - stream_stall_timeout：上游连续无数据超过该时长才判定线路死亡——
+        - stream_probe_interval × stream_max_idle_probes：判死的"心跳机制"——
+          连续 N 个探测周期无任何数据（含思考 token），判定线路死亡；
           思考模型会持续吐 reasoning token，正常"正在思考"不会被掐断；
         - 已向客户端交付正文后断流：绝不发 error 事件（否则客户端 SSE 解析报
           "error decoding response body"），干净收尾 [DONE]。
@@ -1392,7 +1393,8 @@ class AdminChatView(AdminRequiredMixin, APIView):
 
         import time as _time
         started = _time.monotonic()
-        stall_timeout = float(sysconfig.get("stream_stall_timeout", channel) or 0)
+        probe_interval = float(sysconfig.get("stream_probe_interval", channel) or 0)
+        max_idle_probes = int(sysconfig.get("stream_max_idle_probes", channel) or 0)
         heartbeat = float(sysconfig.get("stream_heartbeat_interval", channel) or 0)
         max_duration = float(sysconfig.get("stream_max_duration", channel) or 0)
 
@@ -1428,8 +1430,8 @@ class AdminChatView(AdminRequiredMixin, APIView):
                 stream_ok = False
                 done_sent = False
                 try:
-                    async for chunk in _drain(winner, stall_timeout, heartbeat,
-                                              max_duration):
+                    async for chunk in _drain(winner, probe_interval, max_idle_probes, heartbeat,
+                                      max_duration):
                         # 首字 = 首个正文（content/tool_calls）到达时间，非首个思考 chunk
                         if _chunk_has_content(chunk):
                             if not sent_content:
@@ -1513,8 +1515,10 @@ class AdminChatView(AdminRequiredMixin, APIView):
                 log.duration_ms = round((_time.monotonic() - started) * 1000, 1)
                 log.save()
                 if is_stall:
-                    msg = (f"上游数据停滞（{round(stall_timeout or 0)} 秒未收到任何数据），"
-                           "已中断。可尝试调大 stream_stall_timeout")
+                    msg = ("上游连续无响应（"
+                           f"{int(max_idle_probes or 0)}×{round(probe_interval or 0, 1)} 秒"
+                           "未收到任何数据），已判定线路死亡。可调大 stream_probe_interval"
+                           " / stream_max_idle_probes")
                 else:
                     msg = f"stream error: {exc}"
                 yield "data: " + json.dumps({

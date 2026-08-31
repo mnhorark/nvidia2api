@@ -23,32 +23,40 @@ RUNTIME_PARAMS: dict[str, tuple[str, object, str, str]] = {
                              "渠道 Key 默认每分钟请求数（RPM）", "request"),
     "max_routes_per_request": ("int", lambda: settings.MAX_ROUTES_PER_REQUEST,
                                "单次请求最大并行线路数（1 直连 + N 代理，受可用 Key 数约束）", "request"),
-    "retry_count": ("int", 1,
-                    "竞速全部线路失败后的自动重试次数（上限 5，0=不重试）。"
-                    "竞速架构下全线路失败已属小概率，默认 1 次重试换取一次换线机会，成本极低", "request"),
+    "retry_count": ("int", 2,
+                    "竞速全部线路失败、或胜出线路被静默掐断后的自动重试次数（上限 5，0=不重试）。"
+                    "配合短静默阈值：假死线路快速掐断后多换几次线路；竞速已并行全部线路，"
+                    "重试主要兜底瞬时故障与换掉假死线路", "request"),
     "proxy_timeout": ("float", lambda: settings.PROXY_TIMEOUT,
                       "代理测速超时（秒）", "health"),
     "upstream_connect_timeout": ("float", lambda: settings.UPSTREAM_CONNECT_TIMEOUT,
                                  "上游连接超时（秒），覆盖连接阶段（DNS/建连/代理握手）", "timeout"),
     "upstream_read_timeout": ("float", lambda: settings.UPSTREAM_READ_TIMEOUT,
                               "非流式请求的上游读超时（秒），也是该线路请求的总读预算", "timeout"),
-    "stream_first_byte_timeout": ("float", 60,
+    "stream_first_byte_timeout": ("float", 90,
                                   "流式竞速：连接成功后等待首个有效 SSE 块的最长超时（秒）。"
-                                  "超时视为该线路死线（可换线重试）；0=不限制", "timeout"),
-    "stream_heartbeat_interval": ("float", 15,
+                                  "竞速是并行的，等待窗口稍大只会让慢速首块模型多一次机会，"
+                                  "不浪费其它线路；超时仍视为该线路死线（可换线重试）；0=不限制", "timeout"),
+    "stream_heartbeat_interval": ("float", 20,
                                   "流式请求：上游静默超过该时长时向客户端发送 SSE 心跳（: keep-alive），"
                                   "防止 NAT/负载均衡/客户端把连接误判为死；0=关闭", "stream"),
-    "stream_stall_timeout": ("float", 300,
-                             "流式请求：竞速胜出后上游连续无任何数据的最长时长（秒）。"
-                             "思考模型会持续吐 reasoning token，正常思考不会被误掐；"
-                             "超过则判定线路死亡：未交付正文可重建线路重试，已交付正文则干净收尾 [DONE]；"
-                             "0=不掐断（只发心跳）", "stream"),
+    "stream_probe_interval": ("float", 30,
+                              "流式请求：判死的「心跳探测」周期（秒），等价 WebSocket 的 Pong 超时。"
+                              "SSE 是 HTTP 单向流，无应用层 Pong 帧，因此以「单个周期内无任何字节」"
+                              "视为一次心跳失败；配合 stream_max_idle_probes 连续失败才判死。"
+                              "任何数据（含思考 token）到达即清零重计，生成慢不会误杀。"
+                              "节点质量差/长静默思考场景建议 30s 起步，25×30~90s 总容忍", "stream"),
+    "stream_max_idle_probes": ("int", 3,
+                               "流式请求：连续多少次心跳探测失败（约 interval×count 秒无任何数据）"
+                               "判定线路真死。默认 30s×3≈90s；想更快踢坏节点可 20s×2≈40s。"
+                               "未交付正文则换线重试，已交付正文则干净收尾", "stream"),
     "stream_max_duration": ("float", 0,
                             "流式请求总时长上限（秒），兜底防僵尸流；0=不限制", "stream"),
     "proxy_failure_cooldown_seconds": ("int", 60,
                                        "代理连续失败后的冷却时间（秒）", "health"),
-    "proxy_unhealthy_threshold": ("int", 3,
-                                  "代理连续失败多少次后标记为 unhealthy", "health"),
+    "proxy_unhealthy_threshold": ("int", 5,
+                                  "代理连续失败多少次后标记为 unhealthy（代理池质量差时放宽，"
+                                  "避免间歇性失败过快耗尽可用代理）", "health"),
     "key_cooldown_seconds": ("int", 60,
                              "渠道 Key 失败后冷却时间（秒）", "health"),
     "channel_cooldown_failures": ("int", 5,

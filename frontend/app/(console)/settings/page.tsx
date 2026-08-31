@@ -40,12 +40,26 @@ export default function SettingsPage() {
   async function save() {
     setSaving(true);
     try {
-      const settings: Record<string, string | number> = {};
+      const settings: Record<string, string | number | null> = {};
       for (const p of params) {
-        const raw = (draft[p.key] ?? String(p.value)).trim();
+        const cur = String(p.value);
+        const raw = (draft[p.key] ?? cur).trim();
+        // 未修改且从未覆盖过：不提交。避免把"当前默认值"固化成覆盖行，
+        // 导致日后调整代码默认值时旧值继续压着（如 stream_stall_timeout
+        // → stream_probe_interval×max_idle_probes 的演进曾被固化值卡住）。
+        if (raw === cur && !p.overridden) continue;
+        // 改回默认值（或数字类型留空）→ 提交 null，由后端清除覆盖、回落后端默认
+        if (raw === String(p.default)) {
+          settings[p.key] = null;
+          continue;
+        }
         if (p.type === "int" || p.type === "float") {
+          if (raw === "") {
+            settings[p.key] = null;
+            continue;
+          }
           const n = Number(raw);
-          if (raw === "" || Number.isNaN(n)) {
+          if (Number.isNaN(n)) {
             toast.error(`参数 ${p.key} 需要合法的数字`);
             setSaving(false);
             return;

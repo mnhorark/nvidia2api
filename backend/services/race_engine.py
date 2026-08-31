@@ -145,7 +145,8 @@ def _client_kwargs(route: Route, stream: bool) -> dict:
     if stream:
         # 流式请求不设每读超时（read=None）：思考模型可能合法停顿数十秒~数分钟，
         # 固定读超时会在中途掐断（客户端报 "error decoding response body"）。
-        # 死线路统一由应用层 stream_stall_timeout 检测（见 openai_views._drain）。
+        # 死线路统一由应用层 stream_probe_interval × stream_max_idle_probes
+        # （连续心跳探测失败，见 openai_views._drain）负责。
         read = None
     kwargs: dict[str, Any] = {
         "timeout": httpx.Timeout(
