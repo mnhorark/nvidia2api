@@ -6,7 +6,11 @@ export const CHANNEL_KEY = "nvidia2api_channel";
 
 export function getToken(): string | null {
   if (typeof window === "undefined") return null;
-  return localStorage.getItem(TOKEN_KEY);
+  const v = localStorage.getItem(TOKEN_KEY);
+  // 历史 bug 的残留防御：异常响应曾把字面量 "undefined" / "null" 写进
+  // localStorage，导致"看起来已登录"却每次请求都 401。当成未登录处理。
+  if (!v || v === "undefined" || v === "null") return null;
+  return v;
 }
 
 /** 当前选中的渠道 slug；切换渠道后所有管理接口自动带上 X-Channel */
@@ -149,6 +153,7 @@ export interface Channel {
   default_rpm: number;
   allow_duplicate_keys: boolean;
   disable_key_invalid: boolean;
+  disable_proxy_unhealthy: boolean;
   enabled: boolean;
   is_default: boolean;
   notes: string;
@@ -318,50 +323,58 @@ export interface RuntimeParam {
   value: number | string;
   default: number | string;
   description: string;
+  group: string;
   overridden: boolean;
 }
 
+/**
+ * 用量统计字段统一标为可空。
+ *
+ * 后端用 `Sum()`/`Count()` 聚合，空区间会返回 null；把这些类型写成非空
+ * `number` 会让 TS 误以为可以安全调用 `.toFixed()` / `.toLocaleString()`，
+ * 运行时却在渲染期抛错、整页白屏。标成可空后，类型系统会强制调用方兜底。
+ */
 export interface TokenUsageDay {
   date: string;
-  prompt_tokens: number;
-  completion_tokens: number;
-  cached_tokens: number;
-  total_tokens: number;
-  requests: number;
-  success: number;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  cached_tokens: number | null;
+  total_tokens: number | null;
+  requests: number | null;
+  success: number | null;
 }
 
 export interface UsageTotals {
-  requests: number;
-  success: number;
-  success_rate: number;
-  prompt_tokens: number;
-  completion_tokens: number;
-  cached_tokens: number;
-  total_tokens: number;
+  requests: number | null;
+  success: number | null;
+  success_rate: number | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  cached_tokens: number | null;
+  total_tokens: number | null;
   avg_latency_s: number | null;
   avg_ttft_ms: number | null;
-  cache_hit_rate: number;
+  cache_hit_rate: number | null;
 }
 
 export interface UsageTotalsPrev {
-  requests: number;
-  total_tokens: number;
-  success_rate: number;
+  requests: number | null;
+  total_tokens: number | null;
+  success_rate: number | null;
 }
 
 export interface ChannelUsage {
   name: string;
-  requests: number;
-  total_tokens: number;
+  requests: number | null;
+  total_tokens: number | null;
 }
 
 export interface ModelUsage {
   model: string;
-  requests: number;
-  success: number;
-  success_rate: number;
-  total_tokens: number;
+  requests: number | null;
+  success: number | null;
+  success_rate: number | null;
+  total_tokens: number | null;
   avg_latency_s: number | null;
 }
 

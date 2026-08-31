@@ -19,11 +19,18 @@ export default function LoginPage() {
     setError("");
     setLoading(true);
     try {
-      const res = await api.post<{ token: string }>("/api/admin/login", {
+      const res = await api.post<{ token?: unknown }>("/api/admin/login", {
         username,
         password,
       });
-      setToken(res.token);
+      // 必须校验：后端若异常返回 200 但无 token，过去会把 "undefined" 写进
+      // localStorage —— 控制台认为"已登录"却永远 401，跳转回登录页形成死循环。
+      const token = typeof res?.token === "string" ? res.token.trim() : "";
+      if (!token) {
+        setError("登录失败：服务端未返回有效的访问令牌");
+        return;
+      }
+      setToken(token);
       router.replace("/dashboard");
     } catch (err) {
       setError(err instanceof Error ? err.message : "登录失败");

@@ -3,7 +3,7 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, RefreshCw, Search } from "lucide-react";
 import { api, RequestLog } from "@/lib/api";
-import { useLocalStorage } from "@/lib/use-local-storage";
+import { readStoredValue, useLocalStorage } from "@/lib/use-local-storage";
 import {
   Badge,
   Button,
@@ -22,11 +22,11 @@ import { toast } from "@/components/toaster";
 export default function RequestLogsPage() {
   const [logs, setLogs] = useState<RequestLog[]>([]);
   const [modelInput, setModelInput] = useLocalStorage("requestLogsModelFilter", ""); // 输入框即时值
+  // 300ms 防抖后真正参与查询的值。
+  // 必须用 readStoredValue 解析：直接 getItem 会拿到带引号的 JSON 串，首查带脏值。
   const [model, setModel] = useState(() =>
-    typeof window === "undefined"
-      ? ""
-      : (window.localStorage.getItem("requestLogsModelFilter") ?? "")
-  ); // 300ms 防抖后真正参与查询的值
+    readStoredValue<string>("requestLogsModelFilter", "")
+  );
   const [status, setStatus] = useLocalStorage("requestLogsStatusFilter", "");
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -185,6 +185,7 @@ export default function RequestLogsPage() {
 
       <DataTable
         loading={loading}
+        fill
         empty="暂无日志"
         head={
           <>
@@ -214,13 +215,20 @@ export default function RequestLogsPage() {
                 </Td>
                 <Td className="font-mono text-xs text-mute">{l.request_id}</Td>
                 <Td className="text-xs text-faint">{fmtTime(l.created_at)}</Td>
-                <Td className="max-w-[220px] truncate font-mono text-xs text-gray-300" title={l.model}>
-                  {l.model}
+                <Td className="max-w-[180px]">
+                  <div className="truncate font-mono text-xs text-gray-300" title={l.model}>
+                    {l.model}
+                  </div>
                 </Td>
                 <Td className="tabular-nums">{fmtLatency(l.duration_ms)}</Td>
                 <Td className="tabular-nums">{l.first_token_ms != null ? fmtLatency(l.first_token_ms) : "—"}</Td>
-                <Td className="text-xs text-mute">
-                  <span className="font-mono">{l.winner_proxy_name || l.winner_key_name ? `${l.winner_proxy_name || "直连"} + ${l.winner_key_name}` : "—"}</span>
+                <Td className="max-w-[240px] text-xs text-mute">
+                  <div
+                    className="truncate"
+                    title={l.winner_proxy_name || l.winner_key_name ? `${l.winner_proxy_name || "直连"} + ${l.winner_key_name}` : undefined}
+                  >
+                    <span className="font-mono">{l.winner_proxy_name || l.winner_key_name ? `${l.winner_proxy_name || "直连"} + ${l.winner_key_name}` : "—"}</span>
+                  </div>
                 </Td>
                 <Td className="text-xs text-faint">{l.is_stream ? "是" : "否"}</Td>
                 <Td>

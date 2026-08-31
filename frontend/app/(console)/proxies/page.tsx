@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Gauge, Globe, Pencil, Plus, RefreshCw, Search, Trash2, Upload } from "lucide-react";
 import { api, asList, ChannelKey, Proxy, ProxyGroup } from "@/lib/api";
+import { useSubmitGuard } from "@/lib/use-submit-guard";
 import {
   Badge,
   BatchBar,
@@ -31,12 +32,17 @@ export default function ProxiesPage() {
   const [enabledCount, setEnabledCount] = useState(0);
   // 代理启用上限：以接口返回的 max_enabled_proxies 为准（= 非禁用 Key 数 - 1）
   const [maxAllowed, setMaxAllowed] = useState(0);
+  // 当前渠道"关闭代理异常标记"开关（存渠道级配置，持久化到后端）
+  const [channelId, setChannelId] = useState<number | null>(null);
+  const [cancelUnhealthy, setCancelUnhealthy] = useState(false);
+  const [flagBusy, setFlagBusy] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState("");
   const [editItem, setEditItem] = useState<Partial<Proxy> | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
+  const [saving, submit] = useSubmitGuard();
   const [testingAll, setTestingAll] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
@@ -52,7 +58,7 @@ export default function ProxiesPage() {
     setError("");
     try {
       const [p, g, k] = await Promise.all([
-        api.get<{ results: Proxy[]; summary?: { max_enabled_proxies?: number } }>("/api/admin/proxies"),
+        api.get<{ results: Proxy[]; summary?: { max_enabled_proxies?: number; channel_id?: number; disable_proxy_unhealthy?: boolean } }>("/api/admin/proxies"),
         api.get("/api/admin/proxy-groups"),
         api.get("/api/admin/keys"),
       ]);
@@ -64,6 +70,8 @@ export default function ProxiesPage() {
       setGroups(asList<ProxyGroup>(g));
       setKeyCount(keyList.length);
       setMaxAllowed(Math.max(p.summary?.max_enabled_proxies ?? keyList.length - 1, 0));
+      setChannelId(p.summary?.channel_id ?? null);
+      setCancelUnhealthy(p.summary?.disable_proxy_unhealthy ?? false);
     } catch (e) {
       setError(e instanceof Error ? e.message : "加载失败");
     } finally {
@@ -121,6 +129,21 @@ export default function ProxiesPage() {
       toast.error(e instanceof Error ? e.message : "测速失败");
     } finally {
       setTestingAll(false);
+    }
+  }
+
+  async function toggleCancelUnhealthy(v: boolean) {
+    if (!channelId) return;
+    setFlagBusy(true);
+    try {
+      // 渠道级配置持久化；开启时后端会顺带恢复存量"异常/冷却"代理
+      await api.patch(`/api/admin/channels/${channelId}`, { disable_proxy_unhealthy: v });
+      toast.success(v ? "已开启：代理连续失败不标异常、不踢出池" : "已关闭：代理恢复异常标记");
+      await load();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "操作失败");
+    } finally {
+      setFlagBusy(false);
     }
   }
 
@@ -281,21 +304,23 @@ export default function ProxiesPage() {
   async function save(e: React.FormEvent) {
     e.preventDefault();
     if (!editItem) return;
-    try {
-      const body: Record<string, unknown> = {
-        name: editItem.name,
-        protocol: editItem.protocol,
-        host: editItem.host,
-        port: editItem.port,
-        group: editItem.group ?? null,
-      };
-      if (editItem.id) await api.patch(`/api/admin/proxies/${editItem.id}`, body);
-      else await api.post("/api/admin/proxies", body);
-      setEditItem(null);
-      load();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "保存失败");
-    }
+    await submit(async () => {
+      try {
+        const body: Record<string, unknown> = {
+          name: editItem.name,
+          protocol: editItem.protocol,
+          host: editItem.host,
+          port: editItem.port,
+          group: editItem.group ?? null,
+        };
+        if (editItem.id) await api.patch(`/api/admin/proxies/${editItem.id}`, body);
+        else await api.post("/api/admin/proxies", body);
+        setEditItem(null);
+        load();
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "保存失败");
+      }
+    });
   }
 
   const atCap = enabledCount >= maxProxies && maxProxies > 0;
@@ -307,6 +332,17 @@ export default function ProxiesPage() {
         subtitle="当前渠道的 SOCKS5 / HTTP / HTTPS 代理线路；启用上限 = 该渠道 Key 数 - 1"
         actions={
           <>
+            <label
+              className="flex cursor-pointer items-center gap-2 text-[13px] text-gray-300"
+              title="开启后：代理连续失败不再标记为异常、不踢出池、不进冷却（存量异常立即恢复），仅保留计数与降级"
+            >
+              <Toggle
+                checked={cancelUnhealthy}
+                onChange={toggleCancelUnhealthy}
+                disabled={flagBusy || !channelId}
+              />
+              取消异常
+            </label>
             <Button onClick={() => setImportOpen(true)}>
               <Upload size={14} /> 批量导入
             </Button>
@@ -609,7 +645,7 @@ export default function ProxiesPage() {
             <Button type="button" onClick={() => setEditItem(null)}>
               取消
             </Button>
-            <Button variant="primary" type="submit">
+            <Button variant="primary" type="submit" loading={saving}>
               保存
             </Button>
           </div>

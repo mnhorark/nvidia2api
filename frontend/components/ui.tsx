@@ -322,15 +322,18 @@ export function DataTable({
   children,
   empty,
   loading,
+  fill,
 }: {
   head: React.ReactNode;
   children: React.ReactNode;
   empty?: string;
   loading?: boolean;
+  /** 填满容器宽度：去掉 min-w-max，让长内容单元格（模型名等）能按 max-w 收缩省略 */
+  fill?: boolean;
 }) {
   return (
     <div className="overflow-x-auto rounded-xl border border-line bg-panel">
-      <table className="w-full min-w-max border-collapse">
+      <table className={cx("w-full border-collapse", !fill && "min-w-max")}>
         <thead>
           <tr className="border-b border-line bg-white/[0.015]">{head}</tr>
         </thead>

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Ban, Check, FlaskConical, Gauge, Pencil, Plus, RefreshCw, Trash2, Upload, Wand2 } from "lucide-react";
 import { api, asList, Channel, ChannelKey } from "@/lib/api";
+import { useSubmitGuard } from "@/lib/use-submit-guard";
 import {
   Badge,
   BatchBar,
@@ -16,6 +17,7 @@ import {
   Modal,
   PageHeader,
   safePct,
+  Select,
   Td,
   Textarea,
   Th,
@@ -40,8 +42,12 @@ export default function ChannelKeysPage() {
   const [importText, setImportText] = useState("");
   const [importResult, setImportResult] = useState<ImportResult | null>(null);
   const [genCount, setGenCount] = useState(50);
+  // 批量导入快捷生成：模式 = 匿名(无 Key) / public(复用同一 Key) / sk(前缀+任意后缀)
+  const [genMode, setGenMode] = useState<"anon" | "public" | "sk">("anon");
+  const [genKey, setGenKey] = useState("sk-");
   const [editItem, setEditItem] = useState<Partial<ChannelKey> | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
+  const [saving, submit] = useSubmitGuard();
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
 
@@ -80,35 +86,58 @@ export default function ChannelKeysPage() {
     }
   }
 
-  function generateAnonymous() {
+  function generateLines() {
     const n = Math.max(1, Math.min(Math.floor(Number(genCount) || 1) || 1, 5000));
-    const lines = Array.from(
-      { length: n },
-      (_, i) => `匿名线路 ${String(i + 1).padStart(3, "0")}---`
-    );
+    const pad = (i: number) => String(i + 1).padStart(3, "0");
+    let lines: string[];
+    if (genMode === "public") {
+      const key = genKey.trim();
+      if (!key) return;
+      // 公共 Key 渠道（允许重复 Key）：多个槽位复用同一把 Key
+      lines = Array.from({ length: n }, (_, i) => `公共线路 ${pad(i)}---${key}`);
+    } else if (genMode === "sk") {
+      // sk- 前置：后缀为随机串，每槽位独立 Key
+      const prefix = genKey.trim() || "sk-";
+      const seen = new Set<string>();
+      lines = Array.from({ length: n }, (_, i) => {
+        let suffix: string;
+        do {
+          suffix = Math.random().toString(36).slice(2, 12);
+        } while (seen.has(suffix));
+        seen.add(suffix);
+        return `Key ${pad(i)}---${prefix}${suffix}`;
+      });
+    } else {
+      // 匿名线路：无鉴权渠道的"无需 Key"槽位，Key 留空
+      lines = Array.from({ length: n }, (_, i) => `匿名线路 ${pad(i)}---`);
+    }
     setImportText(lines.join("\n"));
   }
 
   async function save(e: React.FormEvent) {
     e.preventDefault();
     if (!editItem) return;
-    const body: Record<string, unknown> = { name: editItem.name };
-    // 留空表示不修改；各渠道 Key 的格式不同，不做前缀校验
-    if (editItem.api_key && !editItem.api_key.includes("••") && !editItem.api_key.includes("*")) {
-      body.api_key = editItem.api_key;
-    }
-    if (editItem.rpm_limit != null) body.rpm_limit = editItem.rpm_limit;
-    try {
-      if (editItem.id) {
-        await api.patch(`/api/admin/keys/${editItem.id}`, body);
-      } else {
-        await api.post("/api/admin/keys", body);
+    // 在途防重：双击/连按回车不应重复提交（会创建出重复记录）
+    await submit(async () => {
+      const body: Record<string, unknown> = { name: editItem.name };
+      // 留空表示不修改；各渠道 Key 的格式不同，不做前缀校验
+      if (editItem.api_key && !editItem.api_key.includes("••")
+          && !editItem.api_key.includes("*")) {
+        body.api_key = editItem.api_key;
       }
-      setEditItem(null);
-      load();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "保存失败");
-    }
+      if (editItem.rpm_limit != null) body.rpm_limit = editItem.rpm_limit;
+      try {
+        if (editItem.id) {
+          await api.patch(`/api/admin/keys/${editItem.id}`, body);
+        } else {
+          await api.post("/api/admin/keys", body);
+        }
+        setEditItem(null);
+        load();
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "保存失败");
+      }
+    });
   }
 
   async function toggle(k: ChannelKey) {
@@ -395,7 +424,24 @@ export default function ChannelKeysPage() {
               <code className="text-gray-300">名称---</code> 留空 Key 即匿名线路
             </p>
             <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-line bg-white/[0.02] px-3 py-2.5">
-              <span className="text-xs text-mute">快速生成匿名线路：</span>
+              <span className="text-xs text-mute">快速生成：</span>
+              <Select
+                value={genMode}
+                onChange={(e) => setGenMode(e.target.value as "anon" | "public" | "sk")}
+                className="w-44"
+              >
+                <option value="anon">匿名线路（无 Key）</option>
+                <option value="public">public（复用同一 Key）</option>
+                <option value="sk">sk- 前缀（随机 Key）</option>
+              </Select>
+              {genMode !== "anon" && (
+                <Input
+                  value={genKey}
+                  onChange={(e) => setGenKey(e.target.value)}
+                  placeholder={genMode === "public" ? "公共 Key（如 public）" : "Key 前缀，如 sk-"}
+                  className="w-40"
+                />
+              )}
               <Input
                 type="number"
                 min={1}
@@ -405,7 +451,11 @@ export default function ChannelKeysPage() {
                 className="w-24"
               />
               <span className="text-xs text-mute">条</span>
-              <Button size="sm" onClick={generateAnonymous}>
+              <Button
+                size="sm"
+                onClick={generateLines}
+                disabled={genMode === "public" && !genKey.trim()}
+              >
                 <Wand2 size={13} /> 生成
               </Button>
             </div>
@@ -463,7 +513,7 @@ export default function ChannelKeysPage() {
             <Button type="button" onClick={() => setEditItem(null)}>
               取消
             </Button>
-            <Button variant="primary" type="submit">
+            <Button variant="primary" type="submit" loading={saving}>
               保存
             </Button>
           </div>

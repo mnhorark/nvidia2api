@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Check, Copy, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api, asList, UserApiKey } from "@/lib/api";
+import { useSubmitGuard } from "@/lib/use-submit-guard";
 import {
   Badge,
   Button,
@@ -34,6 +35,7 @@ export default function ApiKeysPage() {
   const [createdKey, setCreatedKey] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [busyId, setBusyId] = useState<number | null>(null);
+  const [saving, submit] = useSubmitGuard();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -54,17 +56,19 @@ export default function ApiKeysPage() {
   async function doCreate(e: React.FormEvent) {
     e.preventDefault();
     if (!create) return;
-    try {
-      const res = await api.post<{ key?: string }>("/api/admin/api-keys", create);
-      setCreate(null);
-      if (res.key) {
-        setCreatedKey(res.key);
-        setCopied(false);
+    await submit(async () => {
+      try {
+        const res = await api.post<{ key?: string }>("/api/admin/api-keys", create);
+        setCreate(null);
+        if (res.key) {
+          setCreatedKey(res.key);
+          setCopied(false);
+        }
+        load();
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "创建失败");
       }
-      load();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "创建失败");
-    }
+    });
   }
 
   async function setEnabled(k: UserApiKey, enabled: boolean) {
@@ -91,13 +95,15 @@ export default function ApiKeysPage() {
 
   async function saveQuota(k: UserApiKey) {
     if (!quotaEdit) return;
-    try {
-      await api.patch(`/api/admin/api-keys/${k.id}`, { quota: quotaEdit.quota });
-      setQuotaEdit(null);
-      load();
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : "修改额度失败");
-    }
+    await submit(async () => {
+      try {
+        await api.patch(`/api/admin/api-keys/${k.id}`, { quota: quotaEdit.quota });
+        setQuotaEdit(null);
+        load();
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "修改额度失败");
+      }
+    });
   }
 
   function copyKey() {
@@ -262,7 +268,7 @@ export default function ApiKeysPage() {
             <Button type="button" onClick={() => setCreate(null)}>
               取消
             </Button>
-            <Button variant="primary" type="submit">
+            <Button variant="primary" type="submit" loading={saving}>
               创建
             </Button>
           </div>
@@ -315,7 +321,7 @@ export default function ApiKeysPage() {
               <Button type="button" onClick={() => setQuotaEdit(null)}>
                 取消
               </Button>
-              <Button variant="primary" onClick={() => saveQuota(quotaEdit)}>
+              <Button variant="primary" onClick={() => saveQuota(quotaEdit)} loading={saving}>
                 保存
               </Button>
             </div>

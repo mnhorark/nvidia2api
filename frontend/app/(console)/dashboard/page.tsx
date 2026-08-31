@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Activity,
   ArrowDownRight,
@@ -58,9 +58,15 @@ function KpiCard({
   );
 }
 
-function Delta({ cur, prev, invert, suffix = "%" }: { cur: number; prev: number; invert?: boolean; suffix?: string }) {
-  if (prev === 0 || prev === undefined) return null;
-  const pct = ((cur - prev) / prev) * 100;
+function Delta({ cur, prev, invert, suffix = "%" }: {
+  // 后端按天聚合时字段可能为 null（无数据当天），这里统一兜底为 0
+  cur: number | null | undefined;
+  prev: number | null | undefined;
+  invert?: boolean;
+  suffix?: string;
+}) {
+  if (!prev) return null;
+  const pct = (((cur ?? 0) - prev) / prev) * 100;
   if (Math.abs(pct) < 0.05) {
     return (
       <span className="inline-flex items-center gap-1 rounded-md bg-white/[0.04] px-1.5 py-0.5 text-[11px] text-faint">
@@ -215,9 +221,17 @@ const statusLabels: Record<string, string> = {
 };
 
 function fmtNum(n: number) {
+  if (n == null || Number.isNaN(n)) return "—";
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return String(n);
+}
+
+/** 千分位整数。上游聚合可能回 null（无数据区间），必须做空值兜底——
+ *  否则 `null.toLocaleString()` 在渲染期抛错，整页白屏。 */
+function fmtNumInt(n: number | null | undefined) {
+  if (n == null || Number.isNaN(n)) return "0";
+  return n.toLocaleString();
 }
 
 /* ==================== 分布条形 ==================== */
@@ -240,7 +254,13 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
+  // 递增的请求序号：慢响应返回时若已不是最新一次请求，直接丢弃。
+  // 没有它时，快速切换时间范围会让先发的慢请求覆盖后发的快请求，
+  // 界面停留在新筛选但显示旧区间的数据。
+  const seqRef = useRef(0);
+
   async function load(d = days) {
+    const seq = ++seqRef.current;
     setLoading(true);
     setError("");
     try {
@@ -251,12 +271,14 @@ export default function DashboardPage() {
           `/api/admin/dashboard/usage?days=${d}&tz=${encodeURIComponent(tz)}`
         ),
       ]);
+      if (seq !== seqRef.current) return; // 已有更新的请求发出，丢弃本次结果
       setStats(s);
       setUsage(u);
     } catch (e) {
+      if (seq !== seqRef.current) return;
       setError(e instanceof Error ? e.message : "加载失败");
     } finally {
-      setLoading(false);
+      if (seq === seqRef.current) setLoading(false);
     }
   }
 
@@ -414,17 +436,26 @@ function TokenUsageSection({
   const models = usage?.models ?? [];
   const channels = usage?.channels ?? [];
   const apiKeys = usage?.keys ?? [];
-  const max = Math.max(1, ...list.map((d) => d.total_tokens || 0));
-  const maxReq = Math.max(1, ...list.map((d) => d.requests || 0));
+  const max = Math.max(1, ...list.map((d) => d.total_tokens ?? 0));
+  const maxReq = Math.max(1, ...list.map((d) => d.requests ?? 0));
+
+  // 后端用 Sum() 聚合，空区间会返回 null；这里统一走 num() 兜底，
+  // 避免 `null.toFixed()` / `null.toLocaleString()` 在渲染期炸掉整页。
+  const num = (v: number | null | undefined) =>
+    v == null || Number.isNaN(v) ? 0 : v;
 
   const metricRow: [string, React.ReactNode][] = [
-    ["请求", totals?.requests.toLocaleString() ?? "—"],
-    ["成功率", totals ? `${totals.success_rate.toFixed(1)}%` : "—"],
-    ["总 Tokens", totals ? fmtNum(totals.total_tokens) : "—"],
-    ["输入/输出", totals ? `${fmtNum(totals.prompt_tokens)} / ${fmtNum(totals.completion_tokens)}` : "—"],
-    ["缓存命中率", totals ? `${totals.cache_hit_rate.toFixed(1)}%` : "—"],
-    ["平均延迟", totals?.avg_latency_s != null ? `${totals.avg_latency_s.toFixed(2)}s` : "—"],
-    ["平均 TTFT", totals?.avg_ttft_ms != null ? `${Math.round(totals.avg_ttft_ms)}ms` : "—"],
+    ["请求", totals ? fmtNumInt(totals.requests) : "—"],
+    ["成功率", totals ? `${num(totals.success_rate).toFixed(1)}%` : "—"],
+    ["总 Tokens", totals ? fmtNum(num(totals.total_tokens)) : "—"],
+    ["输入/输出", totals
+      ? `${fmtNum(num(totals.prompt_tokens))} / ${fmtNum(num(totals.completion_tokens))}`
+      : "—"],
+    ["缓存命中率", totals ? `${num(totals.cache_hit_rate).toFixed(1)}%` : "—"],
+    ["平均延迟", totals?.avg_latency_s != null
+      ? `${totals.avg_latency_s.toFixed(2)}s` : "—"],
+    ["平均 TTFT", totals?.avg_ttft_ms != null
+      ? `${Math.round(totals.avg_ttft_ms)}ms` : "—"],
   ];
 
   return (
@@ -465,9 +496,9 @@ function TokenUsageSection({
                   {value}
                   {showDelta && (
                     <>
-                      {i === 0 && <Delta cur={totals.requests} prev={prev.requests} />}
-                      {i === 1 && <Delta cur={totals.success_rate} prev={prev.success_rate} />}
-                      {i === 2 && <Delta cur={totals.total_tokens} prev={prev.total_tokens} />}
+                      {i === 0 && <Delta cur={num(totals.requests)} prev={num(prev.requests)} />}
+                      {i === 1 && <Delta cur={num(totals.success_rate)} prev={num(prev.success_rate)} />}
+                      {i === 2 && <Delta cur={num(totals.total_tokens)} prev={num(prev.total_tokens)} />}
                     </>
                   )}
                 </div>
@@ -499,10 +530,10 @@ function TokenUsageSection({
                 return (
                   <div key={d.date} className="group relative h-full flex-1">
                     <ChartTip>
-                      {d.date} · 总计 <b className="text-gray-100">{d.total_tokens.toLocaleString()}</b>
-                      {(d.cached_tokens ?? 0) > 0 && <> · 缓存 {d.cached_tokens.toLocaleString()}</>}
-                      {d.prompt_tokens > 0 && <> · 输入 {d.prompt_tokens.toLocaleString()}</>}
-                      {d.completion_tokens > 0 && <> · 输出 {d.completion_tokens.toLocaleString()}</>}
+                      {d.date} · 总计 <b className="text-gray-100">{fmtNumInt(d.total_tokens)}</b>
+                      {(d.cached_tokens ?? 0) > 0 && <> · 缓存 {fmtNumInt(d.cached_tokens)}</>}
+                      {(d.prompt_tokens ?? 0) > 0 && <> · 输入 {fmtNumInt(d.prompt_tokens)}</>}
+                      {(d.completion_tokens ?? 0) > 0 && <> · 输出 {fmtNumInt(d.completion_tokens)}</>}
                     </ChartTip>
                     <div className="flex h-full flex-col justify-end overflow-hidden rounded-t-[3px]">
                       <div style={{ height: `${c}%`, minHeight: c > 0 ? 3 : 0 }}
@@ -527,12 +558,14 @@ function TokenUsageSection({
           >
             <div className="flex items-end gap-[3px]" style={{ height: 140 }}>
               {list.map((d) => {
-                const ok = Math.min(100, ((d.success || 0) / maxReq) * 100);
-                const fail = Math.min(100, ((d.requests - d.success) / maxReq) * 100);
+                // 空区间 success/requests 可能为 null，做空值兜底后再做减法
+                const req = d.requests ?? 0;
+                const ok = Math.min(100, ((d.success ?? 0) / maxReq) * 100);
+                const fail = Math.min(100, (Math.max(req - (d.success ?? 0), 0) / maxReq) * 100);
                 return (
                   <div key={d.date} className="group relative h-full flex-1">
                     <ChartTip>
-                      {d.date} · <b className="text-gray-100">{d.requests}</b> 次 · 失败 {d.requests - d.success}
+                      {d.date} · <b className="text-gray-100">{req}</b> 次 · 失败 {Math.max(req - (d.success ?? 0), 0)}
                     </ChartTip>
                     <div className="flex h-full flex-col justify-end overflow-hidden rounded-t-[3px]">
                       <div style={{ height: `${fail}%` }} className="w-full bg-err/70" />
@@ -563,13 +596,13 @@ function TokenUsageSection({
       {(models.length > 0 || channels.length > 0 || apiKeys.length > 0) && (
         <div className="grid border-t border-line lg:grid-cols-3">
           {models.length > 0 && (
-            <DistributionSection title="按模型" rows={models.slice(0, 6).map((m) => ({ key: m.model, tokens: m.total_tokens, mono: true }))} max={Math.max(...models.map((m) => m.total_tokens), 1)} total={totals?.total_tokens ?? 1} color="bg-accent" mono />
+            <DistributionSection title="按模型" rows={models.slice(0, 6).map((m) => ({ key: m.model, tokens: m.total_tokens ?? 0, mono: true }))} max={Math.max(...models.map((m) => m.total_tokens ?? 0), 1)} total={totals?.total_tokens ?? 1} color="bg-accent" mono />
           )}
           {channels.length > 0 && (
-            <DistributionSection title="按渠道" rows={channels.slice(0, 6).map((c) => ({ key: c.name, tokens: c.total_tokens }))} max={Math.max(...channels.map((c) => c.total_tokens), 1)} total={totals?.total_tokens ?? 1} color="bg-info" />
+            <DistributionSection title="按渠道" rows={channels.slice(0, 6).map((c) => ({ key: c.name, tokens: c.total_tokens ?? 0 }))} max={Math.max(...channels.map((c) => c.total_tokens ?? 0), 1)} total={totals?.total_tokens ?? 1} color="bg-info" />
           )}
           {apiKeys.length > 0 && (
-            <DistributionSection title="按用户 Key" rows={apiKeys.slice(0, 6).map((k) => ({ key: k.name, tokens: k.total_tokens }))} max={Math.max(...apiKeys.map((k) => k.total_tokens), 1)} total={totals?.total_tokens ?? 1} color="bg-ok" />
+            <DistributionSection title="按用户 Key" rows={apiKeys.slice(0, 6).map((k) => ({ key: k.name, tokens: k.total_tokens ?? 0 }))} max={Math.max(...apiKeys.map((k) => k.total_tokens ?? 0), 1)} total={totals?.total_tokens ?? 1} color="bg-ok" />
           )}
         </div>
       )}

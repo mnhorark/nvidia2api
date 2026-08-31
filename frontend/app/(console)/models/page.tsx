@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Download, Pencil, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
 import { api, asList, Model, ProxyGroup } from "@/lib/api";
+import { useSubmitGuard } from "@/lib/use-submit-guard";
 import {
   Badge,
   BatchBar,
@@ -30,6 +31,7 @@ export default function ModelsPage() {
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState("");
   const [edit, setEdit] = useState<Partial<Model> | null>(null);
+  const [saving, submit] = useSubmitGuard();
   const [busyId, setBusyId] = useState<number | null>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
@@ -68,7 +70,8 @@ export default function ModelsPage() {
     (m) =>
       !q ||
       m.model_name.toLowerCase().includes(q.toLowerCase()) ||
-      (m.display_name || "").toLowerCase().includes(q.toLowerCase())
+      (m.alias || "").toLowerCase().includes(q.toLowerCase()) ||
+      (m.aliases ?? []).some((a) => a.toLowerCase().includes(q.toLowerCase()))
   );
 
   async function sync(prune = false) {
@@ -162,26 +165,27 @@ export default function ModelsPage() {
   async function save(e: React.FormEvent) {
     e.preventDefault();
     if (!edit) return;
-    try {
-      const body = {
-        model_name: edit.model_name,
-        display_name: edit.display_name ?? "",
-        alias: edit.alias ?? "",
-        aliases: aliasText
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean),
-        description: edit.description ?? "",
-        proxy_group: edit.proxy_group ?? null,
-        endpoint: edit.endpoint ?? "",
-      };
-      if (edit.id) await api.patch(`/api/admin/models/${edit.id}`, body);
-      else await api.post("/api/admin/models", body);
-      setEdit(null);
-      load();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "保存失败");
-    }
+    await submit(async () => {
+      try {
+        const body = {
+          model_name: edit.model_name,
+          alias: edit.alias ?? "",
+          aliases: aliasText
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean),
+          description: edit.description ?? "",
+          proxy_group: edit.proxy_group ?? null,
+          endpoint: edit.endpoint ?? "",
+        };
+        if (edit.id) await api.patch(`/api/admin/models/${edit.id}`, body);
+        else await api.post("/api/admin/models", body);
+        setEdit(null);
+        load();
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "保存失败");
+      }
+    });
   }
 
   return (
@@ -290,11 +294,6 @@ export default function ModelsPage() {
                   ))}
                 </div>
               )}
-              {m.display_name && m.display_name !== m.model_name && (
-                <div className="truncate text-[10px] text-mute" title={m.display_name}>
-                  {m.display_name}
-                </div>
-              )}
             </Td>
             <Td>
               {m.proxy_group_name ? (
@@ -354,37 +353,33 @@ export default function ModelsPage() {
         <form onSubmit={save} className="space-y-3.5">
           <Field label="模型名称">
             <Input
-              placeholder="模型 ID，如 deepseek-ai/deepseek-r1"
+              placeholder="上游模型 ID，如 moonshotai/kimi-k3"
               value={edit?.model_name ?? ""}
               onChange={(e) => setEdit((p) => ({ ...p, model_name: e.target.value }))}
               required
             />
+            <p className="mt-1 text-xs text-faint">同步自渠道；客户端通过「对外名 / 别名」调用它</p>
           </Field>
-          <Field label="显示名称">
+          <Field label="对外名（主别名）">
             <Input
-              value={edit?.display_name ?? ""}
-              onChange={(e) => setEdit((p) => ({ ...p, display_name: e.target.value }))}
-            />
-          </Field>
-          <Field label="对外名称（别名，留空则使用显示名称）">
-            <Input
-              placeholder="客户端在 /v1 里使用的模型名，如 gpt-4o-mini"
+              placeholder="客户端在 /v1 里使用的模型名，如 kimi-k3"
               value={edit?.alias ?? ""}
               onChange={(e) => setEdit((p) => ({ ...p, alias: e.target.value }))}
             />
             <p className="mt-1 text-xs text-faint">
-              /v1/models 返回及 chat 请求时的模型名：别名 &gt; 显示名称 &gt; 原始模型名
+              参考 one-api 模型映射：设置后 /v1/models 对外暴露该名，请求会自动路由到上面的上游模型。
+              留空则直接用上游模型名。设置了主别名后，上游原始名不再出现在 /v1/models
             </p>
           </Field>
-          <Field label="附加对外名（多个别名，英文逗号分隔）">
+          <Field label="附加别名（多个，英文逗号分隔）">
             <Input
-              placeholder="如：gpt-4o-mini, my-llm, chat-assistant"
+              placeholder="如：kimi-k3-lite, my-assistant"
               value={aliasText}
               onChange={(e) => setAliasText(e.target.value)}
             />
             <p className="mt-1 text-xs text-faint">
-              一个模型可暴露多个可调用名字（类似模型映射）：所有对外名都会出现在 /v1/models，
-              客户端可用其中任意一个调用，路由到同一个上游模型
+              一个模型可暴露多个可调用名字：所有对外名都会出现在 /v1/models，
+              客户端用其中任意一个调用，都路由到同一个上游模型
             </p>
           </Field>
           <Field label="描述">
@@ -430,7 +425,7 @@ export default function ModelsPage() {
             <Button type="button" onClick={() => setEdit(null)}>
               取消
             </Button>
-            <Button variant="primary" type="submit">
+            <Button variant="primary" type="submit" loading={saving}>
               保存
             </Button>
           </div>

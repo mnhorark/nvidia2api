@@ -128,47 +128,93 @@ export default function ChatPage() {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buf = "";
+
+      // 从缓冲区切出完整事件；兼容 \n\n 与 \r\n\r\n 两种分隔，并保留残余部分。
+      const drain = (flushTail: boolean) => {
+        const events: string[] = [];
+        for (;;) {
+          const rn = buf.indexOf("\r\n\r\n");
+          const nn = buf.indexOf("\n\n");
+          let cut = -1;
+          let width = 2;
+          if (rn >= 0 && (nn < 0 || rn < nn)) {
+            cut = rn;
+            width = 4;
+          } else if (nn >= 0) {
+            cut = nn;
+          }
+          if (cut < 0) break;
+          events.push(buf.slice(0, cut));
+          buf = buf.slice(cut + width);
+        }
+        if (flushTail && buf.trim()) {
+          events.push(buf);
+          buf = "";
+        }
+        return events;
+      };
+
+      // 一个 SSE 事件可含多行 `data:`（续行），需拼接后再解析；
+      // 同时要跳过 `event:` / `id:` / `:keep-alive` 等非数据行。
+      const dataPayload = (evt: string): string | null => {
+        const parts: string[] = [];
+        let sawData = false;
+        for (const rawLine of evt.split(/\r?\n/)) {
+          const line = rawLine.trimEnd();
+          if (!line.trim() || line.startsWith(":")) continue; // 注释/心跳
+          if (!line.startsWith("data:")) continue;           // event:/id: 等
+          sawData = true;
+          parts.push(line.slice(5).trim());
+        }
+        if (!sawData) return null;
+        return parts.join("\n");
+      };
+
+      // 事件处理逻辑只有一份，主循环与尾部冲刷共用，避免两处实现跑偏。
+      const handleEvent = (evt: string) => {
+        const raw = dataPayload(evt);
+        if (raw === null || raw === "[DONE]") return;
+        let data: Record<string, unknown>;
+        try {
+          data = JSON.parse(raw);
+        } catch (parseErr) {
+          // 静默吞掉解析失败会让"上游返回了内容但界面空白"无法定位
+          console.warn("[chat] SSE 事件解析失败:", raw, parseErr);
+          return;
+        }
+        if (data.error) {
+          failed = true;
+          const e = data.error as { message?: string };
+          content = `⚠ ${e.message || "请求失败"}`;
+          paint();
+          toast.error(e.message || "请求失败");
+          return;
+        }
+        if (data.meta) {
+          meta = { ...(meta ?? {}), ...(data.meta as ChatMessage["meta"]) };
+          paint();
+          return;
+        }
+        if (data.summary) {
+          meta = { ...(meta ?? {}), ...(data.summary as ChatMessage["meta"]) };
+          paint();
+          return;
+        }
+        const delta = (data.choices as { delta?: Record<string, string> }[])?.[0]?.delta;
+        if (delta?.content) content += delta.content;
+        if (delta?.reasoning_content) reasoning += delta.reasoning_content;
+        if (delta) paint();
+      };
+
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
         buf += decoder.decode(value, { stream: true });
-        const events = buf.split("\n\n");
-        buf = events.pop() ?? "";
-        for (const evt of events) {
-          const line = evt.trim();
-          if (!line.startsWith("data:")) continue;
-          const raw = line.slice(5).trim();
-          if (raw === "[DONE]") continue;
-          let data: Record<string, unknown>;
-          try {
-            data = JSON.parse(raw);
-          } catch {
-            continue;
-          }
-          if (data.error) {
-            failed = true;
-            const e = data.error as { message?: string };
-            content = `⚠ ${e.message || "请求失败"}`;
-            paint();
-            toast.error(e.message || "请求失败");
-            continue;
-          }
-          if (data.meta) {
-            meta = { ...(meta ?? {}), ...(data.meta as ChatMessage["meta"]) };
-            paint();
-            continue;
-          }
-          if (data.summary) {
-            meta = { ...(meta ?? {}), ...(data.summary as ChatMessage["meta"]) };
-            paint();
-            continue;
-          }
-          const delta = (data.choices as { delta?: Record<string, string> }[])?.[0]?.delta;
-          if (delta?.content) content += delta.content;
-          if (delta?.reasoning_content) reasoning += delta.reasoning_content;
-          if (delta) paint();
-        }
+        for (const evt of drain(false)) handleEvent(evt);
       }
+      // 上游可能不以空行结尾：流结束后必须冲刷缓冲区里的最后一个事件，
+      // 否则最后一段回答会凭空丢失（表现为"回答总是少一截"）。
+      for (const evt of drain(true)) handleEvent(evt);
       paint();
       if (!content && !reasoning && !failed) {
         setMessages(history);
@@ -197,7 +243,7 @@ export default function ChatPage() {
             <option value="">选择模型…</option>
             {models.map((m) => (
               <option key={m.id} value={m.model_name}>
-                {m.display_name || m.model_name}
+                {m.public_name || m.model_name}
               </option>
             ))}
           </Select>
@@ -244,7 +290,7 @@ export default function ChatPage() {
                       : "max-w-[80%] rounded-2xl rounded-bl-md border border-line bg-white/[0.03] px-4 py-2.5 text-[13px] text-gray-200"
                   }
                 >
-                  {m.reasoning && <ReasoningBlock text={m.reasoning} />}
+                  {m.reasoning && <ReasoningBlock text={m.reasoning} autoOpen={sending} />}
                   {m.content
                     ? <p className="whitespace-pre-wrap leading-relaxed">{m.content}</p>
                     : <p className="text-faint">&nbsp;</p>}
@@ -333,8 +379,8 @@ function MetaBlock({ meta }: { meta: NonNullable<ChatMessage["meta"]> }) {
   );
 }
 
-function ReasoningBlock({ text }: { text: string }) {
-  const [open, setOpen] = useState(false);
+function ReasoningBlock({ text, autoOpen }: { text: string; autoOpen?: boolean }) {
+  const [open, setOpen] = useState(autoOpen ?? false);
   return (
     <div className="mb-2 rounded-lg border border-warn/20 bg-warn/[0.05]">
       <button

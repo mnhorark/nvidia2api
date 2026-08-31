@@ -1,7 +1,7 @@
 "use client";
 
 import { Suspense, useCallback, useEffect, useState } from "react";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   Check,
   Download,
@@ -15,6 +15,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { Channel, api, asList, setChannel } from "@/lib/api";
+import { useSubmitGuard } from "@/lib/use-submit-guard";
 import {
   Button,
   Card,
@@ -77,6 +78,7 @@ export default function ChannelsPage() {
 
 function ChannelsInner() {
   const params = useSearchParams();
+  const router = useRouter();
   const [channels, setChannels] = useState<Channel[]>([]);
   const [current, setCurrent] = useState("");
   const [loading, setLoading] = useState(false);
@@ -84,6 +86,7 @@ function ChannelsInner() {
   const [edit, setEdit] = useState<Partial<Channel> | null>(null);
   const [applyRpmToKeys, setApplyRpmToKeys] = useState(false);
   const [busyId, setBusyId] = useState<number | null>(null);
+  const [saving, submit] = useSubmitGuard();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -105,16 +108,20 @@ function ChannelsInner() {
     void load();
   }, [load]);
 
+  // ?new=1 打开新建弹窗后必须清掉查询参数：否则切换渠道导致页面重挂载时，
+  // 这个"用过就忘"的参数会幽灵复活、再次弹出新建框（覆盖用户当前操作）。
   useEffect(() => {
-    if (params.get("new") === "1") {
-      setEdit({ ...EMPTY });
-      setApplyRpmToKeys(false);
-    }
-  }, [params]);
+    if (params.get("new") !== "1") return;
+    setEdit({ ...EMPTY });
+    setApplyRpmToKeys(false);
+    router.replace("/channels");
+  }, [params, router]);
 
   async function save(e: React.FormEvent) {
     e.preventDefault();
     if (!edit) return;
+    // 在途防重：双击/连按回车不应把同一份配置提交多次
+    await submit(async () => {
     const body = {
       name: edit.name,
       slug: edit.slug,
@@ -126,23 +133,27 @@ function ChannelsInner() {
       default_rpm: Number(edit.default_rpm ?? 40),
       allow_duplicate_keys: edit.allow_duplicate_keys ?? false,
       disable_key_invalid: edit.disable_key_invalid ?? false,
+      // 必须带上：编辑弹窗里这个复选框若不在提交体中，UI 显示已勾选、
+      // 后端却收不到该字段，配置会被静默丢弃。
+      disable_proxy_unhealthy: edit.disable_proxy_unhealthy ?? false,
       apply_rpm_to_keys: applyRpmToKeys,
       enabled: edit.enabled ?? true,
       is_default: edit.is_default ?? false,
       notes: edit.notes ?? "",
     };
-    try {
-      if (edit.id) await api.patch(`/api/admin/channels/${edit.id}`, body);
-      else await api.post("/api/admin/channels", body);
-      setEdit(null);
-      setApplyRpmToKeys(false);
-      await load();
-      // 通知 layout 重拉渠道列表，侧边栏名称等信息保持同步（不带 slug，不切换全局渠道）
-      window.dispatchEvent(new CustomEvent("nvidia2api:channel-change"));
-      toast.success("渠道已保存");
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "保存失败");
-    }
+      try {
+        if (edit.id) await api.patch(`/api/admin/channels/${edit.id}`, body);
+        else await api.post("/api/admin/channels", body);
+        setEdit(null);
+        setApplyRpmToKeys(false);
+        await load();
+        // 通知 layout 重拉渠道列表，侧边栏名称等信息保持同步（不带 slug，不切换全局渠道）
+        window.dispatchEvent(new CustomEvent("nvidia2api:channel-change"));
+        toast.success("渠道已保存");
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "保存失败");
+      }
+    });
   }
 
   async function switchTo(c: Channel) {
@@ -517,6 +528,7 @@ function ChannelsInner() {
               { key: "is_default", label: "设为默认渠道（/v1/* 走它）", val: edit?.is_default ?? false },
               { key: "allow_duplicate_keys", label: "允许导入重复 Key（公共 Key 渠道）", val: edit?.allow_duplicate_keys ?? false },
               { key: "disable_key_invalid", label: "关闭 Key 无效标记（公共/匿名 Key 渠道，401/403 不标无效，保留限流与冷却）", val: edit?.disable_key_invalid ?? false },
+              { key: "disable_proxy_unhealthy", label: "关闭代理异常标记（公共/不稳定代理渠道，连续失败不标异常、不踢出池，仅保留计数与降级）", val: edit?.disable_proxy_unhealthy ?? false },
             ].map((opt) => (
               <label key={opt.key} className="flex cursor-pointer items-center gap-2.5 text-[13px] text-gray-300">
                 <Checkbox
@@ -532,8 +544,9 @@ function ChannelsInner() {
             <Button type="button" onClick={() => setEdit(null)}>
               取消
             </Button>
-            <Button variant="primary" type="submit">
-              保存
+            <Button variant="primary" type="submit" loading={saving}
+                    disabled={saving}>
+              {saving ? "保存中…" : "保存"}
             </Button>
           </div>
         </form>
