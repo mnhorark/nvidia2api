@@ -7,23 +7,15 @@ services:
     volumes:
       - ./data:/app/data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"]
+      # urlopen 必须带 timeout，否则后端卡死时探针会永久挂起、容器永不判 unhealthy
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz', timeout=5).status==200 else 1)"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
       start_period: 20s
     restart: unless-stopped
 
-  frontend:
-    image: node:22-slim
-    working_dir: /fe
-    command: sh -c "npm install && npm run build && npm run start"
-    volumes:
-      - ./frontend:/fe
-    ports:
-      - "3000:3000"
-    environment:
-      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
-    depends_on:
-      - backend
-    restart: unless-stopped
+# 说明：镜像已把 Next.js 静态导出产物打进 /app/static/frontend，
+# 由 Django 在同一个 8000 端口上同时提供 API 与控制台（all-in-one）。
+# 因此不再需要独立的 frontend 服务——原配置里的 `npm run start` 在
+# output: 'export' 下也根本无法工作。本地开发请用 start.bat（前端 :3000 + 后端 :8000）。

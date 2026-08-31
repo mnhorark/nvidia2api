@@ -3,10 +3,15 @@ __pycache__/
 .venv/
 .env
 .env.local
+# SQLite 主库及其 WAL/SHM 伴生文件（运行期生成，勿入库）
 data/*.sqlite3
+data/*.sqlite3-shm
+data/*.sqlite3-wal
+data/*.bak*
 # 个人工具配置（含明文 API Key），勿提交到版本库
 config.json
-data/*.bak*
+# 助手工作区（会话记忆、草稿），勿提交到版本库
+.workbuddy/
 node_modules/
 .next/
 *.tsbuildinfo
