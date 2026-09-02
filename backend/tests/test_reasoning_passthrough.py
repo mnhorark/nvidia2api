@@ -366,3 +366,101 @@ class PassthroughGateTests(TestCase):
             payload = {"reasoning_effort": "high", "model": "test", "messages": []}
             out = thinking.build_upstream(payload, "stripped-model", ch)
         self.assertEqual(out, {})
+
+
+class StreamReasoningDecryptorTests(TestCase):
+    """muse 思考密文的流式解密：跨 chunk 分片缓冲 + 不可解密落占位符。"""
+
+    def _mk_chunk(self, field: str, value: str, **extra):
+        import json as _json
+        delta = {field: value}
+        delta.update(extra)
+        return "data: " + _json.dumps({"choices": [{"delta": delta}]}, ensure_ascii=False) + "\n\n"
+
+    def _token(self, plaintext: str) -> str:
+        # 用与 _candidate_keys 兜底相同的派生（'nvidia2api'）造可解密 token
+        from services.reasoning_decrypt import _fernet_for
+        return _fernet_for("nvidia2api").encrypt(plaintext.encode()).decode()
+
+    def test_single_full_token_chunk(self):
+        from services.reasoning_decrypt import StreamReasoningDecryptor
+        d = StreamReasoningDecryptor()
+        out = d.feed(self._mk_chunk("reasoning_content", self._token("hello world")))
+        self.assertEqual(len(out), 1)
+        self.assertIn("hello world", out[0])
+
+    def test_fragmented_token_reassembled(self):
+        from services.reasoning_decrypt import StreamReasoningDecryptor
+        tok = self._token("完整思考内容 should not leak as ciphertext")
+        third = max(1, len(tok) // 3)
+        parts = [tok[:third], tok[third:2 * third], tok[2 * third:]]
+        d = StreamReasoningDecryptor()
+        outs = []
+        for p in parts:
+            outs += d.feed(self._mk_chunk("reasoning_content", p))
+        # 前两片不应产生输出（缓冲），凑齐后一次性解密
+        text = "".join(outs)
+        self.assertIn("完整思考内容 should not leak as ciphertext", text)
+        self.assertNotIn("gAAAA", text)
+
+    def test_opaque_blob_replaced_with_placeholder(self):
+        from services.reasoning_decrypt import (
+            ENCRYPTED_PLACEHOLDER, StreamReasoningDecryptor)
+        blob = "Q-PaDg" + "X7" * 600  # 无 gAAAA 前缀的长 base64url 串
+        d = StreamReasoningDecryptor()
+        out = d.feed(self._mk_chunk("reasoning_content", blob))
+        self.assertEqual(len(out), 1)
+        self.assertIn(ENCRYPTED_PLACEHOLDER, out[0])
+        self.assertNotIn("Q-PaDg", out[0])
+
+    def test_plaintext_reasoning_passes_through(self):
+        from services.reasoning_decrypt import StreamReasoningDecryptor
+        d = StreamReasoningDecryptor()
+        out = d.feed(self._mk_chunk("reasoning_content", "正常的明文思考"))
+        self.assertEqual(len(out), 1)
+        self.assertIn("正常的明文思考", out[0])
+
+    def test_buffer_flushed_before_content(self):
+        from services.reasoning_decrypt import (
+            ENCRYPTED_PLACEHOLDER, StreamReasoningDecryptor)
+        d = StreamReasoningDecryptor()
+        # 先用错误密钥造不可解密但带 gAAAA 前缀的首片
+        from cryptography.fernet import Fernet
+        bad = Fernet(Fernet.generate_key()).encrypt(
+            "secret thought".encode()).decode()
+        half = len(bad) // 2
+        outs = d.feed(self._mk_chunk("reasoning_content", bad[:half]))
+        self.assertEqual(outs, [])  # 缓冲中
+        # 正文到达：必须先冲刷缓冲（占位符），再放行正文
+        outs = d.feed(self._mk_chunk("reasoning_content", bad[half:], content="正文"))
+        text = "".join(outs)
+        self.assertIn(ENCRYPTED_PLACEHOLDER, text)
+        self.assertIn("正文", text)
+        # 占位符 chunk 出现在正文 chunk 之前
+        self.assertLess(text.index(ENCRYPTED_PLACEHOLDER), text.index("正文"))
+        # 任何下发给客户端的 chunk 都不得携带密文碎片（gAAAA 前缀）
+        for c in outs:
+            self.assertNotIn("gAAAA", c)
+
+    def test_finalize_flushes_leftover_at_stream_end(self):
+        from services.reasoning_decrypt import (
+            ENCRYPTED_PLACEHOLDER, StreamReasoningDecryptor)
+        from cryptography.fernet import Fernet
+        bad = Fernet(Fernet.generate_key()).encrypt("x".encode()).decode()
+        d = StreamReasoningDecryptor()
+        d.feed(self._mk_chunk("reasoning_content", bad[: len(bad) // 2]))
+        out = d.feed("data: [DONE]\n\n")
+        text = "".join(out)
+        self.assertIn(ENCRYPTED_PLACEHOLDER, text)
+        self.assertIn("[DONE]", text)
+
+    def test_no_regression_for_kilo_nested_reasoning(self):
+        from services.reasoning_decrypt import StreamReasoningDecryptor
+        tok = self._token("nested ok")
+        import json as _json
+        chunk = "data: " + _json.dumps(
+            {"choices": [{"delta": {"reasoning": {"effort": tok}}}]}) + "\n\n"
+        d = StreamReasoningDecryptor()
+        out = d.feed(chunk)
+        text = "".join(out)
+        self.assertIn("nested ok", text)

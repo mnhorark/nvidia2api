@@ -20,7 +20,9 @@ from services import responses_api, sysconfig
 from services.key_service import report_failure, report_success
 from services.load_balancer import Route
 from services.proxy_service import report_proxy_result
-from services.reasoning_decrypt import decrypt_sse_chunk
+from services.reasoning_decrypt import (
+    StreamReasoningDecryptor, decrypt_sse_chunk,
+)
 
 logger = logging.getLogger("nvidia2api.race")
 
@@ -574,10 +576,17 @@ class StreamWinner:
                 # 额外的 SSE chunk 解密（处理 Kilo/OpenRouter 加密 reasoning）
                 yield decrypt_sse_chunk(chunk)
         else:
-            async for chunk in iter_sse(self.first_line, self.aiter):
-                # Chat 直连的 reasoning_content/reasoning 可能是 Fernet 密文，就地解密
-                # 支持：muse-spark (reasoning_content) / Kilo/OpenRouter (reasoning)
-                yield decrypt_sse_chunk(chunk)
+            decryptor = StreamReasoningDecryptor()
+            try:
+                async for chunk in iter_sse(self.first_line, self.aiter):
+                    # 有状态解密：跨 chunk 分片的 Fernet token 缓冲凑齐后一次解密；
+                    # 无法解密的密文输出占位符，不再把乱码怼给客户端。
+                    for out in decryptor.feed(chunk):
+                        yield out
+            finally:
+                # 异常收尾（客户端断开/上游暴毙）也冲刷残留缓冲
+                for out in decryptor.finalize():
+                    yield out
 
     async def close(self):
         try:
