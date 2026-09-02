@@ -1,5 +1,9 @@
+// 用 ?? 而非 ||：Docker 构建显式注入空串（同源相对路径），
+// 空串是 falsy，|| 会把它错误地回落到 127.0.0.1，导致 all-in-one
+// 镜像在非本机访问时所有 API 请求打到访客自己的回环地址。
+// 仅在变量未设置（本地开发）时才回落本机后端。
 export const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
 export const TOKEN_KEY = "nvidia2api_admin_token";
 export const CHANNEL_KEY = "nvidia2api_channel";

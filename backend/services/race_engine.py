@@ -125,7 +125,8 @@ def _client_kwargs(route: Route, stream: bool) -> dict:
     if stream:
         # 流式请求不设每读超时（read=None）：思考模型可能合法停顿数十秒~数分钟，
         # 固定读超时会在中途掐断（客户端报 "error decoding response body"）。
-        # 死线路统一由应用层 stream_idle_timeout（静默判死，见 openai_views._drain）负责。
+        # 死线路统一由应用层探测制兜底：竞速阶段 stream_first_byte_timeout、
+        # 转发阶段 stream_idle_timeout + 心跳探测（见 openai_views._drain）。
         read = None
     kwargs: dict[str, Any] = {
         "timeout": httpx.Timeout(
@@ -477,7 +478,22 @@ async def race_stream_winner(routes: list[Route], body: dict):
         while pending and n_failed < len(routes):
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
-                res, fail_info = t.result()
+                # 与 _race 同级防护：任务自身可能因取消/未捕获异常结束，
+                # 裸 t.result() 会把异常/取消直接抛出并中断整条竞速循环。
+                try:
+                    res, fail_info = t.result()
+                except asyncio.CancelledError:
+                    report.append(route_info(
+                        tasks[t], "cancelled", (_time.monotonic() - t0) * 1000,
+                        "task cancelled"))
+                    n_failed += 1
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    report.append(route_info(
+                        tasks[t], "failed", (_time.monotonic() - t0) * 1000,
+                        f"task_error:{type(exc).__name__}"))
+                    n_failed += 1
+                    continue
                 if res is not None:
                     winner_route = tasks[t]
                     latency = (_time.monotonic() - t0) * 1000
@@ -513,7 +529,15 @@ async def race_stream_winner(routes: list[Route], body: dict):
                     report.append(fail_info)
                 n_failed += 1
     finally:
-        pass
+        # 兜底取消：客户端在竞速途中断开时，GeneratorExit/CancelledError 会沿
+        # asyncio.wait 抛出，若无此段，所有未完成线路任务（各持一个已建连的
+        # httpx.AsyncClient + 代理连接/fd）将悬挂至 first_byte_timeout 甚至更久，
+        # 长期累积即 fd 耗尽。与 _race 的 finally 兜底保持同级防护。
+        leftover = [t for t in tasks if not t.done()]
+        for t in leftover:
+            t.cancel()
+        if leftover:
+            await asyncio.gather(*leftover, return_exceptions=True)
     failures = [r for r in report if r.get("status") == "failed"] or report
     raise AllRoutesFailed(
         [f"{f['name']}:{f['error']}" for f in failures], report=report)

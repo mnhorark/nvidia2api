@@ -176,12 +176,18 @@ LOGGING = {
 # 回读全部上游 Key，管理面等于完全失守。
 import logging as _logging
 
-DEFAULT_ADMIN_PASSWORD = "admin123"
-DEFAULT_ADMIN_TOKEN = "dev-admin-token"
-DEFAULT_SECRET_KEY = "dev-insecure-secret-change-me"
+# 已知公知凭据集合：仅含出厂默认值与 .env.example 中随仓库公开分发的占位值。
+# 不扩展到 generic 弱口令词典（如 "password"/"admin"）——那样会误伤内网环境
+# 的合法自定义凭据；门禁的目标是拦截"按仓库公开值部署"这一具体高危路径。
+KNOWN_WEAK_ADMIN_PASSWORDS = {"admin123", "change-me"}
+KNOWN_WEAK_ADMIN_TOKENS = {"dev-admin-token", "change-me"}
+KNOWN_WEAK_SECRET_KEYS = {
+    "dev-insecure-secret-change-me",
+    "change-me-to-a-random-string",
+}
 USING_DEFAULT_CREDENTIALS = (
-    ADMIN_PASSWORD == DEFAULT_ADMIN_PASSWORD
-    or any(t == DEFAULT_ADMIN_TOKEN for t in ADMIN_TOKENS)
+    ADMIN_PASSWORD in KNOWN_WEAK_ADMIN_PASSWORDS
+    or any(t in KNOWN_WEAK_ADMIN_TOKENS for t in ADMIN_TOKENS)
 )
 
 if USING_DEFAULT_CREDENTIALS:
@@ -199,7 +205,7 @@ if USING_DEFAULT_CREDENTIALS:
         )
     _logging.getLogger("django").warning(message)
 
-if not os.environ.get("ENCRYPTION_KEY") and SECRET_KEY == DEFAULT_SECRET_KEY:
+if not os.environ.get("ENCRYPTION_KEY") and SECRET_KEY in KNOWN_WEAK_SECRET_KEYS:
     _logging.getLogger("django").warning(
         "【安全警告】未配置 ENCRYPTION_KEY 且 SECRET_KEY 为默认值，"
         "入库的 NVIDIA Key / 代理密码加密使用可被推导的密钥。"

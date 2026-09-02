@@ -721,11 +721,19 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                     await asyncio.sleep(backoff)
             except Exception as exc:
                 if sent_content or done_sent:
+                    # 线路中途死亡（含已出部分内容后断流）：竞速时该 Key 已被
+                    # _mark_success 记为成功，但中途死亡是真实故障。补记一次失败
+                    # （不标 invalid，仅累计 failure_count + 冷却），否则"先吐
+                    # role chunk 然后死亡"的慢性坏 Key 永远不会被调度打分发现。
                     try:
-                        if (w is not None and w.route is not None
-                                and w.route.proxy is not None):
+                        if w is not None and w.route is not None:
                             from services.proxy_service import report_proxy_result
-                            await run_db(report_proxy_result, w.route.proxy.id, False)
+                            if w.route.proxy is not None:
+                                await run_db(report_proxy_result, w.route.proxy.id, False)
+                            key_id = getattr(w.route.key, "id", None)
+                            if key_id is not None:
+                                await run_db(key_service.report_failure,
+                                             key_id, "stream_died", 0)
                     except Exception:
                         pass
                     logger.warning("stream truncated after content (req %s): %s",
@@ -741,6 +749,13 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                         from services.proxy_service import report_proxy_result
                         if w.route.proxy is not None:
                             await run_db(report_proxy_result, w.route.proxy.id, False)
+                        # 宽松判胜下 winner 可能在首个结构合法 chunk 后即判死：
+                        # 该 Key 竞速时已被记成功，这里补记失败保持统计可信
+                        # （不标 invalid，仅累计 + 冷却）。
+                        key_id = getattr(w.route.key, "id", None)
+                        if key_id is not None:
+                            await run_db(key_service.report_failure,
+                                         key_id, "stream_died", 0)
                     except Exception:
                         pass
                     excluded.add((getattr(w.route.key, "id", None),
