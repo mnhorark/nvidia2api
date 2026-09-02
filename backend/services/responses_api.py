@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import json
 import time
+import logging
 from typing import Any, AsyncIterator, Iterator
+
+logger = logging.getLogger("nvidia2api.responses")
 
 # 两协议同名的通用参数：忠实透传，不做白名单裁剪。
 # 依据 OpenAI 官方迁移指南（chat↔responses 字段对照）：
@@ -255,6 +258,15 @@ def chat_to_responses_body(body: dict) -> dict:
     if tool_choice is not None:
         out["tool_choice"] = tool_choice
     reasoning = _chat_reasoning_to_responses(body)
+    if reasoning is None:
+        # 实测（zen/muse-spark 矩阵回归）：思考型模型走 Responses 端点时，
+        # 若请求完全不带 reasoning 字段，上游只回 encrypted_content 密文块、
+        # 不发明文 summary——客户端看到的就只剩一坨解不开的乱码。参照
+        # RikkaHub/opencode 的默认行为：凡识别为思考能力的模型，自动补
+        # {"summary": "auto"}，上游即会流出明文 summary 事件。
+        from services import thinking as _thinking
+        if _thinking.is_known_thinking_model(body.get("model") or ""):
+            reasoning = {"summary": "auto"}
     if reasoning:
         out["reasoning"] = reasoning
         # 参考 RikkaHub：推理模型默认 summary auto，muse-spark-1.2 等 Responses 端点
@@ -333,6 +345,12 @@ def _reasoning_text(item: dict) -> str:
                 return dec
         except Exception:
             pass
+        # 上游自有封装的密文（非 Fernet / 密钥不在本端）：它仅供多轮回传，
+        # 没有展示价值，不再原样返回给客户端。
+        from services.reasoning_decrypt import _looks_like_opaque_blob
+        if _looks_like_opaque_blob(enc):
+            logger.debug("encrypted_content 不可解密（%d chars），跳过展示", len(enc))
+            return ""
         return enc
     return ""
 
@@ -710,6 +728,7 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
     # 推理内容：OpenAI 标准摘要增量事件
     if etype == "response.reasoning_summary_text.delta":
         delta_text = str(data.get("delta") or "")
+        state["reasoning_summary_streamed"] = True
         if delta_text.startswith("gAAAA"):
             try:
                 from services.reasoning_decrypt import decrypt_token
@@ -771,6 +790,11 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
         if not isinstance(item, dict):
             return None
         if item.get("type") == "reasoning":
+            # 增量 summary 已经作为 reasoning_content 流过了——done 事件里的
+            # item 会再携带一遍完整 summary，原样下发就是全量重复（双倍思考）。
+            # 因此：只要之前见过 summary 增量，done 一律不再补发。
+            if state.get("reasoning_summary_streamed"):
+                return None
             text = _reasoning_text(item)
             if text:
                 if text.startswith("gAAAA"):
@@ -781,6 +805,15 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
                             text = dec
                     except Exception:
                         pass
+                # 密文无法解密时（上游自有封装，如 zen/muse-spark 的
+                # 43e3da0e 头 blob，客户端不可能解开——RikkaHub/opencode 同样
+                # 只保存不解密）不再把乱码块怼给客户端，直接静默跳过；
+                # 明文 summary 已经在增量事件里给过了。
+                from services.reasoning_decrypt import _looks_like_opaque_blob
+                if _looks_like_opaque_blob(text):
+                    logger.debug("done 事件携带无法解密的思考密文（%d chars），已跳过展示",
+                                 len(text))
+                    return None
                 return json.dumps({"choices": [{"index": 0,
                                                 "delta": {"reasoning_content": text},
                                                 "finish_reason": None}]})

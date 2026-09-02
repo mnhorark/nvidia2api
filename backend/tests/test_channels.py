@@ -1207,3 +1207,54 @@ class DisabledChannelAccessTests(TestCase):
         request = self.factory.get("/c/zen/v1/models", **self.auth)
         resp = openai_views.list_models(request, channel_slug="zen")
         self.assertEqual(resp.status_code, 200)
+
+
+class MuseReasoningDefaultSummaryTests(TestCase):
+    """muse 思考修复回归：思考型模型走 Responses 端点时，即使客户端没传
+    思考参数，也必须带 reasoning.summary，否则上游只回密文块。"""
+
+    def test_known_thinking_model_gets_default_summary(self):
+        from services import responses_api
+        out = responses_api.chat_to_responses_body({
+            "model": "muse-spark-1.2-contributor-free",
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertIn("reasoning", out)
+        self.assertEqual(out["reasoning"]["summary"], "auto")
+        self.assertEqual(out["include"], ["reasoning.encrypted_content"])
+
+    def test_non_thinking_model_not_polluted(self):
+        """非思考模型不得被强行注入 reasoning 字段。"""
+        from services import responses_api
+        out = responses_api.chat_to_responses_body({
+            "model": "meta/llama-3.3-70b-instruct",
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertNotIn("reasoning", out)
+
+    def test_done_event_blob_not_emitted(self):
+        """done 事件里的密文（非 Fernet）不得怼给客户端。"""
+        from services.responses_api import _translate_event
+        import json as _json
+        blob = "Q-PaDg" + "X7" * 400
+        raw = "data: " + _json.dumps({
+            "type": "response.output_item.done",
+            "item": {"type": "reasoning", "encrypted_content": blob,
+                     "summary": []}}) + "\n\n"
+        out = _translate_event(raw, {})
+        self.assertIsNone(out)
+
+    def test_done_event_no_duplicate_when_streamed(self):
+        """summary 增量已流式下发过，done 不再重复整段。"""
+        from services.responses_api import _translate_event
+        import json as _json
+        state = {}
+        delta = "data: " + _json.dumps({
+            "type": "response.reasoning_summary_text.delta",
+            "delta": "thinking aloud..."}) + "\n\n"
+        first = _json.loads(_translate_event(delta, state))
+        self.assertIn("thinking aloud",
+                      first["choices"][0]["delta"]["reasoning_content"])
+        done = "data: " + _json.dumps({
+            "type": "response.output_item.done",
+            "item": {"type": "reasoning",
+                     "summary": [{"type": "summary_text", "text": "thinking aloud..."}]}}) + "\n\n"
+        self.assertIsNone(_translate_event(done, state))

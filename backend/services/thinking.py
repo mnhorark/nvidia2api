@@ -124,6 +124,12 @@ _THINKING_CAPABILITIES: list[tuple[str, ThinkingCapability]] = [
 _DEFAULT_CAPABILITY = ThinkingCapability()
 
 
+def is_known_thinking_model(model_name: str = "") -> bool:
+    """模型名是否命中思考能力表（有显式模式匹配）。"""
+    name = (model_name or "").lower()
+    return any(pattern in name for pattern, _ in _THINKING_CAPABILITIES)
+
+
 def resolve_capability(model_name: str = "") -> ThinkingCapability:
     name = (model_name or "").lower()
     for pattern, cap in _THINKING_CAPABILITIES:
