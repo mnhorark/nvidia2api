@@ -181,3 +181,84 @@ class SetEnabledConcurrencyTests(__import__("django.test", fromlist=["Transactio
         self.assertLessEqual(sum(results), 1)
         self.assertLessEqual(
             Proxy.objects.filter(channel=channel, enabled=True).count(), 1)
+
+
+class ProxyCheckerDecouplingTests(
+        __import__("django.test", fromlist=["TransactionTestCase"]).TransactionTestCase):
+    # run_db 在异步线程内写库；TestCase 的事务包裹会让旁线程写直接锁死，
+    # 必须用 TransactionTestCase（提交可见）才能测到真实写入。
+    """M6/M7 回归：拨测源 429 不等于代理死；连接级全失败才算不可用。"""
+
+    def _run(self, coro):
+        import asyncio
+        return asyncio.run(coro)
+
+    def _proxy(self):
+        channel = make_channel("pc")
+        return Proxy.objects.create(channel=channel, name="pp",
+                                    host="127.0.0.1", port=1080)
+
+    def _fake_client(self, behavior):
+        """behavior: list of ('http', status) | ('raise',) per probe URL."""
+        from services import proxy_checker
+
+        class _Resp:
+            def __init__(self, status):
+                self.status_code = status
+
+            def json(self):
+                return {"ip": "1.2.3.4", "country": "US"}
+
+        class _Client:
+            def __init__(self, *a, **kw):
+                self.calls = 0
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url):
+                what = behavior[min(self.calls, len(behavior) - 1)]
+                self.calls += 1
+                if what[0] == "raise":
+                    raise OSError("connection refused")
+                return _Resp(what[1])
+
+        return _Client
+
+    def test_probe_429_means_proxy_alive(self):
+        from services import proxy_checker
+        p = self._proxy()
+        fake = self._fake_client([("http", 429)])
+        with __import__("unittest.mock", fromlist=["patch"]).patch.object(
+                proxy_checker.httpx, "AsyncClient", fake):
+            res = self._run(proxy_checker.check_proxy(p, timeout=1))
+        self.assertTrue(res["ok"])
+        p.refresh_from_db()
+        self.assertEqual(p.success_count, 1)
+        self.assertEqual(p.failure_count, 0)
+
+    def test_connection_level_failure_means_dead(self):
+        from services import proxy_checker
+        p = self._proxy()
+        fake = self._fake_client([("raise",)])
+        with __import__("unittest.mock", fromlist=["patch"]).patch.object(
+                proxy_checker.httpx, "AsyncClient", fake):
+            res = self._run(proxy_checker.check_proxy(p, timeout=1))
+        self.assertFalse(res["ok"])
+        p.refresh_from_db()
+        self.assertEqual(p.failure_count, 1)
+
+    def test_first_probe_429_second_200_gets_geo(self):
+        from services import proxy_checker
+        p = self._proxy()
+        fake = self._fake_client([("http", 429), ("http", 200)])
+        with __import__("unittest.mock", fromlist=["patch"]).patch.object(
+                proxy_checker.httpx, "AsyncClient", fake):
+            res = self._run(proxy_checker.check_proxy(p, timeout=1))
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["ip"], "1.2.3.4")
+        p.refresh_from_db()
+        self.assertEqual(p.public_ip, "1.2.3.4")
