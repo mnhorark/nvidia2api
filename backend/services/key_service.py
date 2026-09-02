@@ -228,6 +228,22 @@ def claim_rpm_slot(key_id: int) -> bool:
         return False
 
 
+def release_rpm_slot(key_id: int) -> None:
+    """退还一次已申领但最终未被线路使用的 RPM 槽位。
+
+    场景：build_routes 已为每条线路 claim 名额后，全局上游并发闸门
+    （_reserve_upstream）不足的线路被整条丢弃——若不回滚，全局拥塞期
+    （恰是最需要保护 RPM 配额的时刻）会按比率虚耗各 Key 的分钟配额，
+    加速集体 429/误判 rate_limited。条件 UPDATE + F()-1，不会减成负数。
+    """
+    try:
+        ChannelKey.objects.filter(
+            pk=key_id, minute_request_count__gt=0,
+        ).update(minute_request_count=F("minute_request_count") - 1)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("release_rpm_slot %s failed (swallowed): %s", key_id, exc)
+
+
 def report_success(key_id: int):
     """记录一次成功。统计写入失败（如 SQLite 锁）只记日志，绝不连带请求失败。"""
     try:

@@ -86,8 +86,14 @@ def build_routes(channel: Channel | None = None,
     # 白占（未进线路却计数），最终误判 rate_limited。claim 失败同样不消耗
     # 代理（保持 M9 语义）。
     proxy_ptr = 0
-    for i in range(route_count):
-        key = keys[i]
+    # 线路回填：claim 竞争失败 / 组合级排除不消耗线路配额，继续用后续 Key
+    # 补位，直到铺满 route_count 或 Key 池耗尽。旧实现只看 keys[:route_count]，
+    # 高并发重试轮次下"5 Key 4 代理"可能实际只发出 1-2 条线路，竞速冗余
+    # 名存实亡。
+    ki = 0
+    while len(routes) < route_count and ki < len(keys):
+        key = keys[ki]
+        ki += 1
         proxy = proxies[proxy_ptr] if proxy_ptr < n_proxies else None
         # 上一轮被判定死亡（静默掐断）的 Key+代理组合：本轮不参与竞速。
         # 直连（proxy=None）也可被排除：被掐线路就是 winner，其 Key 被盗用
@@ -101,6 +107,7 @@ def build_routes(channel: Channel | None = None,
         if proxy is not None:
             proxy_ptr += 1
         routes.append(Route(kind="proxy" if proxy else "direct", key=key,
-                            proxy=proxy, url_override=endpoint or None))
+                            proxy=proxy, claimed=True,
+                            url_override=endpoint or None))
 
     return routes

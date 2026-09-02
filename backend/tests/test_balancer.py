@@ -157,3 +157,39 @@ class DefaultChannelTests(TestCase):
         routes = build_routes()
         self.assertEqual(len(routes), 1)
         self.assertEqual(routes[0].key.channel_id, channel.id)
+
+
+class BackfillTests(TestCase):
+    """M5 回归：claim 失败的 Key 不应造成线路塌缩，后续 Key 必须补位。"""
+
+    def setUp(self):
+        self.channel = Channel.objects.create(
+            name="BF", slug="bf", base_url="https://bf.test/v1")
+
+    def test_failed_claim_backfills_with_next_key(self):
+        from apps.core.models import ChannelKey as _K
+        keys = [
+            _K.objects.create(channel=self.channel, name=f"k{i}",
+                              api_key=f"bf-{i}", rpm_limit=2)
+            for i in range(6)
+        ]
+        # 让排头的 2 把 Key 接近满额：先白占一个槽，第二把打满
+        from services import key_service
+        key_service.claim_rpm_slot(keys[0].id)   # 用掉 1/2
+        key_service.claim_rpm_slot(keys[1].id)
+        key_service.claim_rpm_slot(keys[1].id)   # 打满 2/2
+        routes = build_routes(self.channel)
+        # 期望 1 条直连 + 无代理 = 1 条? 不：max_routes_per_request 默认为更大值，
+        # 无代理时 route_count = min(0+1, len(keys), max)=1——直连场景需代理才有意义。
+        # 建 3 个代理并启用（上限 6-1=5）
+        proxies = [Proxy.objects.create(channel=self.channel, name=f"bp{i}",
+                                        host=f"10.2.0.{i}", port=2000 + i)
+                   for i in range(3)]
+        for p in proxies:
+            proxy_service.set_enabled(p, True)
+        routes = build_routes(self.channel)
+        # route_count = min(3+1, 6, max)=4；k1（满额）应被跳过并用 k5 补位
+        self.assertEqual(len(routes), 4)
+        used = {r.key.name for r in routes}
+        self.assertNotIn("k1", used)
+        self.assertEqual(len(used), 4)

@@ -348,6 +348,11 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
         if not stream:
             upstream_reserved = _reserve_upstream(len(routes))
             if upstream_reserved < len(routes):
+                # 被全局并发闸门截断的线路：其 Key 已在 build_routes 内领取
+                # RPM 名额，整条丢弃前必须退回，否则拥塞期白烧配额。
+                for dropped in routes[upstream_reserved:]:
+                    if dropped.claimed and getattr(dropped.key, "id", None):
+                        key_service.release_rpm_slot(dropped.key.id)
                 routes = routes[:upstream_reserved]
         log = RequestLog.objects.create(
             channel=channel, request_id=request_id, user_api_key=user_key,
@@ -634,6 +639,11 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                 continue
             reserved = _reserve_upstream(len(rs))
             if reserved < len(rs):
+                # 被上游并发闸门截断的线路：退回它们已 claim 的 RPM 名额，
+                # 避免全局拥塞期按比率虚耗各 Key 的分钟配额。
+                for dropped in rs[reserved:]:
+                    if dropped.claimed and getattr(dropped.key, "id", None):
+                        await run_db(key_service.release_rpm_slot, dropped.key.id)
                 rs = rs[:reserved]
             if not rs:
                 last_exc = NoRouteAvailable()
