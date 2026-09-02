@@ -22,7 +22,12 @@ export default function SettingsPage() {
       const data = await api.get<{ channel: string; settings: RuntimeParam[] }>(
         "/api/admin/settings"
       );
-      const list = Array.isArray(data?.settings) ? data.settings : [];
+      // 隐藏不需要在控制台调整的参数；后端仍可通过 API / env 修改，
+      // 功能不受影响（如 max_request_bytes 这类体积极限，默认即可）
+      const HIDDEN = new Set(["max_request_bytes"]);
+      const list = (Array.isArray(data?.settings) ? data.settings : []).filter(
+        (p) => !HIDDEN.has(p.key)
+      );
       setParams(list);
       setChannel(data?.channel ?? "");
       setDraft(Object.fromEntries(list.map((p) => [p.key, String(p.value)])));
