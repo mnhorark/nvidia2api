@@ -99,7 +99,8 @@ def quota_enabled(rec: UserApiKey) -> bool:
 def check_quota(rec: UserApiKey) -> tuple[bool, str]:
     """请求前置检查：额度耗尽则拒绝。返回 (ok, reason)。
 
-    从库中取最新额度值，避免进程内缓存导致超卖；仅额度生效时多一次查询。
+    注意：这是"读后判"快照，仅供 UI 展示等参考场景。入口拦截必须改用
+    `claim_quota`（原子预占），否则 N 个并发在途请求可同时通过检查导致超扣。
     """
     if not quota_enabled(rec):
         return True, ""
@@ -109,16 +110,45 @@ def check_quota(rec: UserApiKey) -> tuple[bool, str]:
     return True, ""
 
 
+def claim_quota(rec: UserApiKey) -> tuple[bool, str]:
+    """原子预占 1 token 额度。返回 (ok, reason)。
+
+    用条件 UPDATE（WHERE used_quota < quota）把"检查 + 占位"合并为一条
+    语句，消除 check-then-act 竞态：并发请求再多也不会越过 quota。
+    预占的 1 token 由 record_usage 结算时扣除（reservation 参数）。
+    """
+    if not quota_enabled(rec):
+        return True, ""
+    updated = (
+        UserApiKey.objects
+        .filter(pk=rec.pk, used_quota__lt=F("quota"))
+        .update(used_quota=F("used_quota") + 1)
+    )
+    if updated:
+        return True, ""
+    return False, "quota_exceeded"
+
+
 def record_usage(rec: UserApiKey | None, prompt_tokens: int = 0,
-                 completion_tokens: int = 0, cached_tokens: int = 0) -> None:
+                 completion_tokens: int = 0, cached_tokens: int = 0,
+                 reservation: int = 0) -> None:
     """请求结束后累计 token 消耗。
 
     缓存 token 不占用额度（视为免费/折扣），与主流中转平台计费口径一致。
+    所有 token 计数先做负值钳制——恶意/异常上游返回负数 usage 不得抵扣
+    （否则等于给客户端"充值"）。reservation 为 claim_quota 预占的额度，
+    结算时从实际计费中扣除；delta 为负即退还预占（如下游失败请求）。
     """
     if rec is None or not quota_enabled(rec):
         return
-    billed = max(int(prompt_tokens or 0) - int(cached_tokens or 0), 0) + int(completion_tokens or 0)
-    if billed <= 0:
+    prompt = max(int(prompt_tokens or 0), 0)
+    completion = max(int(completion_tokens or 0), 0)
+    cached = max(int(cached_tokens or 0), 0)
+    billed = max(prompt - cached, 0) + completion
+    delta = billed - int(reservation or 0)
+    if delta == 0:
         return
     UserApiKey.objects.filter(pk=rec.pk).update(
-        used_quota=F("used_quota") + billed)
+        used_quota=F("used_quota") + delta)
+    # 防御性下限：并发结算/异常参数下不允许出现负额度
+    UserApiKey.objects.filter(pk=rec.pk, used_quota__lt=0).update(used_quota=0)

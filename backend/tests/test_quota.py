@@ -113,3 +113,55 @@ class QuotaApiTests(TestCase):
         self.assertEqual(resp.data["quota"], 999)
         rec.refresh_from_db()
         self.assertEqual(rec.quota, 999)
+
+
+class ClaimQuotaTests(TransactionTestCase):
+    """M2 回归：claim_quota 原子预占；record_usage 负值钳制（上游不可信 usage）。"""
+
+    def test_concurrent_claims_never_exceed_quota(self):
+        rec, _ = api_key_service.create_key("qc", quota=5)
+        results = []
+
+        def worker():
+            results.append(api_key_service.claim_quota(rec)[0])
+
+        threads = [threading.Thread(target=worker) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sum(results), 5)
+        rec.refresh_from_db()
+        self.assertEqual(rec.used_quota, 5)
+
+    def test_claim_settlement_returns_reservation_delta(self):
+        rec, _ = api_key_service.create_key("qs", quota=100)
+        ok, _ = api_key_service.claim_quota(rec)
+        self.assertTrue(ok)
+        rec.refresh_from_db()
+        self.assertEqual(rec.used_quota, 1)
+        api_key_service.record_usage(rec, prompt_tokens=30, completion_tokens=20,
+                                     reservation=1)
+        rec.refresh_from_db()
+        self.assertEqual(rec.used_quota, 50)
+
+    def test_failed_request_refunds_reservation(self):
+        rec, _ = api_key_service.create_key("qr", quota=100)
+        api_key_service.claim_quota(rec)
+        api_key_service.record_usage(rec, reservation=1)
+        rec.refresh_from_db()
+        self.assertEqual(rec.used_quota, 0)
+
+    def test_negative_upstream_usage_cannot_recharge(self):
+        rec, _ = api_key_service.create_key("qn", quota=100)
+        api_key_service.claim_quota(rec)  # used_quota = 1
+        api_key_service.record_usage(rec, prompt_tokens=-500,
+                                     completion_tokens=-999, reservation=1)
+        rec.refresh_from_db()
+        self.assertEqual(rec.used_quota, 0)
+
+    def test_used_quota_never_goes_negative(self):
+        rec, _ = api_key_service.create_key("q0", quota=100)
+        api_key_service.record_usage(rec, reservation=1)  # 无预占直接结算
+        rec.refresh_from_db()
+        self.assertEqual(rec.used_quota, 0)

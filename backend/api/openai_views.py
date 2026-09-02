@@ -269,7 +269,7 @@ def _authorize(request):
         if reason == "rate_limited":
             return None, openai_error("Rate limit exceeded", "rate_limit_exceeded", 429)
         return None, openai_error("API key disabled", "key_disabled", 403, "authentication_error")
-    ok, reason = api_key_service.check_quota(user_key)
+    ok, reason = api_key_service.claim_quota(user_key)
     if not ok:
         return None, openai_error("Insufficient quota (quota exceeded)",
                                   "insufficient_quota", 402, "insufficient_quota")
@@ -359,6 +359,8 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
         if not routes:
             _finish_log(log, started, False, 503, "no_available_route")
             api_key_service.record_result(user_key, False)
+            # claim_quota 预占的 1 token 在失败路径退还
+            api_key_service.record_usage(user_key, reservation=1)
             return openai_error("当前没有可用线路（该渠道没有可用的 Key）",
                                 "no_available_route", 503)
 
@@ -401,16 +403,36 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
             if isinstance(last_exc, NoRouteAvailable):
                 _finish_log(log, started, False, 503, "no_available_route")
                 api_key_service.record_result(user_key, False)
+                api_key_service.record_usage(user_key, reservation=1)  # 退还预占
                 return openai_error("当前没有可用线路", "no_available_route", 503)
             report = getattr(last_exc, "report", None) or []
             logger.warning("all routes failed after %d attempt(s): %s",
                            max_attempts, last_exc)
             _finish_log(log, started, False, 502, "all_routes_failed", routes=report)
             api_key_service.record_result(user_key, False)
+            api_key_service.record_usage(user_key, reservation=1)  # 退还预占
             return openai_error("上游服务暂时不可用，请稍后重试", "upstream_error", 502)
 
         r = result.route
         usage = (result.payload or {}).get("usage") or {}
+        # 上游缺省/省略 usage 时落本地估算：否则该请求对额度完全免费
+        # （流式路径本就有 tokenizer 兜底，两条路径口径必须一致）。
+        prompt_tokens = usage.get("prompt_tokens", 0) or 0
+        completion_tokens = usage.get("completion_tokens", 0) or 0
+        if not prompt_tokens or not completion_tokens:
+            from services import tokenizer as _tokenizer
+            if not prompt_tokens:
+                prompt_tokens = _tokenizer.estimate_messages_tokens(
+                    upstream_body.get("messages"))
+            if not completion_tokens:
+                _text_parts: list[str] = []
+                for _ch in ((result.payload or {}).get("choices") or []):
+                    _msg = (_ch or {}).get("message") or {}
+                    if isinstance(_msg.get("content"), str):
+                        _text_parts.append(_msg["content"])
+                completion_tokens = _tokenizer.estimate_tokens("".join(_text_parts))
+        usage = dict(usage, prompt_tokens=prompt_tokens,
+                     completion_tokens=completion_tokens)
         _finish_log(log, started, True, result.http_status, "", route_kind=r.kind,
                     key_name=r.key.name, proxy_name=r.proxy.name if r.proxy else "",
                     proxy_ip=(r.proxy.public_ip if r.proxy else ""),
@@ -418,9 +440,10 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
         api_key_service.record_result(user_key, True)
         api_key_service.record_usage(
             user_key,
-            usage.get("prompt_tokens", 0) or 0,
-            usage.get("completion_tokens", 0) or 0,
+            prompt_tokens,
+            completion_tokens,
             (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0,
+            reservation=1,  # 扣除 claim_quota 预占的 1 token
         )
         payload = result.payload
         if protocol == "responses":
@@ -590,7 +613,8 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
         await run_db(
             api_key_service.record_usage,
             user_key, rec.prompt_tokens or 0,
-            rec.completion_tokens or 0, rec.cached_tokens or 0)
+            rec.completion_tokens or 0, rec.cached_tokens or 0,
+            1)  # reservation：扣除入口 claim_quota 预占的 1 token
 
     async def _safe_finish(*args, **kwargs):
         try:
