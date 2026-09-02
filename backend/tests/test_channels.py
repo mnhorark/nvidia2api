@@ -1164,3 +1164,46 @@ class BatchApiTests(TestCase):
 
         resp = self._post(view, {"ids": [proxies[0].id], "action": "delete"})
         self.assertEqual(Proxy.objects.count(), 2)
+
+
+class DisabledChannelAccessTests(TestCase):
+    """M1 回归：禁用渠道必须彻底下线，不得被 /c/<slug>/ 或 body.channel 显式寻址。"""
+
+    def setUp(self):
+        self.factory = RequestFactory()
+        self.channel = Channel.objects.create(
+            name="Zen", slug="zen", base_url="https://z.test/v1", enabled=False)
+        ChannelKey.objects.create(channel=self.channel, name="k1", api_key="k1")
+        AIModel.objects.create(channel=self.channel, model_name="m1", enabled=True)
+        _user, self.raw_key = api_key_service.create_key("tester")
+        self.auth = {"HTTP_AUTHORIZATION": f"Bearer {self.raw_key}"}
+
+    def test_chat_by_slug_rejected_when_disabled(self):
+        request = self.factory.post(
+            "/c/zen/v1/chat/completions",
+            data=json.dumps({"model": "m1",
+                             "messages": [{"role": "user", "content": "hi"}]}),
+            content_type="application/json", **self.auth)
+        resp = openai_views.chat_completions(request, channel_slug="zen")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_chat_by_body_channel_rejected_when_disabled(self):
+        request = self.factory.post(
+            "/v1/chat/completions",
+            data=json.dumps({"model": "m1", "channel": "zen",
+                             "messages": [{"role": "user", "content": "hi"}]}),
+            content_type="application/json", **self.auth)
+        resp = openai_views.chat_completions(request)
+        self.assertEqual(resp.status_code, 404)
+
+    def test_models_by_slug_rejected_when_disabled(self):
+        request = self.factory.get("/c/zen/v1/models", **self.auth)
+        resp = openai_views.list_models(request, channel_slug="zen")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_reenable_restores_access(self):
+        self.channel.enabled = True
+        self.channel.save()
+        request = self.factory.get("/c/zen/v1/models", **self.auth)
+        resp = openai_views.list_models(request, channel_slug="zen")
+        self.assertEqual(resp.status_code, 200)

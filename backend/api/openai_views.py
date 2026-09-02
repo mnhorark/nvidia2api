@@ -147,7 +147,7 @@ def list_models(request, channel_slug: str | None = None):
 
     if channel_slug:
         channel = channel_service.lookup(channel_slug)
-        if channel is None:
+        if channel is None or not channel.enabled:
             return openai_error(f"Unknown channel '{channel_slug}'",
                                 "channel_not_found", 404, "invalid_request_error")
         ms = list(channel.models.filter(enabled=True).order_by("model_name"))
@@ -169,7 +169,9 @@ def _resolve_channel(slug: str | None) -> Channel | None:
     if not slug:
         return None
     channel = channel_service.lookup(slug)
-    if channel is None:
+    # 禁用即彻底下线：/c/<slug>/ 与 body.channel 两条显式路径都不得再服务。
+    # 否则管理员禁用渠道（如 Key 泄露应急）不产生任何效果。
+    if channel is None or not channel.enabled:
         raise ChannelNotFound(slug)
     return channel
 
@@ -188,7 +190,8 @@ def _not_found_error(name: str, channel_slug: str | None):
     if not channel_slug:
         owners = model_registry.channels_with_model(name)
         if owners:
-            msg += f" (disabled channel(s): {', '.join(c.slug for c in owners)})"
+            # 提示模型存在于已禁用渠道，但不回显内部渠道 slug（信息泄露面）
+            msg += " (exists on disabled channel(s))"
     return openai_error(msg, "model_not_found", 404, "invalid_request_error")
 
 
