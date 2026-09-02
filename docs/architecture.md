@@ -5,7 +5,9 @@
 NVIDIA2API 是面向 NVIDIA AI API 的聚合代理平台：
 
 - 管理多个 NVIDIA API Key（40 RPM/Key 默认）、多协议代理（SOCKS5/HTTP/HTTPS）两者组成"线路池"
+
 - 对外暴露 OpenAI 兼容的 `/v1/models`、`/v1/chat/completions`
+
 - 核心能力：**多线路并发竞速 + 首个有效响应 Winner + 其余线路立即取消**
 
 ## 分层
@@ -17,22 +19,28 @@ NVIDIA2API 是面向 NVIDIA AI API 的聚合代理平台：
                │ Admin Token            │ Bearer sk-nvidia2api-*
 ┌──────────────▼────────────────────────▼────────────────────┐
 │                Django + DRF (api/)                         │
-│   /api/admin/*                 /v1/*                       │
+│   /api/admin/*（admin_views 包，按资源拆分）   /v1/*       │
 │   管理 CRUD/统计               OpenAI 兼容                 │
 └──────────────┬─────────────────────────────────────────────┘
                │
 ┌──────────────▼────────────────┐
 │        services/ 服务层        │
 │  channel_service 渠道解析      │
+│  channel_health 渠道熔断       │
 │  key_service      Key 限流冷却 │
 │  proxy_service    代理启用限制 │
 │  proxy_checker    并发测速/IP  │
 │  load_balancer    线路构建     │
 │  race_engine      竞速执行     │
-│  upstream_service 上游 HTTP    │
-│  api_key_service        用户Key│
+│  responses_api / anthropic_api  协议转换（内部统一 chat 格式）│
 │  thinking         思考强度归一化│
-│  sysconfig        运行时参数   │
+│  tokenizer        本地 token 估算│
+│  crypto           敏感字段加密   │
+│  cleanup          日志保留清理   │
+│  loop_offload     事件循环去阻塞 │
+│  sysconfig        运行时参数(缓存)│
+│  api_key_service        用户Key│
+│  upstream_service 上游 HTTP    │
 └──────────────┬────────────────┘
                │ httpx(异步) + SQLite
 ┌──────────────▼────────┐   ┌────────────────────┐
@@ -44,11 +52,21 @@ NVIDIA2API 是面向 NVIDIA AI API 的聚合代理平台：
 ## 关键决策
 
 1. **业务不落 View**：`api/*` 只做参数校验与响应拼装，业务都在 `services/`。
-2. **同步视图 + 竞速内部 async**：竞速在 `asyncio.run()` / 独立 event loop 中执行；"DRF 视图保持同步"避免 ASGI 迁移复杂度。
+2. **异步流式 + ASGI 逐块下发**：流式响应是 async 生成器，Django ASGI 逐块转发
+   （同步生成器会被一次性缓冲成"假流式"）。竞速在事件循环内执行；
+   同步 DB 写经 `services/loop_offload.run_db` 挪到线程池，避免写锁阻塞事件循环
+   （卡死主链，见 audit R4）。
 3. **SQLite 并发控制**：Key 的 RPM 计数用数据库侧条件 `UPDATE ... WHERE count < rpm_limit`，放弃 `SELECT FOR UPDATE`，避免 SQLite 锁升级死锁（detail 见 [database.md](database.md)）。
-4. **运行时参数优先于环境变量**：`SystemSetting` 表中的值覆盖 `.env`，改后即时生效（`sysconfig.py`），且**按渠道隔离**。
+4. **运行时参数优先于环境变量**：`SystemSetting` 表中的值覆盖 `.env`，改后即时生效（`sysconfig.py`，带 TTL 缓存 + 信号失效），且**按渠道隔离**。
 5. **线路数 = 启用代理数 + 1 直连**：代理数量上限 = 该渠道 Key 数 − 1，由后端在 `set_enabled` 强制（不是前端校验）。
 6. **渠道是一等公民**：上游 URL 与鉴权方式由 `Channel` 决定，不再有全局的 `NVIDIA_BASE_URL` 单点；Keys/代理/分组/模型/日志/设置全部挂 channel 外键（见 [channels.md](channels.md)）。
+7. **管理视图按资源拆分**：`api/admin_views/` 包（auth/channels/keys/proxies/proxy\_groups/models\_admin/user\_keys/logs/dashboard/settings/chat + common），
+   `__init__.py` 聚合导出保持 `admin_views.XxxView` 引用兼容（参考 new-api 按资源分 handler）。
+8. **宽松判胜 + 透传**：竞速比"谁先开始出流"（首个结构 chunk，含空 role 块），
+   胜出后默认不掐流（`stream_first_content_timeout=0`），正文/思考到达速度是模型特性
+   （对齐 new-api 透传语义，见 audit R5）。
+9. **协议转换统一内部格式**：`/v1/responses`、`/v1/messages` 入口转成内部 chat 格式，
+   出口再转回各协议 SSE（`responses_api` / `anthropic_api`），竞速/日志/限流完全复用。
 
 ## 请求路径（聊天）
 
@@ -58,11 +76,13 @@ POST /v1/chat/completions  或  POST /c/<slug>/v1/chat/completions
   验证 Bearer（UserApiKey, sha256）
   验证模型 enabled（限定在该渠道内）
   用户 Key 限流（rate_limit>0 才计数）
-  全局并发信号量
-  build_routes(channel) → [代理+Key]*N + [直连+Key]
-  race (asyncio.FIRST_COMPLETED)
-    ├ 首个"有效响应"判定 Winner（见 race-engine.md）
+  动态并发闸门（sysconfig.max_concurrent_requests，事件循环计数）
+  build_routes(channel) → [代理+Key]*N + [直连+Key]（RPM 原子 claim + 排除先于 claim）
+  race (asyncio.FIRST_COMPLETED) —— 宽松判胜：首个结构合法 chunk 即 Winner
     ├ 其余任务 cancel + httpx 连接关闭
+    ├ 每线路统计写库经 run_db 移出事件循环
     └ 写 RequestLog（含每条线路明细）
-  返回用户（SSE 或 JSON）
+  返回用户（SSE async 生成器逐块转发 / JSON）
+    失败路径落库一律 _safe_finish/_safe_save 兜底，绝不逃逸炸 ASGI
 ```
+

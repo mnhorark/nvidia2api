@@ -52,7 +52,7 @@ if not exist "frontend\node_modules" (
 
 rem ---- [4/4] start servers ----
 echo [4/4] Starting servers ...
-start "nvidia2api Backend :8000" cmd /k "cd /d ""%~dp0backend"" && python -m uvicorn config.asgi:application --host 0.0.0.0 --port 8000 --reload"
+start "nvidia2api Backend :8000" cmd /k "cd /d ""%~dp0backend"" && python -m uvicorn config.asgi:application --host 0.0.0.0 --port 8000"
 start "nvidia2api Frontend :3000" cmd /k "cd /d ""%~dp0frontend"" && npm run dev"
 
 echo.
