@@ -66,6 +66,7 @@ urlpatterns = [
 
     path("api/admin/logs", admin_views.LogListView.as_view()),
     path("api/admin/logs/clean", admin_views.LogCleanView.as_view()),
+    path("api/admin/logs/<int:pk>", admin_views.LogDetailView.as_view()),
 
     # ---- 前端静态托管（all-in-one 镜像）----
     # 必须放在最后，且用否定预查排除 API 前缀：未知 API 路径仍然要返回 404，
