@@ -54,8 +54,9 @@ async def check_proxy(proxy: Proxy, timeout: float | None = None) -> dict:
         }
     except Exception as exc:  # noqa: BLE001
         latency_ms = (time.monotonic() - start) * 1000
-        report_proxy_result(proxy.id, False)
-        Proxy.objects.filter(pk=proxy.id).update(last_check_at=timezone.now())
+        from services.loop_offload import run_db
+        await run_db(report_proxy_result, proxy.id, False)
+        await run_db(lambda: Proxy.objects.filter(pk=proxy.id).update(last_check_at=timezone.now()))
         return {"ok": False, "error": type(exc).__name__, "latency_ms": round(latency_ms, 1)}
 
 

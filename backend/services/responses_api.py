@@ -160,27 +160,29 @@ def _response_format_to_chat(text):
 def _chat_reasoning_to_responses(body: dict) -> dict | None:
     """把 chat 侧思考参数映射为 Responses API 的 reasoning.effort。
 
-    思考参数已由 thinking 服务归一化到顶层 reasoning_effort / chat_template_kwargs，
-    这里把 intent 映射成 responses 的 `reasoning: {"effort": ...}`；客户端未表达
-    任何思考意图时返回 None（不额外携带，避免改变上游行为）。
+    使用 thinking.parse() 归一化思考意图，支持所有客户端格式：
+    - reasoning_effort: "high"
+    - reasoning: {effort: "high"}
+    - thinking: {type: "enabled", budget_tokens: 8000}
+    - extra_body.openai.reasoning_effort: "high"
+    等任意嵌套格式。
     """
-    effort = body.get("reasoning_effort")
-    thinking_flag = None
-    kwargs = body.get("chat_template_kwargs")
-    if isinstance(kwargs, dict):
-        thinking_flag = kwargs.get("thinking")
-        if thinking_flag is None:
-            thinking_flag = kwargs.get("enable_thinking")
-    if thinking_flag is None:
-        thinking_flag = body.get("thinking")
-    if thinking_flag is None:
-        thinking_flag = body.get("enable_thinking")
+    from services import thinking
+    spec = thinking.parse(body)
+    if not spec.is_set():
+        return None
     out: dict = {}
-    if effort is not None:
-        e = str(effort).strip().lower()
-        out["effort"] = _EFFORT_TO_RESPONSES.get(e, e)
-    if thinking_flag is False and "effort" not in out:
+    if spec.enabled is False:
         out["effort"] = "none"
+    elif spec.enabled is True:
+        if spec.effort:
+            e = str(spec.effort).strip().lower()
+            out["effort"] = _EFFORT_TO_RESPONSES.get(e, e)
+        else:
+            out["enabled"] = True
+    elif spec.effort:
+        e = str(spec.effort).strip().lower()
+        out["effort"] = _EFFORT_TO_RESPONSES.get(e, e)
     return out or None
 
 
@@ -255,6 +257,14 @@ def chat_to_responses_body(body: dict) -> dict:
     reasoning = _chat_reasoning_to_responses(body)
     if reasoning:
         out["reasoning"] = reasoning
+        # 参考 RikkaHub：推理模型默认 summary auto，muse-spark-1.2 等 Responses 端点
+        # 需同时携带 include，服务端才会返回 reasoning.encrypted_content 与 summary
+        if "summary" not in out["reasoning"]:
+            out["reasoning"]["summary"] = "auto"
+        # 参考 RikkaHub：推理模型默认 summary auto，muse-spark-1.2 等 Responses 端点
+        # 需同时携带 include，服务端才会返回 reasoning.encrypted_content 与 summary
+        if "include" not in body and "include" not in out:
+            out["include"] = ["reasoning.encrypted_content"]
     max_tokens = body.get("max_tokens")
     if max_tokens is None:
         max_tokens = body.get("max_completion_tokens")
@@ -303,15 +313,28 @@ def _reasoning_summary_text(item: dict) -> str:
 
 
 def _reasoning_text(item: dict) -> str:
-    """提取推理条目的可透传内容：优先明文摘要，否则原样透传加密内容。
+    """提取推理条目的可透传内容：优先明文摘要，无明文时尝试解密密文。
 
-    上游对推理内容加密（encrypted_content）时，不替换、不解密，原样放在
-    reasoning_content 中，由下游（拥有解密能力的一方）自行处理。
+    参考 RikkaHub 的 Responses 协议处理：
+    - summary 为明文摘要（summary_text 数组），可直接展示
+    - encrypted_content 为 Fernet 密文（gAAAA…），RikkaHub 保存为
+      OpenAIReasoningMetadata 原样回传；本端有密钥时尝试还原（muse-spark-1.2
+      常见：仅给密文不给明文 summary），失败则保留密文占位，不抛异常。
     """
     text = _reasoning_summary_text(item)
     if text:
         return text
-    return str(item.get("encrypted_content") or "")
+    enc = item.get("encrypted_content")
+    if isinstance(enc, str) and enc:
+        try:
+            from services.reasoning_decrypt import decrypt_token
+            dec = decrypt_token(enc)
+            if dec is not None:
+                return dec
+        except Exception:
+            pass
+        return enc
+    return ""
 
 
 def _message_to_item(msg) -> dict:
@@ -414,6 +437,8 @@ def responses_payload_to_chat(payload: dict) -> dict:
         if item.get("type") == "message":
             text += _content_to_text(item.get("content"))
         elif item.get("type") == "reasoning":
+            # 参考 RikkaHub 的 parseResponseOutput：
+            # 优先使用 summary 明文，无明文时尝试解密 encrypted_content
             reasoning += _reasoning_text(item)
         elif item.get("type") == "function_call":
             tool_calls.append({
@@ -465,17 +490,25 @@ def responses_payload_to_chat(payload: dict) -> dict:
 def responses_to_chat_body(rb: dict) -> dict:
     """把客户端 Responses API 请求体转成内部 chat/completions 请求体。
 
-    `/v1/responses` 入口用它归一化后复用整套竞速/重试/日志链路。
-    同名通用参数直接透传；仅做结构性映射（input->messages、
-    max_output_tokens->max_tokens、instructions->system 消息、
-    reasoning.effort->reasoning_effort、tools/tool_choice/text.format 的
-    包装差异），responses 独有而 chat 无法表达的字段（previous_response_id、
-    truncation、include 等）按协议限制不携带。
+    无损原则：同名透传 + 结构性映射（input->messages、max_output_tokens->
+    max_tokens、instructions->system、reasoning.effort->reasoning_effort、
+    tools/text 包装），responses 独有且 chat 无法表达的字段
+    （previous_response_id/truncation/include 等）不携带以避免 400，
+    其余未知顶层字段一律保留。
     """
     out: dict[str, Any] = {}
     for key in _RESPONSES_COMMON | _CHAT_ONLY:
         if key in rb and rb[key] is not None:
             out[key] = rb[key]
+    # 保留未知顶层字段（Responses 未来新增字段无损透传）
+    _RESPONSES_STRUCTURAL = frozenset({
+        "tools", "tool_choice", "reasoning", "max_output_tokens",
+        "instructions", "input", "text",
+    })
+    for key, val in rb.items():
+        if key not in _RESPONSES_COMMON and key not in _CHAT_ONLY \
+                and key not in _RESPONSES_STRUCTURAL and val is not None:
+            out[key] = val
     tools = _tools_to_chat(rb.get("tools"))
     if tools is not None:
         out["tools"] = tools
@@ -604,6 +637,7 @@ def chat_to_responses_payload(chat: dict, echo: dict | None = None) -> dict:
         resp["incomplete_details"] = {"reason": _FINISH_TO_RESPONSES[finish]}
     if echo and isinstance(echo, dict):
         # 回显请求参数，保持 response 对象与 OpenAI 结构一致
+        # 参考 RikkaHub 的 chat_to_responses_payload：回显 reasoning 保证结构完整
         for key in ("instructions", "previous_response_id", "tools",
                     "parallel_tool_calls", "truncation", "metadata", "store",
                     "user", "reasoning", "include", "max_output_tokens",
@@ -675,8 +709,17 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
                                         "finish_reason": None}]})
     # 推理内容：OpenAI 标准摘要增量事件
     if etype == "response.reasoning_summary_text.delta":
+        delta_text = str(data.get("delta") or "")
+        if delta_text.startswith("gAAAA"):
+            try:
+                from services.reasoning_decrypt import decrypt_token
+                dec = decrypt_token(delta_text)
+                if dec is not None:
+                    delta_text = dec
+            except Exception:
+                pass
         return json.dumps({"choices": [{"index": 0,
-                                        "delta": {"reasoning_content": str(data.get("delta") or "")},
+                                        "delta": {"reasoning_content": delta_text},
                                         "finish_reason": None}]})
     if etype == "response.output_item.added":
         item = data.get("item")
@@ -730,6 +773,14 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
         if item.get("type") == "reasoning":
             text = _reasoning_text(item)
             if text:
+                if text.startswith("gAAAA"):
+                    try:
+                        from services.reasoning_decrypt import decrypt_token
+                        dec = decrypt_token(text)
+                        if dec is not None:
+                            text = dec
+                    except Exception:
+                        pass
                 return json.dumps({"choices": [{"index": 0,
                                                 "delta": {"reasoning_content": text},
                                                 "finish_reason": None}]})
@@ -827,132 +878,141 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
                          {"type": "response.output_item.added",
                           "output_index": 0, "item": item})
 
-    async for chunk in chat_iter:
-        # SSE 心跳注释（`: keep-alive`）原样透传：/v1/responses 出口同样保活
-        if chunk.startswith(":"):
-            yield chunk
-            continue
-        if not chunk.startswith("data:"):
-            continue
-        payload = chunk[5:].strip().rstrip("\n")
-        if payload == "[DONE]":
-            if not done_sent:
-                yield "data: [DONE]\n\n"
-                done_sent = True
-            return
-        try:
-            data = json.loads(payload)
-        except Exception:  # noqa: BLE001
-            continue
-        if not isinstance(data, dict):
-            continue
-        if data.get("error"):
-            yield _sse_event("response.failed",
-                             {"type": "response.failed", "error": data["error"]})
-            continue
-        choices = data.get("choices") or []
-        if not choices:
-            continue
-        ch = choices[0]
-        rid = data.get("id") or "resp_x"
-        if not emitted_created:
-            emitted_created = True
-            yield _sse_event("response.created", {
-                "type": "response.created",
-                "response": {"id": rid, "object": "response",
-                             "status": "in_progress", "model": data.get("model") or ""},
-            })
-            yield _sse_event("response.in_progress", {
-                "type": "response.in_progress",
-                "response": {"id": rid, "object": "response",
-                             "status": "in_progress", "model": data.get("model") or ""},
-            })
-        delta = ch.get("delta") or {}
-        reasoning = delta.get("reasoning_content")
-        if reasoning:
-            reasoning_acc += str(reasoning)
-            async for _ev in announce({"id": "rs_0", "type": "reasoning",
-                                       "status": "in_progress", "summary": []}):
-                yield _ev
-            yield _sse_event("response.reasoning_summary_text.delta", {
-                "type": "response.reasoning_summary_text.delta", "output_index": 0,
-                "delta": str(reasoning),
-            })
-        content = delta.get("content")
-        if content:
-            content_acc += str(content)
-            async for _ev in announce({"id": message_item_id, "type": "message",
-                                       "role": "assistant", "status": "in_progress",
-                                       "content": []}):
-                yield _ev
-            yield _sse_event("response.output_text.delta", {
-                "type": "response.output_text.delta", "output_index": 0,
-                "delta": str(content),
-            })
-        tool_calls = delta.get("tool_calls")
-        if isinstance(tool_calls, list):
-            for tc in tool_calls:
-                iid = str(tc.get("id") or "")
-                fn = tc.get("function") or {}
-                if iid and iid not in announced:
-                    async for _ev in announce({"id": iid, "type": "function_call",
-                                               "status": "in_progress", "call_id": iid,
-                                               "name": str(fn.get("name") or ""),
-                                               "arguments": ""}):
-                        yield _ev
-                if iid:
-                    if fn.get("name"):
-                        tool_names[iid] = str(fn["name"])
-                    args = str(fn.get("arguments") or "")
-                    tool_args[iid] = tool_args.get(iid, "") + args
-                    yield _sse_event("response.function_call_arguments.delta", {
-                        "type": "response.function_call_arguments.delta",
-                        "output_index": 0, "item_id": iid,
-                        "delta": args,
-                    })
-        if data.get("usage"):
-            usage = data["usage"]
-        finish = ch.get("finish_reason")
-        if finish:
-            if "rs_0" in announced:
-                yield _sse_event("response.output_item.done", {
-                    "type": "response.output_item.done", "output_index": 0,
-                    "item": {"id": "rs_0", "type": "reasoning",
-                             "status": "completed", "summary": []},
+    try:
+        async for chunk in chat_iter:
+            # SSE 心跳注释（`: keep-alive`）原样透传：/v1/responses 出口同样保活
+            if chunk.startswith(":"):
+                yield chunk
+                continue
+            if not chunk.startswith("data:"):
+                continue
+            payload = chunk[5:].strip().rstrip("\n")
+            if payload == "[DONE]":
+                if not done_sent:
+                    yield "data: [DONE]\n\n"
+                    done_sent = True
+                return
+            try:
+                data = json.loads(payload)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(data, dict):
+                continue
+            if data.get("error"):
+                yield _sse_event("response.failed",
+                                 {"type": "response.failed", "error": data["error"]})
+                continue
+            choices = data.get("choices") or []
+            if not choices:
+                continue
+            ch = choices[0]
+            rid = data.get("id") or "resp_x"
+            if not emitted_created:
+                emitted_created = True
+                yield _sse_event("response.created", {
+                    "type": "response.created",
+                    "response": {"id": rid, "object": "response",
+                                 "status": "in_progress", "model": data.get("model") or ""},
                 })
-            if message_item_id in announced:
-                yield _sse_event("response.output_text.done", {
-                    "type": "response.output_text.done", "output_index": 0,
-                    "text": content_acc, "item_id": message_item_id,
+                yield _sse_event("response.in_progress", {
+                    "type": "response.in_progress",
+                    "response": {"id": rid, "object": "response",
+                                 "status": "in_progress", "model": data.get("model") or ""},
                 })
-                yield _sse_event("response.output_item.done", {
-                    "type": "response.output_item.done", "output_index": 0,
-                    "item": {"id": message_item_id, "type": "message",
-                             "role": "assistant", "status": "completed",
-                             "content": [{"type": "output_text", "text": content_acc}]},
+            delta = ch.get("delta") or {}
+            reasoning = delta.get("reasoning_content")
+            if reasoning:
+                reasoning_acc += str(reasoning)
+                async for _ev in announce({"id": "rs_0", "type": "reasoning",
+                                           "status": "in_progress", "summary": []}):
+                    yield _ev
+                yield _sse_event("response.reasoning_summary_text.delta", {
+                    "type": "response.reasoning_summary_text.delta", "output_index": 0,
+                    "delta": str(reasoning),
                 })
-            for iid in announced:
-                if iid not in ("rs_0", message_item_id):
+            content = delta.get("content")
+            if content:
+                content_acc += str(content)
+                async for _ev in announce({"id": message_item_id, "type": "message",
+                                           "role": "assistant", "status": "in_progress",
+                                           "content": []}):
+                    yield _ev
+                yield _sse_event("response.output_text.delta", {
+                    "type": "response.output_text.delta", "output_index": 0,
+                    "delta": str(content),
+                })
+            tool_calls = delta.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    iid = str(tc.get("id") or "")
+                    fn = tc.get("function") or {}
+                    if iid and iid not in announced:
+                        async for _ev in announce({"id": iid, "type": "function_call",
+                                                   "status": "in_progress", "call_id": iid,
+                                                   "name": str(fn.get("name") or ""),
+                                                   "arguments": ""}):
+                            yield _ev
+                    if iid:
+                        if fn.get("name"):
+                            tool_names[iid] = str(fn["name"])
+                        args = str(fn.get("arguments") or "")
+                        tool_args[iid] = tool_args.get(iid, "") + args
+                        yield _sse_event("response.function_call_arguments.delta", {
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": 0, "item_id": iid,
+                            "delta": args,
+                        })
+            if data.get("usage"):
+                usage = data["usage"]
+            finish = ch.get("finish_reason")
+            if finish:
+                if "rs_0" in announced:
                     yield _sse_event("response.output_item.done", {
                         "type": "response.output_item.done", "output_index": 0,
-                        "item": {"id": iid, "type": "function_call",
-                                 "status": "completed", "call_id": iid,
-                                 "name": tool_names.get(iid, ""),
-                                 "arguments": tool_args.get(iid, "")},
+                        "item": {"id": "rs_0", "type": "reasoning",
+                                 "status": "completed", "summary": []},
                     })
-            if finish == "stop" or finish == "tool_calls":
-                status = "completed"
-            else:
-                status = "incomplete"
-            completed: dict = {
-                "type": "response.completed",
-                "response": {"id": rid, "object": "response",
-                             "status": status, "model": data.get("model") or "",
-                             "usage": usage},
-            }
-            if finish in _FINISH_TO_RESPONSES:
-                completed["response"]["incomplete_details"] = {
-                    "reason": _FINISH_TO_RESPONSES[finish]}
-            yield _sse_event("response.completed", completed)
+                if message_item_id in announced:
+                    yield _sse_event("response.output_text.done", {
+                        "type": "response.output_text.done", "output_index": 0,
+                        "text": content_acc, "item_id": message_item_id,
+                    })
+                    yield _sse_event("response.output_item.done", {
+                        "type": "response.output_item.done", "output_index": 0,
+                        "item": {"id": message_item_id, "type": "message",
+                                 "role": "assistant", "status": "completed",
+                                 "content": [{"type": "output_text", "text": content_acc}]},
+                    })
+                for iid in announced:
+                    if iid not in ("rs_0", message_item_id):
+                        yield _sse_event("response.output_item.done", {
+                            "type": "response.output_item.done", "output_index": 0,
+                            "item": {"id": iid, "type": "function_call",
+                                     "status": "completed", "call_id": iid,
+                                     "name": tool_names.get(iid, ""),
+                                     "arguments": tool_args.get(iid, "")},
+                        })
+                if finish == "stop" or finish == "tool_calls":
+                    status = "completed"
+                else:
+                    status = "incomplete"
+                completed: dict = {
+                    "type": "response.completed",
+                    "response": {"id": rid, "object": "response",
+                                 "status": status, "model": data.get("model") or "",
+                                 "usage": usage},
+                }
+                if finish in _FINISH_TO_RESPONSES:
+                    completed["response"]["incomplete_details"] = {
+                        "reason": _FINISH_TO_RESPONSES[finish]}
+                yield _sse_event("response.completed", completed)
+    finally:
+        # 客户端断开 / 外层 aclose 时，内层 chat 生成器（_stream_response）必须
+        # 被显式关闭——否则其 finally（含并发闸门 _bump_active(-1)）要等 GC 触发，
+        # 高压下表现为假 server_overloaded。见审查条目 R2-M2-6。
+        try:
+            await chat_iter.aclose()
+        except Exception:  # noqa: BLE001
+            pass
     if not done_sent:
         yield "data: [DONE]\n\n"

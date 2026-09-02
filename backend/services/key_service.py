@@ -40,6 +40,17 @@ def _stored_plain_keys(channel: Channel) -> set[str]:
             for stored in channel.keys.values_list("api_key", flat=True)}
 
 
+def _key_stored_in_channel(channel: Channel, plain_key: str) -> bool:
+    """该明文 Key 是否已存在于渠道内（去重检查）。
+
+    存储为密文，必须逐条解密比对；重复导入防护使用，高频路径（批量导入）
+    请改用 `_stored_plain_keys` 一次性构建集合后自行 in 判断。
+    """
+    if not plain_key:
+        return False
+    return plain_key in _stored_plain_keys(channel)
+
+
 def parse_import_text(text: str) -> list[tuple[str, str, str | None]]:
     """Parse bulk import lines. Returns list of (name, key, auto_name_or_None)."""
     lines = [ln.strip() for ln in text.splitlines()]

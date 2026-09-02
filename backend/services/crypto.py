@@ -19,12 +19,28 @@ from django.conf import settings
 logger = logging.getLogger("nvidia2api.crypto")
 
 _PREFIX = "enc:v1:"
+_fernet_singleton: Fernet | None = None
+_fernet_key_fingerprint: str | None = None
 
 
 def _fernet() -> Fernet:
-    raw = getattr(settings, "ENCRYPTION_KEY", None) or settings.SECRET_KEY or "nvidia2api"
-    key = base64.urlsafe_b64encode(hashlib.sha256(str(raw).encode("utf-8")).digest())
-    return Fernet(key)
+    # Fernet 构造含 SHA-256 + 对象分配；available_keys / 竞速每条线路都会解密。
+    # 密钥在进程生命周期内通常不变，缓存单例即可。测试覆盖 ENCRYPTION_KEY /
+    # SECRET_KEY 时指纹变化，自动重建，避免跨测试污染。
+    global _fernet_singleton, _fernet_key_fingerprint
+    raw = str(getattr(settings, "ENCRYPTION_KEY", None) or settings.SECRET_KEY or "nvidia2api")
+    if _fernet_singleton is None or _fernet_key_fingerprint != raw:
+        key = base64.urlsafe_b64encode(hashlib.sha256(raw.encode("utf-8")).digest())
+        _fernet_singleton = Fernet(key)
+        _fernet_key_fingerprint = raw
+    return _fernet_singleton
+
+
+def reset_fernet_cache() -> None:
+    """测试用：清空 Fernet 单例，避免跨测试密钥污染。"""
+    global _fernet_singleton, _fernet_key_fingerprint
+    _fernet_singleton = None
+    _fernet_key_fingerprint = None
 
 
 def encrypt_secret(plain: str) -> str:

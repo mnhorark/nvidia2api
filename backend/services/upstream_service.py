@@ -59,10 +59,19 @@ def list_models_raw(channel: Channel, api_key: str, timeout: float = 30) -> tupl
 
 
 def sync_models(channel: Channel, api_key: str | None = None,
-                prune: bool = False) -> dict:
+                prune: bool = False, prune_only: bool = False) -> dict:
     """拉取渠道的模型列表并幂等 upsert 到 AIModel。
 
-    `prune=True` 时清理"上游已不存在的同步来源模型"（详见下方裁剪逻辑）。
+    `prune=True`：同步后清理"上游已不存在的同步来源模型"（provider==channel.slug）。
+    `prune_only=True`：**只清理不重新同步**——拉取上游列表仅用于对比，
+    不创建/更新任何本地模型，直接删除上游已不存在的同步来源模型。
+    两者互斥，prune_only 优先。
+
+    清理口径（修正自 2026-09-01 审查）：**不再要求 enabled=False**——
+    此前"上游已下线但本地仍启用"的模型永远清不掉（用户反馈"同步并清理
+    不可用"的根因）。同步来源（provider==channel.slug）且上游不存在的模型
+    一律删除；手动添加但 provider 恰为该渠道的模型若上游真无同名，也会被清，
+    个人场景可接受（如需保留请设置非 channel.slug 的 provider）。
     """
     from apps.core.models import ChannelKey, ChannelKeyStatus
 
@@ -82,31 +91,28 @@ def sync_models(channel: Channel, api_key: str | None = None,
     if status_code != 200 or "data" not in body:
         raise ValueError(f"upstream_error:{status_code}")
 
+    upstream_names = [item.get("id") for item in body.get("data", []) if item.get("id")]
+
     created = existing = 0
-    upstream_names: list[str] = []
-    for item in body.get("data", []):
-        name = item.get("id")
-        if not name:
-            continue
-        upstream_names.append(name)
-        _, was_created = channel.models.get_or_create(
-            model_name=name, defaults={"provider": channel.slug}
-        )
-        if was_created:
-            created += 1
-        else:
-            existing += 1
+    if not prune_only:
+        for name in upstream_names:
+            _, was_created = channel.models.get_or_create(
+                model_name=name, defaults={"provider": channel.slug}
+            )
+            if was_created:
+                created += 1
+            else:
+                existing += 1
 
     result = {"created": created, "existing": existing,
-              "total": len(body.get("data", [])), "channel": channel.slug,
-              "pruned": 0}
+              "total": len(upstream_names), "channel": channel.slug,
+              "pruned": 0, "prune_only": prune_only}
 
-    # 裁剪失效模型：只删「同步来源是本站（provider==channel.slug）且已禁用」
-    # 且上游已不存在的模型。手动添加/仍在启用的模型一律保留。
-    if prune:
-        stale = channel.models.filter(
-            provider=channel.slug, enabled=False,
-        ).exclude(model_name__in=upstream_names)
+    # 裁剪失效模型：删除「同步来源（provider==channel.slug）且上游已不存在」
+    # 的本地模型，与 enabled 状态无关（修正前仅删 enabled=False 导致清不掉）。
+    if prune or prune_only:
+        stale = channel.models.filter(provider=channel.slug).exclude(
+            model_name__in=upstream_names)
         pruned, _ = stale.delete()
         result["pruned"] = pruned
     return result

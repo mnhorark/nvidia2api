@@ -35,12 +35,37 @@ def is_open(channel: Channel) -> bool:
     return bool(channel.cooldown_until and channel.cooldown_until > timezone.now())
 
 
+def _key_alive_evidence(routes: list) -> bool:
+    """线路明细中是否存在"账号/渠道仍活着"的证据（rate_limited / 401 / 403 / 429）。
+
+    竞速失败但只要出现过这类 Key 级应答，就说明上游账户与渠道端点本身是通的，
+    失败原因是号池容量或代理质量，而非渠道宕机。用于把"容量问题"与
+    "渠道级故障"区分开，避免前者误触发熔断。
+    """
+    for item in routes:
+        if not isinstance(item, dict):
+            continue
+        if item.get("error") == "rate_limited":
+            return True
+        if item.get("http_status") in (401, 403, 429):
+            return True
+    return False
+
+
 def record(channel: Channel | None, success: bool, http_status: int = 0,
-           error_type: str = "") -> None:
+           error_type: str = "", routes: list | None = None) -> None:
     """按一次请求的结果更新渠道健康状态。
 
     只统计"系统级"失败：http >= 500 或错误类型为竞速全挂 / 线路不可用 /
     流错误。单 Key 的 401/403/429 属于 Key 级问题，不触发渠道熔断。
+    注意：`no_available_route` **不计入**熔断计数——它是"渠道已熔断 /
+    Key 全部不可用"的结果而非上游故障；一旦计入，熔断期间的每个 503 都会
+    继续累计失败，冷却结束后瞬间再次熔断，形成自我强化的死循环。
+
+    `routes`：本轮竞速的线路明细。若其中存在 `rate_limited` / 401 / 403 / 429
+    的证据，说明**账号与渠道仍然活着**，失败源于号池容量或代理质量（429 风暴
+    里夹带的 502 就属此类），不是渠道宕机——这类失败同样不计入熔断，否则
+    "容量问题"会被升级成"渠道死透"，熔断期间对全池可用 Key 无差别 503。
     """
     if channel is None or not channel.pk:
         return
@@ -48,9 +73,27 @@ def record(channel: Channel | None, success: bool, http_status: int = 0,
         # 任意成功立即清零连续失败（传入对象可能已过期，直接按 pk 重置）
         Channel.objects.filter(pk=channel.pk).update(consecutive_failures=0)
         return
-    systematic = error_type in (
-        "all_routes_failed", "no_available_route", "stream_error", "upstream_error",
-    ) or (http_status and http_status >= 500)
+    if error_type == "no_available_route":
+        # 不计入熔断：它是"渠道已熔断 / Key 全部不可用"的结果而非上游故障，
+        # 计入会让熔断期间的每个 503 继续累计失败（503 也满足 http>=500），
+        # 冷却结束后瞬间再次熔断，形成自我强化的死循环。
+        return
+    if error_type in ("stream_idle_timeout", "first_content_timeout"):
+        # 流式判死超时（模型长思考静默过久 / 首字超时）是"模型延迟"，不是"渠道宕机"：
+        # 上游端点、账号、网络都正常，只是这条模型推理太久。把它计入熔断，几次 kimi/R1
+        # 的长思考超时就会把整个渠道熔断，熔断期间所有可用 Key 无差别 503。
+        # 不计数、也不清零（它既不证明渠道健康，也不证明渠道故障）。
+        return
+    if routes and _key_alive_evidence(routes):
+        # 竞速失败但本轮有 Key 曾应答 401/403/429（或线路明细标注 rate_limited）：
+        # 账号活着、渠道端点活着，只是号池限流/代理拖垮——等价于"渠道活着"，
+        # 清零连续失败（与成功同义），否则 429 风暴里夹带的 502 会把渠道熔断。
+        Channel.objects.filter(pk=channel.pk).update(consecutive_failures=0)
+        return
+    # 只有"竞速全挂 / 上游服务错误"这类确凿的渠道级失败才累计熔断计数。
+    # 不再用 `http_status >= 500` 兜底：它会把 504(流式超时)、503(无线路) 等
+    # 非渠道故障误判为渠道级失败，导致"有号池却整渠道熔断"。
+    systematic = error_type in ("all_routes_failed", "stream_error", "upstream_error")
     if not systematic:
         return
 

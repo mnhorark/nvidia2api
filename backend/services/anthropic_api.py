@@ -141,11 +141,23 @@ def _tool_choice_to_chat(tc) -> Any:
 
 
 def messages_to_chat_body(body: dict) -> dict:
-    """把 Anthropic Messages 请求体转成内部 chat/completions 请求体。"""
+    """把 Anthropic Messages 请求体转成内部 chat/completions 请求体。
+
+    无损原则：_COMMON 同名透传 + stop_sequences/max_tokens/thinking 结构性
+    映射，未知顶层字段一律保留（forward-compat）。
+    """
     out: dict[str, Any] = {}
     for key in _COMMON:
         if key in body and body[key] is not None:
             out[key] = body[key]
+    # 保留未知顶层字段（Anthropic 未来新增字段无损透传）
+    _ANTHROPIC_STRUCTURAL = frozenset({
+        "system", "messages", "tools", "tool_choice", "thinking",
+        "max_tokens", "stop_sequences",
+    })
+    for key, val in body.items():
+        if key not in _COMMON and key not in _ANTHROPIC_STRUCTURAL and val is not None:
+            out[key] = val
     # stop_sequences 是多值数组，chat 的 stop 接受字符串或字符串数组
     stop = body.get("stop_sequences")
     if stop is not None:
@@ -212,7 +224,14 @@ def messages_to_chat_body(body: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def _parse_arguments(raw: str):
-    """tool_calls.arguments 尽量解析为对象，失败回落为原字符串。"""
+    """tool_calls.arguments 尽量解析为对象，失败回落为原字符串。
+
+    保持无损：若上游已是对象形态（非字符串）直接返回。
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, str):
+        return raw
     try:
         return json.loads(raw) if raw else {}
     except Exception:  # noqa: BLE001
@@ -335,132 +354,141 @@ async def iter_chat_sse_as_anthropic(chat_iter: AsyncIterator[str]) -> AsyncIter
     async def close_block(idx: int, btype: str) -> AsyncIterator[str]:
         yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
 
-    async for chunk in chat_iter:
-        # SSE 心跳注释（`: keep-alive`）原样透传：/v1/messages 出口同样保活
-        if chunk.startswith(":"):
-            yield chunk
-            continue
-        if not chunk.startswith("data:"):
-            continue
-        payload = chunk[5:].strip().rstrip("\n")
-        if payload == "[DONE]":
-            if not done_sent:
-                done_sent = True
+    try:
+        async for chunk in chat_iter:
+            # SSE 心跳注释（`: keep-alive`）原样透传：/v1/messages 出口同样保活
+            if chunk.startswith(":"):
+                yield chunk
+                continue
+            if not chunk.startswith("data:"):
+                continue
+            payload = chunk[5:].strip().rstrip("\n")
+            if payload == "[DONE]":
+                if not done_sent:
+                    done_sent = True
+                    async for _e in emit_start():
+                        yield _e
+                    for idx, btype in opened:
+                        async for _e in close_block(idx, btype):
+                            yield _e
+                    stop = "end_turn"
+                    yield _sse("message_delta", {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": stop, "stop_sequence": None},
+                        "usage": {"output_tokens": usage.get("completion_tokens", 0) or 0}})
+                    yield _sse("message_stop", {"type": "message_stop"})
+                return
+            try:
+                data = json.loads(payload)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(data, dict):
+                continue
+            if data.get("error"):
+                # 严格客户端（Claude Code 等）要求 error 事件也必须处在完整的消息
+                # 生命周期内：先 message_start、最后 message_stop。缺失 start 会让
+                # 客户端在未收到 message_start 的情况下收到 error 而直接抛错。
                 async for _e in emit_start():
                     yield _e
+                yield _sse("error", {"type": "error", "error": data["error"]})
+                yield _sse("message_stop", {"type": "message_stop"})
+                done_sent = True
+                return
+            model = model or str(data.get("model") or "")
+            choices = data.get("choices") or []
+            if not choices:
+                if data.get("usage"):
+                    usage = data["usage"]
+                continue
+            ch = choices[0]
+            async for _e in emit_start():
+                yield _e
+            delta = ch.get("delta") or {}
+            finish = ch.get("finish_reason")
+
+            reasoning = delta.get("reasoning_content")
+            if reasoning:
+                if not opened or opened[-1][1] != "thinking":
+                    async for _e in open_block("thinking"):
+                        yield _e
+                thinking_buf += str(reasoning)
+                idx = opened[-1][0]
+                yield _sse("content_block_delta", {
+                    "type": "content_block_delta", "index": idx,
+                    "delta": {"type": "thinking_delta", "thinking": str(reasoning)}})
+            content = delta.get("content")
+            if content:
+                if not opened or opened[-1][1] != "text":
+                    async for _e in open_block("text"):
+                        yield _e
+                text_buf += str(content)
+                idx = opened[-1][0]
+                yield _sse("content_block_delta", {
+                    "type": "content_block_delta", "index": idx,
+                    "delta": {"type": "text_delta", "text": str(content)}})
+            tool_calls = delta.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    fn = tc.get("function") or {}
+                    iid = str(tc.get("id") or "")
+                    name = str(fn.get("name") or "")
+                    args = str(fn.get("arguments") or "")
+                    # 新工具：id 或 name 首次出现即开块
+                    target = None
+                    for idx, tb in tool_blocks.items():
+                        if tb.get("id") == iid or (iid and tb.get("id", "").startswith(iid[:8])):
+                            target = idx
+                            break
+                    if target is None:
+                        # 新工具开块前同样先关闭当前块，保持块严格串行
+                        if opened:
+                            async for _e in close_block(*opened[-1]):
+                                yield _e
+                            opened.clear()
+                        target = block_index
+                        block_index += 1
+                        tool_blocks[target] = {"id": iid, "name": name, "args": ""}
+                        opened.append((target, "tool_use"))
+                        yield _sse("content_block_start", {
+                            "type": "content_block_start", "index": target,
+                            "content_block": {"type": "tool_use",
+                                              "id": iid, "name": name, "input": {}}})
+                    if target is not None:
+                        # 若已有其他块（text/thinking）打开，先关闭再回到工具块
+                        if opened and opened[-1][0] != target:
+                            async for _e in close_block(*opened[-1]):
+                                yield _e
+                            opened.clear()
+                            opened.append((target, "tool_use"))
+                        if name:
+                            tool_blocks[target]["name"] = name
+                        tool_blocks[target]["args"] += args
+                        yield _sse("content_block_delta", {
+                            "type": "content_block_delta", "index": target,
+                            "delta": {"type": "input_json_delta", "partial_json": args}})
+            if data.get("usage"):
+                usage = data["usage"]
+            if finish:
+                # 结束当前所有块
                 for idx, btype in opened:
                     async for _e in close_block(idx, btype):
                         yield _e
-                stop = "end_turn"
+                opened.clear()
+                stop = _STOP_TO_ANTHROPIC.get(str(finish), "end_turn")
                 yield _sse("message_delta", {
                     "type": "message_delta",
                     "delta": {"stop_reason": stop, "stop_sequence": None},
                     "usage": {"output_tokens": usage.get("completion_tokens", 0) or 0}})
                 yield _sse("message_stop", {"type": "message_stop"})
-            return
+                done_sent = True
+    finally:
+        # 客户端断开 / 外层 aclose 时，内层 chat 生成器（_stream_response）必须
+        # 被显式关闭——否则其 finally（含并发闸门 _bump_active(-1)）要等 GC 触发，
+        # 高压下表现为假 server_overloaded。见审查条目 R2-M2-6。
         try:
-            data = json.loads(payload)
+            await chat_iter.aclose()
         except Exception:  # noqa: BLE001
-            continue
-        if not isinstance(data, dict):
-            continue
-        if data.get("error"):
-            # 严格客户端（Claude Code 等）要求 error 事件也必须处在完整的消息
-            # 生命周期内：先 message_start、最后 message_stop。缺失 start 会让
-            # 客户端在未收到 message_start 的情况下收到 error 而直接抛错。
-            async for _e in emit_start():
-                yield _e
-            yield _sse("error", {"type": "error", "error": data["error"]})
-            yield _sse("message_stop", {"type": "message_stop"})
-            done_sent = True
-            return
-        model = model or str(data.get("model") or "")
-        choices = data.get("choices") or []
-        if not choices:
-            if data.get("usage"):
-                usage = data["usage"]
-            continue
-        ch = choices[0]
-        async for _e in emit_start():
-            yield _e
-        delta = ch.get("delta") or {}
-        finish = ch.get("finish_reason")
-
-        reasoning = delta.get("reasoning_content")
-        if reasoning:
-            if not opened or opened[-1][1] != "thinking":
-                async for _e in open_block("thinking"):
-                    yield _e
-            thinking_buf += str(reasoning)
-            idx = opened[-1][0]
-            yield _sse("content_block_delta", {
-                "type": "content_block_delta", "index": idx,
-                "delta": {"type": "thinking_delta", "thinking": str(reasoning)}})
-        content = delta.get("content")
-        if content:
-            if not opened or opened[-1][1] != "text":
-                async for _e in open_block("text"):
-                    yield _e
-            text_buf += str(content)
-            idx = opened[-1][0]
-            yield _sse("content_block_delta", {
-                "type": "content_block_delta", "index": idx,
-                "delta": {"type": "text_delta", "text": str(content)}})
-        tool_calls = delta.get("tool_calls")
-        if isinstance(tool_calls, list):
-            for tc in tool_calls:
-                fn = tc.get("function") or {}
-                iid = str(tc.get("id") or "")
-                name = str(fn.get("name") or "")
-                args = str(fn.get("arguments") or "")
-                # 新工具：id 或 name 首次出现即开块
-                target = None
-                for idx, tb in tool_blocks.items():
-                    if tb.get("id") == iid or (iid and tb.get("id", "").startswith(iid[:8])):
-                        target = idx
-                        break
-                if target is None:
-                    # 新工具开块前同样先关闭当前块，保持块严格串行
-                    if opened:
-                        async for _e in close_block(*opened[-1]):
-                            yield _e
-                        opened.clear()
-                    target = block_index
-                    block_index += 1
-                    tool_blocks[target] = {"id": iid, "name": name, "args": ""}
-                    opened.append((target, "tool_use"))
-                    yield _sse("content_block_start", {
-                        "type": "content_block_start", "index": target,
-                        "content_block": {"type": "tool_use",
-                                          "id": iid, "name": name, "input": {}}})
-                if target is not None:
-                    # 若已有其他块（text/thinking）打开，先关闭再回到工具块
-                    if opened and opened[-1][0] != target:
-                        async for _e in close_block(*opened[-1]):
-                            yield _e
-                        opened.clear()
-                        opened.append((target, "tool_use"))
-                    if name:
-                        tool_blocks[target]["name"] = name
-                    tool_blocks[target]["args"] += args
-                    yield _sse("content_block_delta", {
-                        "type": "content_block_delta", "index": target,
-                        "delta": {"type": "input_json_delta", "partial_json": args}})
-        if data.get("usage"):
-            usage = data["usage"]
-        if finish:
-            # 结束当前所有块
-            for idx, btype in opened:
-                async for _e in close_block(idx, btype):
-                    yield _e
-            opened.clear()
-            stop = _STOP_TO_ANTHROPIC.get(str(finish), "end_turn")
-            yield _sse("message_delta", {
-                "type": "message_delta",
-                "delta": {"stop_reason": stop, "stop_sequence": None},
-                "usage": {"output_tokens": usage.get("completion_tokens", 0) or 0}})
-            yield _sse("message_stop", {"type": "message_stop"})
-            done_sent = True
+            pass
     if not done_sent:
         # 上游可能一条内容都没吐就结束（空流/立即失败）。此时仍需补一条
         # message_start，否则客户端拿到 message_delta 时还没有 message 对象。

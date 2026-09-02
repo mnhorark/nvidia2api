@@ -62,32 +62,44 @@ def build_routes(channel: Channel | None = None,
     max_routes = min(max_routes or cfg_max, cfg_max)
 
     proxies = proxy_service.schedulable_proxies(channel, group=proxy_group)
+    # 整轮停用的坏代理先过滤：exclude_proxies 命中即不参与本轮任何配对，
+    # 且不计入线路配额（否则"1 直连 + N 代理"会膨胀出多余的直连线路）。
+    if exclude_proxies:
+        proxies = [p for p in proxies if p.id not in exclude_proxies]
     keys = key_service.available_keys(channel)
 
     route_count = min(len(proxies) + 1, len(keys), max_routes)
     if route_count <= 0:
         return []
+    # 恰好保留 1 条直连：代理最多占 route_count-1 条线路，
+    # 缺代理时最后一条回落直连（保证"1 直连 + N 代理"的既有拓扑）。
     proxies = proxies[: route_count - 1]
+    n_proxies = len(proxies)
 
     routes: list[Route] = []
     # 代理按"下一个可用"的顺序发放，而不是按线路下标取。
     # 过去若第 i 把 Key 占位（RPM claim）失败，proxies[i] 会被整轮跳过——
     # 排头的启用代理因此永不中标，实际线路数也少于预期。
-    proxy_iter = iter(proxies)
+    #
+    # 关键顺序：**先排除后占位**。组合级 exclude 命中时既不能消耗代理，
+    # 也不能 claim RPM 计数——否则重试风暴里每轮重试都把好 Key 的 RPM 额度
+    # 白占（未进线路却计数），最终误判 rate_limited。claim 失败同样不消耗
+    # 代理（保持 M9 语义）。
+    proxy_ptr = 0
     for i in range(route_count):
         key = keys[i]
+        proxy = proxies[proxy_ptr] if proxy_ptr < n_proxies else None
+        # 上一轮被判定死亡（静默掐断）的 Key+代理组合：本轮不参与竞速。
+        # 直连（proxy=None）也可被排除：被掐线路就是 winner，其 Key 被盗用
+        # 概率低，但组合级排除能同时换掉"Key 或代理"任一嫌疑。
+        if exclude and (key.id, proxy.id if proxy else None) in exclude:
+            # 被排除组合：跳过该 Key，不 claim（组合排除换的是 Key，代理保留
+            # 给后续可用 Key，避免被排除的代理被白白消耗）
+            continue
         if not key_service.claim_rpm_slot(key.id):
             continue
-        proxy = next(proxy_iter, None)
-        if (exclude_proxies and proxy is not None
-                and getattr(proxy, "id", None) in exclude_proxies):
-            # 本轮已知坏代理：直接停用（即使换了 Key 也不打回同一代理）
-            continue
-        if exclude and (key.id, proxy.id if proxy else None) in exclude:
-            # 上一轮被判定死亡（静默掐断）的 Key+代理组合：本轮不参与竞速。
-            # 直连（proxy=None）也可被排除：被掐线路就是 winner，其 Key 被盗用
-            # 概率低，但组合级排除能同时换掉"Key 或代理"任一嫌疑。
-            continue
+        if proxy is not None:
+            proxy_ptr += 1
         routes.append(Route(kind="proxy" if proxy else "direct", key=key,
                             proxy=proxy, url_override=endpoint or None))
 

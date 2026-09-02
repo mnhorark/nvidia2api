@@ -134,12 +134,25 @@ CORS_ALLOW_HEADERS = [
 
 # --- nvidia2api settings ---
 NVIDIA_BASE_URL = os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
-DEFAULT_NVIDIA_RPM = int(os.environ.get("DEFAULT_NVIDIA_RPM", "40"))
+DEFAULT_NVIDIA_RPM = int(os.environ.get("DEFAULT_NVIDIA_RPM", "0"))
 PROXY_TIMEOUT = float(os.environ.get("PROXY_TIMEOUT", "10"))
 UPSTREAM_CONNECT_TIMEOUT = float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "10"))
 UPSTREAM_READ_TIMEOUT = float(os.environ.get("UPSTREAM_READ_TIMEOUT", "120"))
-MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "100"))
-MAX_ROUTES_PER_REQUEST = int(os.environ.get("MAX_ROUTES_PER_REQUEST", "50"))
+MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "500"))
+MAX_ROUTES_PER_REQUEST = int(os.environ.get("MAX_ROUTES_PER_REQUEST", "80"))
+# 全平台同时打开的上游 HTTP 连接数上限（跨请求的全局 socket 阀门）。
+# 默认 0 = 不限制（对齐原始设计：并发只由 max_concurrent_requests ×
+# max_routes_per_request 自然约束）。仅在受 fd 硬限制的环境（如 Windows +
+# SelectorEventLoop，select.select 上限约 512 fd，"too many file descriptors
+# in select()" 崩 worker）需要手动调小，让请求在余量不足时降级为更少线路。
+# 后台设置 max_concurrent_upstream 可覆盖；设 0 表示不限制。
+MAX_CONCURRENT_UPSTREAM = int(os.environ.get("MAX_CONCURRENT_UPSTREAM", "0"))
+# 请求体大小上限（字节）。必须与 openai_views._parse_body 的 MAX_BODY_BYTES 对齐：
+# Django 默认 DATA_UPLOAD_MAX_MEMORY_SIZE=2.5MB 会先于业务校验在 request.body 处
+# 抛 RequestDataTooBig（返回裸 400 页面）；这里把它提到 8MB，业务层的 4MB 上限
+# 仍然先触发并返回干净的 OpenAI 413，第 8MB 极端值由 _parse_body 兜底捕获。
+REASONING_DECRYPT_KEY = os.environ.get("REASONING_DECRYPT_KEY", "")
+DATA_UPLOAD_MAX_MEMORY_SIZE = 8 * 1024 * 1024
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "dev-admin-token")

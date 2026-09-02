@@ -20,6 +20,7 @@ from services import responses_api, sysconfig
 from services.key_service import report_failure, report_success
 from services.load_balancer import Route
 from services.proxy_service import report_proxy_result
+from services.reasoning_decrypt import decrypt_sse_chunk
 
 logger = logging.getLogger("nvidia2api.race")
 
@@ -82,39 +83,19 @@ def is_valid_response(status_code: int, data: dict) -> bool:
     return True
 
 
-def _chunk_has_delta(data: dict) -> bool:
-    """该 chunk 是否携带实际交付内容（正文/思考/工具调用/usage/结束原因）。
-
-    空 delta、纯角色标记、只有 usage=0 的心跳都不算——它们不代表上游真的
-    在产出内容，不能作为竞速胜者的判据。
-    """
-    if data.get("usage"):
-        return True
-    choices = data.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return False
-    first = choices[0]
-    if not isinstance(first, dict):
-        return False
-    if first.get("finish_reason"):
-        return True
-    if isinstance(first.get("text"), str) and first["text"]:
-        return True
-    delta = first.get("delta")
-    if isinstance(delta, dict):
-        for key in ("content", "reasoning_content", "reasoning", "tool_calls"):
-            if delta.get(key):
-                return True
-    return False
-
-
 def is_valid_stream_chunk(line: str) -> dict | None:
-    """Return parsed chunk dict if it is a valid SSE *content* line, else None.
+    """Return parsed chunk dict if it is a valid SSE data line, else None.
 
-    关键：裸 `data: [DONE]`（上游空响应 / 内容被过滤 / 立即结束）**不是**有效
-    首 chunk。过去它被当作胜者，导致客户端收到完全空白的回答，且因为已经
-    "成功"而不再走自动重试换线。这里判为 None，交由调用方走 empty_stream
-    换线重试。
+    采用宽松判胜（与初始提交一致）：只要结构合法的 `choices` 数组出现即算
+    "线路开始响应"——包括空 delta、纯 role 标记等。竞速胜负应比"谁先拿到
+    内容"更快地锁定在"谁先开始出流"，避免思考模型（静默几十秒才吐首个
+    内容块）把竞速窗口拖到几十秒。正文/思考的到达速度是模型特性，
+    胜出后默认完全透传（stream_idle_timeout 作为可配置的僵尸流兜底）。
+
+    保留的关键防呆（不退化的旧 bug）：
+    - 裸 `data: [DONE]` 仍判 None：上游空响应 / 立即结束不能当选胜者，
+      否则客户端收到空白回答且不走换线重试；
+    - `error` 字段存在判 None；无法解析判 None。
     """
     if not line.startswith("data:"):
         return None
@@ -127,9 +108,8 @@ def is_valid_stream_chunk(line: str) -> dict | None:
         return None
     if not isinstance(data, dict) or data.get("error"):
         return None
-    if not _chunk_has_delta(data):
-        # 结构性合法但没有任何内容（空 delta 心跳、纯 role 标记）：
-        # 不算有效首块，避免"空响应"线路抢占胜者位置。
+    choices = data.get("choices")
+    if not choices or not isinstance(choices, list):
         return None
     return data
 
@@ -145,8 +125,7 @@ def _client_kwargs(route: Route, stream: bool) -> dict:
     if stream:
         # 流式请求不设每读超时（read=None）：思考模型可能合法停顿数十秒~数分钟，
         # 固定读超时会在中途掐断（客户端报 "error decoding response body"）。
-        # 死线路统一由应用层 stream_probe_interval × stream_max_idle_probes
-        # （连续心跳探测失败，见 openai_views._drain）负责。
+        # 死线路统一由应用层 stream_idle_timeout（静默判死，见 openai_views._drain）负责。
         read = None
     kwargs: dict[str, Any] = {
         "timeout": httpx.Timeout(
@@ -217,25 +196,43 @@ async def _do_request(route: Route, body: dict,
             try:
                 data = resp.json()
             except Exception:  # noqa: BLE001
-                _mark_failure(route, "invalid_json", resp.status_code)
+                await _mark_failure(route, "invalid_json", resp.status_code)
                 return RaceResult(ok=False, route=route, http_status=resp.status_code,
                                   error_type="invalid_json", latency_ms=_elapsed())
             if is_resp:
                 data = responses_api.responses_payload_to_chat(data)
+            # muse-spark 等上游的 reasoning_content 可能是 Fernet 密文（gAAAA…），
+            # 参考 RikkaHub 的 encrypted_content 逻辑，有密钥时尝试解密后再展示/计分
+            # 同时处理 Kilo/OpenRouter 网关返回的加密 reasoning 内容
+            try:
+                msg = (data.get("choices") or [{}])[0].get("message") if isinstance(data, dict) else None
+                if isinstance(msg, dict):
+                    from services.reasoning_decrypt import decrypt_chat_message as _dec_msg
+                    _dec_msg(msg)
+                    # 额外处理：Kilo/OpenRouter 网关可能在 message 的其他字段里塞了加密思考内容
+                    for _key in ("reasoning", "thinking"):
+                        _val = msg.get(_key)
+                        if isinstance(_val, str) and _val.startswith("gAAAA"):
+                            from services.reasoning_decrypt import decrypt_token as _dec_tok
+                            _dec_val = _dec_tok(_val)
+                            if _dec_val is not None:
+                                msg[_key] = _dec_val
+            except Exception:
+                pass
             if not is_valid_response(resp.status_code, data):
                 typ = _classify_status(resp.status_code, data)
-                _mark_failure(route, typ, resp.status_code)
+                await _mark_failure(route, typ, resp.status_code)
                 return RaceResult(ok=False, route=route, http_status=resp.status_code,
                                   error_type=typ, latency_ms=_elapsed(),
-                                  error_message=str(data.get("error", ""))[:256])
-            _mark_success(route)
+                                  error_message=_error_detail(data))
+            await _mark_success(route)
             return RaceResult(ok=True, route=route, payload=data,
                               http_status=resp.status_code, latency_ms=_elapsed())
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001
         typ, _ = _classify_error(exc)
-        _mark_failure(route, typ, 0)
+        await _mark_failure(route, typ, 0)
         return RaceResult(ok=False, route=route, error_type=typ, error_message=str(exc),
                           latency_ms=_elapsed())
 
@@ -251,16 +248,49 @@ def _classify_status(code: int, data: dict) -> str:
     return f"http_{code}"
 
 
-def _mark_success(route: Route):
-    report_success(route.key.id)
+def _error_detail(data) -> str:
+    """从上游错误响应体提取人类可读的原因（供日志/竞速明细展示）。
+
+    兼容多种错误格式：
+    - OpenAI:  {"error": {"message": "...", "code": "..."}}
+    - NVIDIA:  {"status":400, "title":"Bad Request", "detail":"Function id ...: DEGRADED..."}
+    - 通用:    {"message": "..."} / {"detail": "..."}
+    此前只取 `data.error`，NVIDIA 类 400（detail/title）被忽略 → 日志只显示 http_400，
+    用户无法得知真实原因（如 "DEGRADED function cannot be invoked"）。
+    """
+    if not isinstance(data, dict):
+        return ""
+    err = data.get("error")
+    if isinstance(err, dict):
+        msg = err.get("message") or err.get("code") or ""
+        return str(msg)[:256]
+    if isinstance(err, str) and err:
+        return err[:256]
+    for key in ("detail", "message", "title"):
+        v = data.get(key)
+        if v:
+            return str(v)[:256]
+    return ""
+
+
+async def _mark_success(route: Route):
+    """线路统计写库。竞速运行在事件循环上，写锁竞争时会冻结整个服务
+    （busy_timeout 最长 30s），因此挪到线程池执行；事务块内（测试）自动
+    回落同线程。"""
+    from services.loop_offload import run_db
+
+    await run_db(report_success, route.key.id)
     if route.proxy is not None:
-        report_proxy_result(route.proxy.id, True)
+        await run_db(report_proxy_result, route.proxy.id, True)
 
 
-def _mark_failure(route: Route, error_type: str, http_status: int):
-    report_failure(route.key.id, error_type, http_status)
+async def _mark_failure(route: Route, error_type: str, http_status: int):
+    """同 _mark_success：统计写库不阻塞事件循环。"""
+    from services.loop_offload import run_db
+
+    await run_db(report_failure, route.key.id, error_type, http_status)
     if route.proxy is not None and http_status == 0:
-        report_proxy_result(route.proxy.id, False)
+        await run_db(report_proxy_result, route.proxy.id, False)
 
 
 # ---------------------------------------------------------------------------
@@ -335,10 +365,25 @@ async def _stream_first_valid(route: Route, body: dict):
         resp = await req_cm.__aenter__()
         if resp.status_code != 200:
             typ = _classify_status(resp.status_code, {})
-            _mark_failure(route, typ, resp.status_code)
+            await _mark_failure(route, typ, resp.status_code)
+            # 尝试读取错误响应体（有限字节）提取真实原因（如 NVIDIA 的
+            # "DEGRADED function cannot be invoked"），供竞速明细展示
+            err_detail = ""
+            try:
+                raw = (await resp.aread())[:2048]
+                if raw:
+                    import json as _json
+                    err_detail = _error_detail(_json.loads(raw))
+            except Exception:  # noqa: BLE001
+                pass
             await req_cm.__aexit__(None, None, None)
             await cm.__aexit__(None, None, None)
-            return None, route_info(route, "failed", error=typ, http_status=resp.status_code)
+            # error 字段带真实原因（如 "http_400: Function id ...: DEGRADED..."），
+            # 日志页不再只显示笼统的 http_400
+            return None, route_info(
+                route, "failed",
+                error=f"{typ}: {err_detail}" if err_detail else typ,
+                http_status=resp.status_code)
         first_line: str | None = None
         ait = resp.aiter_lines()
         first_byte_timeout = float(
@@ -351,7 +396,7 @@ async def _stream_first_valid(route: Route, body: dict):
                             ait.__anext__(), timeout=first_byte_timeout)
                     except asyncio.TimeoutError:
                         # 连上但迟迟无数据 -> 死线路：按失败处理，竞速换线
-                        _mark_failure(route, "first_byte_timeout", 0)
+                        await _mark_failure(route, "first_byte_timeout", 0)
                         await req_cm.__aexit__(None, None, None)
                         await cm.__aexit__(None, None, None)
                         return None, route_info(route, "failed",
@@ -382,7 +427,7 @@ async def _stream_first_valid(route: Route, body: dict):
                     except Exception:  # noqa: BLE001
                         parsed = None
                     if parsed is None or (isinstance(parsed, dict) and parsed.get("error")):
-                        _mark_failure(route, "invalid_response", 200)
+                        await _mark_failure(route, "invalid_response", 200)
                         await req_cm.__aexit__(None, None, None)
                         await cm.__aexit__(None, None, None)
                         return None, route_info(route, "failed", error="invalid_response",
@@ -391,19 +436,19 @@ async def _stream_first_valid(route: Route, body: dict):
         except StopAsyncIteration:
             pass
         if first_line is None:
-            _mark_failure(route, "empty_stream", 200)
+            await _mark_failure(route, "empty_stream", 200)
             await req_cm.__aexit__(None, None, None)
             await cm.__aexit__(None, None, None)
             return None, route_info(route, "failed", error="empty_stream",
                                     http_status=200)
-        _mark_success(route)
+        await _mark_success(route)
         return (cm, req_cm, resp, ait, first_line), None
     except asyncio.CancelledError:
         await cm.__aexit__(None, None, None)
         raise
     except Exception as exc:  # noqa: BLE001
         typ, _ = _classify_error(exc)
-        _mark_failure(route, typ, 0)
+        await _mark_failure(route, typ, 0)
         try:
             await cm.__aexit__(None, None, None)
         except Exception:  # noqa: BLE001
@@ -437,6 +482,24 @@ async def race_stream_winner(routes: list[Route], body: dict):
                     winner_route = tasks[t]
                     latency = (_time.monotonic() - t0) * 1000
                     report.append(route_info(winner_route, "winner", latency))
+                    # 同批次内其它"也已拿到首个有效块"的线路（done 集合里并列完成的
+                    # 胜者候选）连接仍开着，必须在这里关闭——否则每次竞速都会泄漏
+                    # 数个 fd（多线路几乎同时出流很常见），高并发下累积成 fd 耗尽。
+                    for other_t in done:
+                        if other_t is t:
+                            continue
+                        try:
+                            ores, _oinfo = other_t.result()
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if ores is None:
+                            continue
+                        _ocm, oreq, _oresp, _oait, _ofirst = ores
+                        try:
+                            await oreq.__aexit__(None, None, None)
+                            await _ocm.__aexit__(None, None, None)
+                        except Exception:  # noqa: BLE001
+                            pass
                     for p in pending:
                         p.cancel()
                     await asyncio.gather(*pending, return_exceptions=True)
@@ -483,10 +546,14 @@ class StreamWinner:
     async def lines(self) -> AsyncIterator[str]:
         if responses_api.is_responses_url(_route_url(self.route)):
             async for chunk in responses_api.iter_responses_sse(self.first_line, self.aiter):
-                yield chunk
+                # Responses 链路的 reasoning 已在 iter_responses_sse 内由 _reasoning_text 解密
+                # 额外的 SSE chunk 解密（处理 Kilo/OpenRouter 加密 reasoning）
+                yield decrypt_sse_chunk(chunk)
         else:
             async for chunk in iter_sse(self.first_line, self.aiter):
-                yield chunk
+                # Chat 直连的 reasoning_content/reasoning 可能是 Fernet 密文，就地解密
+                # 支持：muse-spark (reasoning_content) / Kilo/OpenRouter (reasoning)
+                yield decrypt_sse_chunk(chunk)
 
     async def close(self):
         try:
