@@ -209,3 +209,34 @@ class FailureStatusTests(TestCase):
         self.key.refresh_from_db()
         self.assertEqual(self.key.status, ChannelKeyStatus.AVAILABLE)
         self.assertIsNone(self.key.cooldown_until)
+
+
+class ApiKeyHintPerfTests(TestCase):
+    """列表序列化不得逐行解密：提示位（api_key_hint）在写入时离线计算。"""
+
+    def test_hint_written_on_create(self):
+        from apps.core.models import ChannelKey
+        ch = channel_service.ensure_default_channel()
+        k = ChannelKey.objects.create(channel=ch, name="h1", api_key="nvapi-abcdefgh1234")
+        k.refresh_from_db()
+        self.assertTrue(k.api_key.startswith("enc:v1:"))
+        self.assertEqual(k.api_key_hint, "nvapi-abcd********1234")
+
+    def test_serializer_uses_hint_without_decrypt(self):
+        from api.serializers import ChannelKeySerializer
+        from apps.core.models import ChannelKey
+        ch = channel_service.ensure_default_channel()
+        k = ChannelKey.objects.create(channel=ch, name="h2", api_key="nvapi-xyz987654321")
+        k.refresh_from_db()
+        from unittest.mock import patch
+        # 有提示位时触碰 decrypt_secret 即失败（证明列表路径不逐行解密）
+        with patch("services.crypto.decrypt_secret", side_effect=AssertionError("should not decrypt")):
+            # serializer 内的兜底路径 import 自 crypto，另打 api.serializers 内的局部引用
+            import services.crypto
+            orig = services.crypto.decrypt_secret
+            services.crypto.decrypt_secret = lambda *a, **k2: (_ for _ in ()).throw(AssertionError("should not decrypt"))
+            try:
+                data = ChannelKeySerializer(k).data
+            finally:
+                services.crypto.decrypt_secret = orig
+        self.assertEqual(data["api_key"], k.api_key_hint)

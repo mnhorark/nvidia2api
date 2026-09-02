@@ -51,6 +51,18 @@ def encrypt_secret(plain: str) -> str:
     return _PREFIX + token
 
 
+def mask_secret(plain: str) -> str:
+    """密文无关的展示掩码（供保存时离线计算提示位，避免列表页逐行解密）。
+
+    与 key_service.mask_key 口径一致：前 10 + 8 个* + 后 4；短串退化为前 4+****
+    """
+    if not plain:
+        return ""
+    if len(plain) <= 10:
+        return plain[:4] + "****"
+    return plain[:10] + "*" * 8 + plain[-4:]
+
+
 def decrypt_secret(stored: str) -> str:
     """解密敏感字符串；无前缀视为历史明文原样返回，解密失败返回空串。
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from django.db import models, transaction
 
-from services.crypto import decrypt_secret, encrypt_secret
+from services.crypto import decrypt_secret, encrypt_secret, mask_secret
 
 
 class Timestamped(models.Model):
@@ -161,6 +161,9 @@ class ChannelKey(Timestamped):
     # 数百字符；256 在 SQLite 下不校验、迁到 PostgreSQL 会直接写入失败。
     # 用 TextField 彻底摆脱上限。
     api_key = models.TextField()
+    # 展示用脱敏提示（"nvapi-abcd****wxyz"）。列表接口每行都用它，
+    # 避免序列化时对每行做 Fernet 解密（2000+ Key 的列表页曾被这个拖慢）。
+    api_key_hint = models.CharField(max_length=64, blank=True, default="")
     status = models.CharField(
         max_length=16, choices=ChannelKeyStatus.choices,
         default=ChannelKeyStatus.AVAILABLE, db_index=True,
@@ -183,6 +186,9 @@ class ChannelKey(Timestamped):
     def save(self, *args, **kwargs):
         # 敏感字段加密存储；幂等（已加密值跳过），旧明文在读取时自动回落
         if self.api_key:
+            # 明文（含更换新 Key）时才重算提示位；密文幂等二次写不动它
+            if not self.api_key.startswith("enc:v1:"):
+                self.api_key_hint = mask_secret(self.api_key)
             self.api_key = encrypt_secret(self.api_key)
         super().save(*args, **kwargs)
 

@@ -49,6 +49,10 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "dev-insecure-secret-change-me")
 # 敏感字段加密专用密钥（crypto._fernet 优先取它，其次回落到 SECRET_KEY 派生）
 ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY")
 DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
+
+# 测试模式：禁用一切"秒级 TTL 缓存"类优化，避免用例间串缓存（同指纹+同参数
+# 在 3s TTL 内会命中前一用例的缓存）。生产不受影响。
+TESTING = ("pytest" in os.sys.modules) or ("PYTEST_CURRENT_TEST" in os.environ)
 # 生产环境应显式声明可服务的域名（逗号分隔），例如
 #   ALLOWED_HOSTS=nvidia2api.example.com,127.0.0.1
 # 保留 "*" 兜底是为了不打断既有自建部署（大量实例用 IP 直连、无法预知域名），
@@ -66,6 +70,10 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # GZip 放最前：大 JSON 列表（keys 125KB / proxies 178KB）压缩到 ~10x 小，
+    # 慢链路与局域网部署下页面加载差异显著。Django 自带实现已处理
+    # Accept-Encoding 协商与 SSE StreamingHttpResponse 的正确跳过。
+    "django.middleware.gzip.GZipMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -83,6 +91,9 @@ DATABASES = {
         "NAME": str(_resolve_path(os.environ.get("DATABASE_PATH") or DATA_DIR / "db.sqlite3")),
         # Serialize writers & allow lock waits: protects per-key RPM counters under concurrency.
         "OPTIONS": {"timeout": 30},
+        # 连接保持 60s：默认 0 会让每请求重建连接并重跑 WAL/busy_timeout 等
+        # pragma，高频小查询路径（Dashboard/列表轮询）上省掉一大块固定开销。
+        "CONN_MAX_AGE": 60,
         "TEST": {"NAME": str(DATA_DIR / "test_db.sqlite3")},
     }
 }
@@ -147,12 +158,10 @@ MAX_ROUTES_PER_REQUEST = int(os.environ.get("MAX_ROUTES_PER_REQUEST", "80"))
 # in select()" 崩 worker）需要手动调小，让请求在余量不足时降级为更少线路。
 # 后台设置 max_concurrent_upstream 可覆盖；设 0 表示不限制。
 MAX_CONCURRENT_UPSTREAM = int(os.environ.get("MAX_CONCURRENT_UPSTREAM", "0"))
-# 请求体大小上限（字节）。必须与 openai_views._parse_body 的 MAX_BODY_BYTES 对齐：
-# Django 默认 DATA_UPLOAD_MAX_MEMORY_SIZE=2.5MB 会先于业务校验在 request.body 处
-# 抛 RequestDataTooBig（返回裸 400 页面）；这里把它提到 8MB，业务层的 4MB 上限
-# 仍然先触发并返回干净的 OpenAI 413，第 8MB 极端值由 _parse_body 兜底捕获。
 REASONING_DECRYPT_KEY = os.environ.get("REASONING_DECRYPT_KEY", "")
-DATA_UPLOAD_MAX_MEMORY_SIZE = 8 * 1024 * 1024
+# Django 层请求体上限，必须 ≥ 业务层 max_request_bytes（默认 32MB），
+# 否则会先于业务校验抛 RequestDataTooBig 返回裸 400。
+DATA_UPLOAD_MAX_MEMORY_SIZE = 40 * 1024 * 1024
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "dev-admin-token")

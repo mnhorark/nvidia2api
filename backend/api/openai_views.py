@@ -276,14 +276,22 @@ def _authorize(request):
     return user_key, None
 
 
-MAX_BODY_BYTES = 4 * 1024 * 1024
+MAX_BODY_BYTES = 32 * 1024 * 1024
 
 
 def _parse_body(request):
+    from services import sysconfig as _sc
+    try:
+        limit = int(_sc.get("max_request_bytes") or MAX_BODY_BYTES)
+    except (TypeError, ValueError):
+        limit = MAX_BODY_BYTES
+    limit = max(0, limit)
+    if limit <= 0:
+        limit = MAX_BODY_BYTES
     declared = request.headers.get("Content-Length")
     if declared is not None:
         try:
-            if int(declared) > MAX_BODY_BYTES:
+            if int(declared) > limit:
                 return None, openai_error("Request body too large",
                                           "payload_too_large", 413)
         except (TypeError, ValueError):
@@ -292,7 +300,7 @@ def _parse_body(request):
         raw = request.body or b""
     except RequestDataTooBig:
         return None, openai_error("Request body too large", "payload_too_large", 413)
-    if len(raw) > MAX_BODY_BYTES:
+    if len(raw) > limit:
         return None, openai_error("Request body too large", "payload_too_large", 413)
     try:
         body = json.loads(raw.decode("utf-8") or "{}")

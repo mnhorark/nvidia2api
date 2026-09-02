@@ -52,6 +52,10 @@ class ChannelKeySerializer(serializers.ModelSerializer):
         ]
 
     def get_api_key(self, obj):
+        # 列表接口绝不能逐行 Fernet 解密（千级 Key 下是主要延迟热点）：
+        # 用保存时离线计算的提示位；空 hint（历史脏数据）回退一次解密。
+        if obj.api_key_hint:
+            return obj.api_key_hint
         if not obj.api_key:
             return ""
         from services.crypto import decrypt_secret

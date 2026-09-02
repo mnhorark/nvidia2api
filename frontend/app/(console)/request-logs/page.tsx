@@ -46,14 +46,24 @@ export default function RequestLogsPage() {
   const PAGE_SIZE = 100;
   // 请求序号：筛选/刷新变更时递增，过期的分页响应直接丢弃，避免跨筛选追加错乱
   const seqRef = useRef(0);
+  // 在途保护：慢后端/慢网络时 setInterval 会堆积 multiple 在途 load，
+  // 上一轮没结束就跳过本轮（不叠加请求风暴）
+  const inflightRef = useRef(false);
+  // 已展开窗口大小（加载更多后会 > PAGE_SIZE），供自动刷新保持窗口不塌回首屏
+  const logsLenRef = useRef(PAGE_SIZE);
 
   const load = useCallback(async () => {
+    if (inflightRef.current) return;
+    inflightRef.current = true;
     setLoading(true);
     setLoadingMore(false);
     setError("");
     const seq = ++seqRef.current;
     try {
-      const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
+      // 自动刷新时保留用户已展开的窗口：若已加载更多（logs.length > PAGE_SIZE），
+      // 用同等大小的窗口重拉，否则轮询会把列表拍回首屏、滚动位置丢失。
+      const windowSize = Math.max(PAGE_SIZE, logsLenRef.current);
+      const params = new URLSearchParams({ limit: String(windowSize) });
       if (model) params.set("model", model);
       if (status) params.set("status", status);
       const qs = params.toString();
@@ -64,12 +74,14 @@ export default function RequestLogsPage() {
       }>(`/api/admin/logs${qs ? `?${qs}` : ""}`);
       if (seq !== seqRef.current) return; // 筛选已变，丢弃过期结果
       setLogs(data.results ?? []);
+      logsLenRef.current = (data.results ?? []).length;
       setTotal(data.total ?? null);
       setHasMore(Boolean(data.has_more));
     } catch (e) {
       if (seq !== seqRef.current) return;
       setError(e instanceof Error ? e.message : "加载失败");
     } finally {
+      inflightRef.current = false;
       if (seq === seqRef.current) setLoading(false);
     }
   }, [model, status]);
@@ -95,7 +107,11 @@ export default function RequestLogsPage() {
         has_more: boolean;
       }>(`/api/admin/logs?${params.toString()}`);
       if (seq !== seqRef.current) return; // 期间筛选/刷新已重置列表，丢弃过期分页
-      setLogs((prev) => [...prev, ...(data.results ?? [])]);
+      setLogs((prev) => {
+        const next = [...prev, ...(data.results ?? [])];
+        logsLenRef.current = next.length;
+        return next;
+      });
       setTotal(data.total ?? null);
       setHasMore(Boolean(data.has_more));
     } catch (e) {

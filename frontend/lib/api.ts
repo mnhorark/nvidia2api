@@ -62,11 +62,34 @@ function extractErrorMessage(data: unknown, status: number): string {
   return `请求失败 (HTTP ${status})`;
 }
 
+// 在途 GET 去重：轮询/channel 切换/组件重挂载经常对同一端点打重复请求，
+// 合并为一个 Promise 直接砍半重复流量。键含 token+渠道，防止串响应。
+const _inflightGet = new Map<string, Promise<unknown>>();
+
 export async function request<T = unknown>(
   path: string,
   options: RequestInit = {},
   timeoutMs = 60_000,
   allowRetry = true,
+): Promise<T> {
+  const isGet = !options.method || options.method === "GET";
+  if (isGet && !options.signal) {
+    const key = `${path}|${getToken()}|${getChannel()}|${timeoutMs}`;
+    const hit = _inflightGet.get(key);
+    if (hit) return hit as Promise<T>;
+    const p = _requestInner<T>(path, options, timeoutMs, allowRetry)
+      .finally(() => { _inflightGet.delete(key); });
+    _inflightGet.set(key, p);
+    return p;
+  }
+  return _requestInner<T>(path, options, timeoutMs, allowRetry);
+}
+
+async function _requestInner<T = unknown>(
+  path: string,
+  options: RequestInit,
+  timeoutMs: number,
+  allowRetry: boolean,
 ): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = {

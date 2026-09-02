@@ -85,6 +85,9 @@ RUNTIME_PARAMS: dict[str, tuple[str, object, str, str]] = {
                     "全部线路失败后重试次数（0=不重试，上限 5）", "request"),
     "retry_backoff_seconds": ("float", 3,
                               "重试前等待秒数（0=立即重试）", "request"),
+    "max_request_bytes": ("int", 32 * 1024 * 1024,
+                          "单次请求体最大字节数（agent 写大文件 / 超大上下文"
+                          "场景需调大；0=默认 32MB）", "request"),
     "proxy_timeout": ("float", lambda: settings.PROXY_TIMEOUT,
                       "代理测速超时（秒）", "health"),
     "upstream_connect_timeout": ("float", lambda: settings.UPSTREAM_CONNECT_TIMEOUT,
@@ -97,8 +100,11 @@ RUNTIME_PARAMS: dict[str, tuple[str, object, str, str]] = {
                                   "上游静默时发送心跳间隔（秒，0=关闭）", "stream"),
     "stream_idle_timeout": ("float", 300,
                             "胜出后无真实内容时的静默上限（0=不限制）", "stream"),
-    "stream_content_idle_timeout": ("float", 0,
-                                    "已产出内容后的静默上限（0=不限制）", "stream"),
+    "stream_content_idle_timeout": ("float", 300,
+                                    "已产出内容后的静默上限（0=不限制）。"
+                                    "思考模型在出过思考块后可能长静默，"
+                                    "给一个与 idle_timeout 一致的兜底，"
+                                    "避免无限悬空直至上游断连", "stream"),
     "stream_max_duration": ("float", 0,
                             "流式请求总时长上限（0=不限制）", "stream"),
     "proxy_failure_cooldown_seconds": ("int", 60,
