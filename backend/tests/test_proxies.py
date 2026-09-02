@@ -149,3 +149,35 @@ class ChannelServiceTests(TestCase):
         self.assertEqual(channel_service.resolve("zen").pk, zen.pk)
         self.assertEqual(channel_service.resolve(str(zen.id)).pk, zen.pk)
         self.assertEqual(channel_service.resolve(None).pk, default.pk)
+
+
+class SetEnabledConcurrencyTests(__import__("django.test", fromlist=["TransactionTestCase"]).TransactionTestCase):
+    """M3 回归：并发启用不得突破 keys-1 上限（条件检查必须原子）。"""
+
+    def test_concurrent_enables_respect_limit(self):
+        import threading
+        channel = make_channel("conc")
+        ChannelKey.objects.create(channel=channel, name="k1", api_key="k1")
+        ChannelKey.objects.create(channel=channel, name="k2", api_key="k2")
+        proxies = [
+            Proxy.objects.create(channel=channel, name=f"p{i}",
+                                 host="127.0.0.1", port=11000 + i)
+            for i in range(4)
+        ]
+        results = []
+        lock = threading.Lock()
+
+        def worker(px):
+            ok, _ = proxy_service.set_enabled(px, True)
+            with lock:
+                results.append(ok)
+
+        # 上限 = 2 keys - 1 = 1；4 个并发启用最多成功 1 个
+        threads = [threading.Thread(target=worker, args=(p,)) for p in proxies]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertLessEqual(sum(results), 1)
+        self.assertLessEqual(
+            Proxy.objects.filter(channel=channel, enabled=True).count(), 1)

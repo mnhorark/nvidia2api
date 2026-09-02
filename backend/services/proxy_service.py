@@ -18,9 +18,19 @@ logger = logging.getLogger("nvidia2api.proxy")
 SUPPORTED_PROTOCOLS = {"socks5", "socks5h", "http", "https"}
 
 
+def count_schedulable_keys(channel: Channel) -> int:
+    """可用于调度竞速的 Key 数：DISABLED / INVALID 不算数。
+
+    旧口径把 401 已判死的 Key 也计入代理启用上限的分母，导致'理论可启用代理数'
+    高于 build_routes 实际可用 Key 数，运维侧数字失真。调度侧以 available_keys
+    （排除 DISABLED/INVALID/冷却）为准，这里同步排除 INVALID。
+    """
+    return channel.keys.exclude(
+        status__in=[ChannelKeyStatus.DISABLED, ChannelKeyStatus.INVALID]).count()
+
+
 def max_proxies_for_channel(channel: Channel) -> int:
-    n = channel.keys.exclude(status=ChannelKeyStatus.DISABLED).count()
-    return max(n - 1, 0)
+    return max(count_schedulable_keys(channel) - 1, 0)
 
 
 def enabled_proxy_count(channel: Channel) -> int:
@@ -119,16 +129,30 @@ def _bulk_import_proxies_locked(lines, channel, result, seen, auto_idx) -> dict:
 def set_enabled(proxy: Proxy, enabled: bool) -> tuple[bool, str]:
     """Enforce: enabled proxies <= number of channel keys - 1."""
     if enabled and not proxy.enabled:
-        channel = proxy.channel
-        n_keys = channel.keys.exclude(status=ChannelKeyStatus.DISABLED).count()
-        max_allowed = max(n_keys - 1, 0)
-        current = channel.proxies.filter(enabled=True).count()
-        if current >= max_allowed:
-            msg = (
-                f"当前渠道 {channel.name} 的 Key 数量为 {n_keys}，"
-                f"最多允许启用 {max_allowed} 个代理。"
-            )
-            return False, msg
+        # 消除 check-then-act：整个"读上限 + 读已启用数 + 置位"放进一个事务，
+        # 先对渠道行做一次写操作拿到 SQLite 写锁（串行化并发的 set_enabled），
+        # 再读计数与置位——两个并发启用请求不再能同时穿过上限检查。
+        try:
+            with transaction.atomic():
+                Channel.objects.filter(pk=proxy.channel_id).update(
+                    updated_at=timezone.now())
+                channel = Channel.objects.get(pk=proxy.channel_id)
+                n_keys = count_schedulable_keys(channel)
+                max_allowed = max(n_keys - 1, 0)
+                current = channel.proxies.filter(enabled=True).count()
+                if current >= max_allowed:
+                    msg = (
+                        f"当前渠道 {channel.name} 的可调度 Key 数量为 {n_keys}，"
+                        f"最多允许启用 {max_allowed} 个代理。"
+                    )
+                    return False, msg
+                proxy.enabled = True
+                proxy.status = ProxyStatus.UNKNOWN
+                proxy.save(update_fields=["enabled", "status", "updated_at"])
+                return True, ""
+        except Exception as exc:  # 写锁竞争（database is locked）等——宁可拒绝也不可超限
+            logger.warning("set_enabled aborted for proxy %s: %s", proxy.pk, exc)
+            return False, "并发启用冲突，请重试"
     proxy.enabled = enabled
     proxy.status = ProxyStatus.UNKNOWN if enabled else ProxyStatus.DISABLED
     proxy.save(update_fields=["enabled", "status", "updated_at"])

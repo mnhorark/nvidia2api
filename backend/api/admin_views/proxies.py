@@ -36,7 +36,7 @@ class ProxyListView(AdminRequiredMixin, APIView):
     def get(self, request):
         channel = current_channel(request)
         qs = channel.proxies.select_related('group').order_by('id')
-        n_keys = channel.keys.exclude(status=ChannelKeyStatus.DISABLED).count()
+        n_keys = proxy_service.count_schedulable_keys(channel)
         max_allowed = max(n_keys - 1, 0)
         enabled = qs.filter(enabled=True).count()
         return Response({'results': ProxySerializer(qs, many=True).data, 'summary': {'channel': channel.slug, 'channel_id': channel.id, 'disable_proxy_unhealthy': channel.disable_proxy_unhealthy, 'nvidia_keys': n_keys, 'max_enabled_proxies': max_allowed, 'enabled_proxies': enabled, 'direct_routes': 1 if n_keys else 0, 'total_routes': enabled + (1 if n_keys else 0)}})
