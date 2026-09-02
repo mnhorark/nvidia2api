@@ -61,7 +61,8 @@ function extractErrorMessage(data: unknown, status: number): string {
 export async function request<T = unknown>(
   path: string,
   options: RequestInit = {},
-  timeoutMs = 60_000
+  timeoutMs = 60_000,
+  allowRetry = true,
 ): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = {
@@ -83,7 +84,18 @@ export async function request<T = unknown>(
     res = await fetch(`${API_BASE_URL}${path}`, { ...options, headers, signal });
   } catch (e) {
     if ((e as Error)?.name === "AbortError") {
+      // 幂等 GET 在超时后重试一次：桥接 --reload / 上游瞬断造成的空窗，
+      // 避免前端"完全加载不出内容"；非 GET（写操作）绝不自动重试防重复提交。
+      if (allowRetry && (!options.method || options.method === "GET")) {
+        await new Promise((r) => setTimeout(r, 1000));
+        return request<T>(path, options, timeoutMs, false);
+      }
       throw new ApiError(`请求超时（${Math.round(timeoutMs / 1000)}s）`, 0);
+    }
+    if (allowRetry && (!options.method || options.method === "GET")) {
+      // 连接被拒/中断等瞬时网络错误：同样重试一次
+      await new Promise((r) => setTimeout(r, 1000));
+      return request<T>(path, options, timeoutMs, false);
     }
     throw e;
   } finally {

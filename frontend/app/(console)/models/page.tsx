@@ -74,14 +74,22 @@ export default function ModelsPage() {
       (m.aliases ?? []).some((a) => a.toLowerCase().includes(q.toLowerCase()))
   );
 
-  async function sync(prune = false) {
+  async function sync(prune = false, pruneOnly = false) {
     setSyncing(true);
     try {
-      const res = await api.post<{ pruned?: number }>("/api/admin/models/sync",
-                                                      prune ? { prune: true } : {});
+      const res = await api.post<{ pruned?: number; created?: number; existing?: number }>(
+        "/api/admin/models/sync",
+        prune ? { prune: true }
+              : pruneOnly ? { prune_only: true } : {}
+      );
       await load();
-      if (prune && (res?.pruned ?? 0) > 0) {
-        toast.success(`同步完成，已清理 ${res.pruned} 个失效模型`);
+      const pruned = res?.pruned ?? 0;
+      if (prune || pruneOnly) {
+        toast.success(pruned > 0
+          ? `已清理 ${pruned} 个上游不存在的模型`
+          : "没有需要清理的模型（本地模型与上游一致）");
+      } else {
+        toast.success(`同步完成（新建 ${res?.created ?? 0} / 已存在 ${res?.existing ?? 0}）`);
       }
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "同步失败");
@@ -198,8 +206,11 @@ export default function ModelsPage() {
             <Button onClick={() => sync()} loading={syncing}>
               <Download size={14} /> 同步渠道模型
             </Button>
-            <Button onClick={() => sync(true)} loading={syncing} title="同步并删除上游已下线的模型">
+            <Button onClick={() => sync(true)} loading={syncing} title="同步并删除上游已下线的模型（含已启用的）">
               <Download size={14} /> 同步并清理
+            </Button>
+            <Button onClick={() => sync(false, true)} loading={syncing} title="不重新同步，仅删除上游已不存在的本地模型">
+              <Trash2 size={14} /> 仅清理不同步
             </Button>
             <Button onClick={load} loading={loading}>
               <RefreshCw size={14} /> 刷新

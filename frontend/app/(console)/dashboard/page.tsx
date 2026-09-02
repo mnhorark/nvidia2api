@@ -28,6 +28,7 @@ function KpiCard({
   value,
   sub,
   delta,
+  loading,
 }: {
   icon: React.ComponentType<{ size?: number | string; className?: string }>;
   label: string;
@@ -35,25 +36,38 @@ function KpiCard({
   value: React.ReactNode;
   sub?: string;
   delta?: React.ReactNode;
+  loading?: boolean;
 }) {
   return (
     <div className="rounded-xl border border-line bg-panel-strong p-5 shadow-panel">
-      <div className="flex items-start justify-between">
-        <div>
-          <div className="text-xs font-medium text-faint">{label}</div>
-          <div className="mt-0.5 text-[10px] uppercase tracking-widest text-faint/70">{en}</div>
+      {loading ? (
+        // 骨架屏：避免首载时数字闪跳（"—"→ 数值的跳动感）
+        <div className="animate-pulse" aria-busy="true" aria-label="加载中">
+          <div className="h-3 w-16 rounded bg-white/[0.06]" />
+          <div className="mt-2 h-4 w-24 rounded bg-white/[0.06]" />
+          <div className="mt-5 h-7 w-20 rounded bg-white/[0.08]" />
+          <div className="mt-2 h-2.5 w-28 rounded bg-white/[0.05]" />
         </div>
-        <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-line bg-white/[0.03]">
-          <Icon size={14} className="text-mute" />
-        </div>
-      </div>
-      <div className="mt-4 flex items-baseline gap-2">
-        <div className="text-3xl font-semibold tracking-tight text-gray-100 [font-variant-numeric:tabular-nums]">
-          {value}
-        </div>
-        {delta}
-      </div>
-      {sub && <div className="mt-1.5 text-[11px] text-faint">{sub}</div>}
+      ) : (
+        <>
+          <div className="flex items-start justify-between">
+            <div>
+              <div className="text-xs font-medium text-faint">{label}</div>
+              <div className="mt-0.5 text-[10px] uppercase tracking-widest text-faint/70">{en}</div>
+            </div>
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-line bg-white/[0.03]">
+              <Icon size={14} className="text-mute" />
+            </div>
+          </div>
+          <div className="mt-4 flex items-baseline gap-2">
+            <div className="text-3xl font-semibold tracking-tight text-gray-100 [font-variant-numeric:tabular-nums]">
+              {value}
+            </div>
+            {delta}
+          </div>
+          {sub && <div className="mt-1.5 text-[11px] text-faint">{sub}</div>}
+        </>
+      )}
     </div>
   );
 }
@@ -250,7 +264,8 @@ function ShareBar({ value, max, color }: { value: number; max: number; color: st
 export default function DashboardPage() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [usage, setUsage] = useState<UsageResponse | null>(null);
-  const [days, setDays] = useLocalStorage("dashboardDays", 1);
+  // 时间范围："5h" = 最近 5 小时；"1"/"7"/"14"/"30" = 天数
+  const [range, setRange] = useLocalStorage<string>("dashboardRange", "1");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -259,17 +274,18 @@ export default function DashboardPage() {
   // 界面停留在新筛选但显示旧区间的数据。
   const seqRef = useRef(0);
 
-  async function load(d = days) {
+  async function load(r = range) {
     const seq = ++seqRef.current;
     setLoading(true);
     setError("");
     try {
       const tz = Intl.DateTimeFormat().resolvedOptions().timeZone ?? "";
+      const usageQs = r === "5h"
+        ? `hours=5&tz=${encodeURIComponent(tz)}`
+        : `days=${r}&tz=${encodeURIComponent(tz)}`;
       const [s, u] = await Promise.all([
         api.get<DashboardStats>("/api/admin/dashboard"),
-        api.get<UsageResponse>(
-          `/api/admin/dashboard/usage?days=${d}&tz=${encodeURIComponent(tz)}`
-        ),
+        api.get<UsageResponse>(`/api/admin/dashboard/usage?${usageQs}`),
       ]);
       if (seq !== seqRef.current) return; // 已有更新的请求发出，丢弃本次结果
       setStats(s);
@@ -287,9 +303,11 @@ export default function DashboardPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 轻量轮询：每 10s 刷新运行指标（实时并发等），不重拉用量图
+  // 轻量轮询：每 10s 刷新运行指标（实时并发等），不重拉用量图。
+  // 标签页不可见时暂停，避免多标签页 / 切后台时对后端空轮询。
   useEffect(() => {
     const timer = window.setInterval(async () => {
+      if (document.hidden) return;
       try {
         const s = await api.get<DashboardStats>("/api/admin/dashboard");
         setStats(s);
@@ -300,9 +318,9 @@ export default function DashboardPage() {
     return () => window.clearInterval(timer);
   }, []);
 
-  function changeDays(d: number) {
-    setDays(d);
-    load(d);
+  function changeRange(r: string) {
+    setRange(r);
+    load(r);
   }
 
   const maxProxies = Math.max(
@@ -326,8 +344,14 @@ export default function DashboardPage() {
       />
 
       {error && (
-        <div className="mb-4 rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-[13px] text-err">
-          {error}
+        <div className="mb-4 flex items-center justify-between rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-[13px] text-err">
+          <span>{error}</span>
+          <button
+            onClick={() => load()}
+            className="shrink-0 rounded-md border border-err/25 bg-err/10 px-2.5 py-1 text-xs font-medium text-err transition-colors hover:bg-err/20"
+          >
+            重试
+          </button>
         </div>
       )}
 
@@ -342,6 +366,7 @@ export default function DashboardPage() {
             ? <Delta cur={usage.totals.requests} prev={usage.prev_totals.requests} />
             : undefined}
           sub="当前渠道过去 24 小时"
+          loading={loading && !stats}
         />
         <KpiCard
           icon={Gauge}
@@ -352,6 +377,7 @@ export default function DashboardPage() {
             ? <Delta cur={usage.totals.success_rate} prev={usage.prev_totals.success_rate} />
             : undefined}
           sub="今日成功/总请求"
+          loading={loading && !stats}
         />
         <KpiCard
           icon={Timer}
@@ -359,6 +385,7 @@ export default function DashboardPage() {
           en="Avg latency"
           value={stats ? `${Number(stats.avg_latency_s ?? stats.avg_latency ?? 0).toFixed(2)}s` : "—"}
           sub="端到端响应时间"
+          loading={loading && !stats}
         />
         <KpiCard
           icon={Zap}
@@ -366,12 +393,13 @@ export default function DashboardPage() {
           en="Active now"
           value={stats?.active_requests ?? 0}
           sub="正在处理的请求数"
+          loading={loading && !stats}
         />
       </div>
 
       {/* ── Token 用量图 ── */}
       <SectionTitle title="用量统计" desc="全渠道 Token 与请求量趋势" />
-      <TokenUsageSection usage={usage} days={days} onChangeDays={changeDays} />
+      <TokenUsageSection usage={usage} range={range} onChangeRange={changeRange} />
 
       {/* ── 渠道资源 ── */}
       <SectionTitle title="渠道资源" desc={`${stats?.channel_name ?? "当前渠道"} · Keys / 代理 / 模型`} />
@@ -423,12 +451,12 @@ export default function DashboardPage() {
 /* ==================== Token 用量大卡 ==================== */
 function TokenUsageSection({
   usage,
-  days,
-  onChangeDays,
+  range,
+  onChangeRange,
 }: {
   usage: UsageResponse | null;
-  days: number;
-  onChangeDays: (d: number) => void;
+  range: string;
+  onChangeRange: (r: string) => void;
 }) {
   const list = usage?.days ?? [];
   const totals = usage?.totals;
@@ -436,6 +464,7 @@ function TokenUsageSection({
   const models = usage?.models ?? [];
   const channels = usage?.channels ?? [];
   const apiKeys = usage?.keys ?? [];
+  const isHourly = range === "5h" || range === "1";
   const max = Math.max(1, ...list.map((d) => d.total_tokens ?? 0));
   const maxReq = Math.max(1, ...list.map((d) => d.requests ?? 0));
 
@@ -459,7 +488,9 @@ function TokenUsageSection({
   ];
 
   return (
-    <Card className="overflow-hidden">
+    /* 注意：不能加 overflow-hidden——边缘柱的 hover tooltip（ChartTip）会超出
+       卡片边界被裁掉（用户反馈"鼠标放边缘树状图的信息被框架遮挡"）。 */
+    <Card>
       {/* 头部：标题 + 时间筛选 */}
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line pb-4">
         <div className="flex items-baseline gap-2">
@@ -468,16 +499,16 @@ function TokenUsageSection({
           <span className="text-[11px] text-faint">全渠道汇总</span>
         </div>
         <div className="flex gap-0.5 rounded-md border border-line bg-white/[0.02] p-0.5">
-          {[1, 7, 14, 30].map((d) => (
+          {(["5h", "1", "7", "14", "30"] as const).map((r) => (
             <button
-              key={d}
-              onClick={() => onChangeDays(d)}
+              key={r}
+              onClick={() => onChangeRange(r)}
               className={cx(
                 "h-6 rounded px-2.5 text-xs font-medium transition-colors",
-                days === d ? "bg-white/[0.09] text-gray-100" : "text-faint hover:text-gray-300"
+                range === r ? "bg-white/[0.09] text-gray-100" : "text-faint hover:text-gray-300"
               )}
             >
-              {d === 1 ? "今日" : `${d} 天`}
+              {r === "5h" ? "最近 5 小时" : r === "1" ? "今日" : `${r} 天`}
             </button>
           ))}
         </div>
@@ -519,14 +550,18 @@ function TokenUsageSection({
             unitValue={`${fmtNum(max)}`}
             side="left"
             legend={[
-              { label: "输入", color: "bg-accent" },
               { label: "输出", color: "bg-info" },
+              { label: "输入", color: "bg-accent" },
+              { label: "缓存", color: "bg-warn" },
             ]}
           >
             <div className="flex items-end gap-[3px]" style={{ height: 140 }}>
               {list.map((d) => {
-                const p = Math.min(100, ((d.prompt_tokens || 0) / max) * 100);
-                const c = Math.min(100, ((d.completion_tokens || 0) / max) * 100);
+                // 三段（自下而上）：输出 / 输入净额 / 缓存（缓存是 prompt 的命中部分）
+                const completion = Math.min(100, ((d.completion_tokens || 0) / max) * 100);
+                const cached = Math.min(100, ((d.cached_tokens || 0) / max) * 100);
+                const prompt = Math.min(100, ((d.prompt_tokens || 0) / max) * 100);
+                const promptNet = Math.max(0, prompt - cached);
                 return (
                   <div key={d.date} className="group relative h-full flex-1">
                     <ChartTip>
@@ -536,15 +571,18 @@ function TokenUsageSection({
                       {(d.completion_tokens ?? 0) > 0 && <> · 输出 {fmtNumInt(d.completion_tokens)}</>}
                     </ChartTip>
                     <div className="flex h-full flex-col justify-end overflow-hidden rounded-t-[3px]">
-                      <div style={{ height: `${c}%`, minHeight: c > 0 ? 3 : 0 }}
+                      <div style={{ height: `${completion}%`, minHeight: completion > 0 ? 3 : 0 }}
                         className="w-full bg-info/70 transition-colors group-hover:bg-info" />
-                      <div style={{ height: `${p}%` }}
+                      <div style={{ height: `${promptNet}%`, minHeight: promptNet > 0 ? 3 : 0 }}
                         className="w-full bg-accent/70 transition-colors group-hover:bg-accent/90" />
+                      <div style={{ height: `${cached}%`, minHeight: cached > 0 ? 3 : 0 }}
+                        className="w-full bg-warn/70 transition-colors group-hover:bg-warn" />
                     </div>
                   </div>
                 );
               })}
             </div>
+            <AxisLabels list={list} isHourly={isHourly} />
           </ChartPanel>
 
           <ChartPanel
@@ -575,20 +613,8 @@ function TokenUsageSection({
                 );
               })}
             </div>
+            <AxisLabels list={list} isHourly={isHourly} />
           </ChartPanel>
-
-          {/* X 轴标签 */}
-          <div className="col-span-full flex justify-between border-t border-line px-5 py-2 text-[10px] tabular-nums text-faint">
-            {list.map((d, i) => (
-              <span key={d.date} className="flex-1 text-center">
-                {days === 1
-                  ? parseInt(d.date, 10) % 3 === 0 ? d.date : ""
-                  : list.length > 14
-                    ? i % 5 === 0 ? d.date.slice(5) : ""
-                    : d.date.slice(5)}
-              </span>
-            ))}
-          </div>
         </div>
       )}
 
@@ -644,6 +670,50 @@ function ChartPanel({
         <span className="text-[10px] tabular-nums text-faint">{unit} {unitValue}</span>
       </div>
       {children}
+    </div>
+  );
+}
+
+/**
+ * X 轴标签：必须与柱使用相同的 flex + gap 布局（柱容器是 `flex items-end gap-[3px]`，
+ * 每根柱 flex-1），否则标签中心与柱中心错位——此前标签在 `col-span-full` 整行均分、
+ * 无 gap，横跨 Token 用量/请求量两图且对不齐（用户反馈"日期时间显示有问题"）。
+ * 每个图表内部渲染各自标签，与柱严格对齐。
+ *
+ * 30 天视图标签拥挤/被截断的修复：不再"每柱一个 flex-1 容器"（30 个容器每个只有
+ * ~20px 宽，text-xs 的 "08-26" 放不下被 truncate 截断）。改为**只渲染需要显示的
+ * 稀疏标签**，用绝对定位（left = 柱中心百分比）逐个摆放 + whitespace-nowrap，
+ * 标签互不挤压、永不截断；左右边缘标签不裁剪（Card 无 overflow-hidden）。
+ */
+function AxisLabels({ list, isHourly }: {
+  list: UsageResponse["days"];
+  isHourly: boolean;
+}) {
+  const n = list.length;
+  return (
+    <div className="relative mt-1.5 h-5 select-none">
+      {list.map((d, i) => {
+        let text = "";
+        if (isHourly) {
+          text = n <= 8
+            ? d.date // 最近 5 小时等小时视图点少：全部显示
+            : parseInt(d.date, 10) % 3 === 0 ? d.date : ""; // 今日视图：每 3 小时稀疏
+        } else {
+          text = n > 14
+            ? i % 5 === 0 ? d.date.slice(5) : "" // 长天数（30 天）：每 5 天一个
+            : d.date.slice(5);
+        }
+        if (!text) return null;
+        return (
+          <span
+            key={d.date}
+            className="absolute -translate-x-1/2 whitespace-nowrap text-xs tabular-nums text-faint"
+            style={{ left: `${((i + 0.5) / n) * 100}%` }}
+          >
+            {text}
+          </span>
+        );
+      })}
     </div>
   );
 }

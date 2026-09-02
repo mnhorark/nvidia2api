@@ -66,7 +66,8 @@ export default function ChatPage() {
   }, []);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    // smooth 滚动在高频 setState 下会排队大量动画，改即时滚动避免卡顿
+    bottomRef.current?.scrollIntoView({ behavior: "auto" });
   }, [messages]);
 
   const send = useCallback(async () => {
@@ -86,14 +87,30 @@ export default function ChatPage() {
     let reasoning = "";
     let meta: ChatMessage["meta"];
     let failed = false;
+    let paintTimer: number | null = null;
+    let paintPending = false;
 
-    const paint = () => {
+    const paintNow = () => {
       const { reasoning: r, content: c } = splitReasoning(content, reasoning || undefined);
       setMessages((prev) => {
         const next = prev.slice();
         next[next.length - 1] = { role: "assistant", content: c, reasoning: r, meta };
         return next;
       });
+    };
+
+    // 思考模型每秒可吐几十~上百个 SSE chunk。每个 chunk 都 setState + 全文正则
+    // + 整树重渲染会把主线程打满（表现为"经常卡死"）。50ms 节流保留流式观感，
+    // 错误/收尾仍立即 paintNow。
+    const paint = () => {
+      paintPending = true;
+      if (paintTimer != null) return;
+      paintTimer = window.setTimeout(() => {
+        paintTimer = null;
+        if (!paintPending) return;
+        paintPending = false;
+        paintNow();
+      }, 50);
     };
 
     const ac = new AbortController();
@@ -186,7 +203,7 @@ export default function ChatPage() {
           failed = true;
           const e = data.error as { message?: string };
           content = `⚠ ${e.message || "请求失败"}`;
-          paint();
+          paintNow();
           toast.error(e.message || "请求失败");
           return;
         }
@@ -215,7 +232,7 @@ export default function ChatPage() {
       // 上游可能不以空行结尾：流结束后必须冲刷缓冲区里的最后一个事件，
       // 否则最后一段回答会凭空丢失（表现为"回答总是少一截"）。
       for (const evt of drain(true)) handleEvent(evt);
-      paint();
+      paintNow();
       if (!content && !reasoning && !failed) {
         setMessages(history);
         toast.error("未收到有效响应");
@@ -226,6 +243,11 @@ export default function ChatPage() {
       setMessages(history);
       toast.error(e instanceof Error ? e.message : "请求失败");
     } finally {
+      if (paintTimer != null) {
+        window.clearTimeout(paintTimer);
+        paintTimer = null;
+      }
+      if (paintPending) paintNow();
       setSending(false);
       if (abortRef.current === ac) abortRef.current = null;
     }

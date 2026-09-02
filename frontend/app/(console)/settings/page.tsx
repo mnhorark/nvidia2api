@@ -45,8 +45,7 @@ export default function SettingsPage() {
         const cur = String(p.value);
         const raw = (draft[p.key] ?? cur).trim();
         // 未修改且从未覆盖过：不提交。避免把"当前默认值"固化成覆盖行，
-        // 导致日后调整代码默认值时旧值继续压着（如 stream_stall_timeout
-        // → stream_probe_interval×max_idle_probes 的演进曾被固化值卡住）。
+        // 导致日后调整代码默认值时旧值继续压着（如流式判死参数曾多次改名演进）。
         if (raw === cur && !p.overridden) continue;
         // 改回默认值（或数字类型留空）→ 提交 null，由后端清除覆盖、回落后端默认
         if (raw === String(p.default)) {
@@ -111,11 +110,11 @@ export default function SettingsPage() {
 
   const dirty = params.some((p) => draft[p.key] !== undefined && draft[p.key] !== String(p.value));
 
-  // 分区展示顺序与标题（与后端 sysconfig 的分组字段一致）
+  // 分区展示顺序与标题（与后端 sysconfig 的分组字段对应）
   const GROUPS: { id: string; label: string }[] = [
-    { id: "request", label: "请求与重试" },
+    { id: "request", label: "并发与请求" },
     { id: "timeout", label: "超时控制" },
-    { id: "stream", label: "流式保活与掐线" },
+    { id: "stream", label: "流式传输" },
     { id: "health", label: "健康检查与冷却" },
     { id: "thinking", label: "思考参数" },
     { id: "logs", label: "日志" },

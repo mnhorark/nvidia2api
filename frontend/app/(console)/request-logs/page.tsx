@@ -34,8 +34,14 @@ export default function RequestLogsPage() {
   const [total, setTotal] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
+  // 展开行的懒加载明细缓存：列表接口已剔除 routes/thinking 大字段，展开时按 id 取全文
+  const [details, setDetails] = useState<Record<number, RequestLog>>({});
+  const [detailLoading, setDetailLoading] = useState(false);
   const [autoRefresh, setAutoRefresh] = useLocalStorage("requestLogsAutoRefresh", false);
   const [refreshSec, setRefreshSec] = useLocalStorage("requestLogsRefreshSec", 10);
+  const safeRefreshSec = [5, 10, 30, 60].includes(Number(refreshSec))
+    ? Number(refreshSec)
+    : 10;
 
   const PAGE_SIZE = 100;
   // 请求序号：筛选/刷新变更时递增，过期的分页响应直接丢弃，避免跨筛选追加错乱
@@ -106,18 +112,44 @@ export default function RequestLogsPage() {
     return () => window.clearTimeout(t);
   }, [modelInput]);
 
-  // 自动刷新：开启后按间隔重新加载（加载中状态复用，不打断展开明细）
+  // 自动刷新：开启后按间隔重新加载（加载中状态复用，不打断展开明细）。
+  // 标签页不可见时暂停轮询：多标签页 / 切后台时不再空耗后端（日志页轮询风暴来源之一）。
   useEffect(() => {
     if (!autoRefresh) return;
-    const t = window.setInterval(() => load(), refreshSec * 1000);
+    const t = window.setInterval(() => {
+      if (!document.hidden) load();
+    }, safeRefreshSec * 1000);
     return () => window.clearInterval(t);
-  }, [autoRefresh, refreshSec, load]);
+  }, [autoRefresh, safeRefreshSec, load]);
 
-  // token 生成速度（tokens/s），参考主流中转网关日志面板的「速度」列
+  // 展开一行：列表已不含 routes/thinking 明细，展开时按 id 懒加载全文并缓存。
+  async function toggleExpand(l: RequestLog) {
+    if (expanded === l.request_id) {
+      setExpanded(null);
+      return;
+    }
+    setExpanded(l.request_id);
+    if (!details[l.id]) {
+      setDetailLoading(true);
+      try {
+        const d = await api.get<RequestLog>(`/api/admin/logs/${l.id}`);
+        setDetails((prev) => ({ ...prev, [l.id]: d }));
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "加载明细失败");
+      } finally {
+        setDetailLoading(false);
+      }
+    }
+  }
+
+  // token 生成速度（tokens/s），口径对齐 new-api / one-api：输出 tokens / 总耗时。
+  // 按量级自适应精度，慢模型（<0.1 tok/s）也保留可读精度，不落回 "—"。
   function fmtSpeed(s?: number | null) {
     if (s == null || !isFinite(s) || s <= 0) return "—";
-    if (s >= 1000) return `${(s / 1000).toFixed(2)}k tok/s`;
-    return `${s} tok/s`;
+    if (s < 0.1) return `${s.toFixed(3)} tok/s`;
+    if (s < 100) return `${s.toFixed(1)} tok/s`;
+    if (s < 1000) return `${s.toFixed(0)} tok/s`;
+    return `${(s / 1000).toFixed(2)}k tok/s`;
   }
 
   useEffect(() => {
@@ -135,7 +167,7 @@ export default function RequestLogsPage() {
               <span className="text-xs text-mute">自动刷新</span>
               <Toggle checked={autoRefresh} onChange={setAutoRefresh} />
               <Select
-                value={String(refreshSec)}
+                value={String(safeRefreshSec)}
                 onChange={(e) => setRefreshSec(Number(e.target.value))}
                 className="w-[74px]"
                 disabled={!autoRefresh}
@@ -204,10 +236,12 @@ export default function RequestLogsPage() {
       >
         {logs.map((l) => {
           const open = expanded === l.request_id;
+          // 明细优先用懒加载的全文（含 routes/thinking）；未展开或未加载时回落列表轻量字段
+          const detail = details[l.id] ?? l;
           return (
             <Fragment key={l.id ?? l.request_id}>
               <tr
-                onClick={() => setExpanded(open ? null : l.request_id)}
+                onClick={() => toggleExpand(l)}
                 className="cursor-pointer transition-colors hover:bg-white/[0.025]"
               >
                 <Td className="w-6 text-faint">
@@ -246,7 +280,7 @@ export default function RequestLogsPage() {
                       {l.status === "success" && (
                         <div
                           className="text-[10px] text-info"
-                          title={l.generation_speed != null ? "输出 tokens / 生成耗时（流式已扣除首字延迟）" : undefined}
+                          title={l.generation_speed != null ? "输出 tokens / 总耗时" : undefined}
                         >
                           {fmtSpeed(l.generation_speed)}
                         </div>
@@ -277,26 +311,28 @@ export default function RequestLogsPage() {
                         <div className="flex flex-wrap items-center gap-x-2 text-xs text-mute">
                           <span className="font-medium text-gray-400">客户端传入</span>
                           <code className="rounded bg-white/[0.05] px-1.5 py-0.5 font-mono text-[11px] text-info">
-                            {Object.keys(l.client_thinking ?? {}).length > 0
-                              ? JSON.stringify(l.client_thinking)
+                            {Object.keys(detail.client_thinking ?? {}).length > 0
+                              ? JSON.stringify(detail.client_thinking)
                               : "—（未传入思考参数）"}
                           </code>
                         </div>
                         <div className="flex flex-wrap items-center gap-x-2 text-xs text-mute">
                           <span className="font-medium text-gray-400">实际下发上游</span>
                           <code className="rounded bg-white/[0.05] px-1.5 py-0.5 font-mono text-[11px] text-warn">
-                            {Object.keys(l.upstream_thinking ?? {}).length > 0
-                              ? JSON.stringify(l.upstream_thinking)
+                            {Object.keys(detail.upstream_thinking ?? {}).length > 0
+                              ? JSON.stringify(detail.upstream_thinking)
                               : "—（未下发思考参数）"}
                           </code>
                         </div>
                       </div>
                       <div className="text-xs font-medium text-mute">线路竞速明细</div>
-                      {(l.routes ?? []).length === 0 ? (
+                      {detailLoading && !detail.routes ? (
+                        <p className="text-xs text-faint">加载中…</p>
+                      ) : (detail.routes ?? []).length === 0 ? (
                         <p className="text-xs text-faint">该请求未记录线路明细（早期日志）</p>
                       ) : (
                         <div className="space-y-1.5">
-                          {l.routes!.map((r, i) => (
+                          {detail.routes!.map((r, i) => (
                             <div key={i} className="flex items-center gap-2.5 text-xs">
                               <span
                                 className={
