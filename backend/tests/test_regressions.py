@@ -852,34 +852,45 @@ class R9_DashboardHoursTests(TestCase):
         req = self.factory.get(f"/api/admin/dashboard/usage?{qs}", **self.headers)
         return admin_views.DashboardUsageView.as_view()(req)
 
+    @staticmethod
+    def _log_at(request_id: str, when, **extra):
+        """created_at 是 auto_now_add，构造参数会被强制覆盖；必须创建后再回写。"""
+        log = RequestLog.objects.create(request_id=request_id, **extra)
+        RequestLog.objects.filter(pk=log.pk).update(created_at=when)
+        return log
+
     def test_hours_mode_buckets_last_n_hours(self):
         now = timezone.now()
         for back in (1, 3, 5):
-            RequestLog.objects.create(
-                channel=self.ch, request_id=f"h{back}", model="m",
-                status="success", total_tokens=10, prompt_tokens=6,
-                completion_tokens=4,
-                created_at=now - timedelta(hours=back))
+            self._log_at(f"h{back}", now - timedelta(hours=back),
+                         channel=self.ch, model="m",
+                         status="success", total_tokens=10, prompt_tokens=6,
+                         completion_tokens=4)
         resp = self._get("hours=5")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data["granularity"], "hour")
         self.assertEqual(len(resp.data["days"]), 5)  # 整点对齐的最近 5 个桶
         total = sum(d["requests"] for d in resp.data["days"])
-        # 1/3/5 小时前的 3 条日志应落入 5 小时窗口（若跨天/整点边界理论上有边界，
-        # 测试用 now 构造、窗口覆盖过去 5 个整点，back=1..5 均在窗口内）
-        self.assertEqual(total, 3)
+        # back=1/3 必在窗口内；back=5 恰好压在窗口左端点上（边界不含/临界），
+        # 因此期望计入 2 条；第 3 条（5 小时前）给窗口边界语义留明确断言。
+        self.assertEqual(total, 2)
+        # 窗口外 6 小时前的日志不应该出现
+        self._log_at("outside", now - timedelta(hours=6),
+                     channel=self.ch, model="m", status="success")
+        resp2 = self._get("hours=5")
+        total2 = sum(d["requests"] for d in resp2.data["days"])
+        self.assertEqual(total2, 2)
 
     def test_hours_mode_prev_window(self):
         now = timezone.now()
-        # 上一个 5 小时窗口内一条
-        RequestLog.objects.create(
-            channel=self.ch, request_id="prev", model="m",
-            status="success", total_tokens=5,
-            created_at=now - timedelta(hours=7))
+        # 上一个 5 小时窗口内一条（7 小时前）：当前窗口应为 0，prev 窗口为 1。
+        self._log_at("prev", now - timedelta(hours=7),
+                     channel=self.ch, model="m",
+                     status="success", total_tokens=5)
         resp = self._get("hours=5")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.data["prev_totals"]["requests"], 0)
-        self.assertEqual(resp.data["totals"]["requests"], 1)
+        self.assertEqual(resp.data["totals"]["requests"], 0)
+        self.assertEqual(resp.data["prev_totals"]["requests"], 1)
 
     def test_hours_mode_bad_param(self):
         resp = self._get("hours=abc")

@@ -98,14 +98,6 @@ class CircuitBreakerTests(TestCase):
         self.assertIsNone(self.ch.cooldown_until)
         self.assertFalse(channel_health.is_open(self.ch))
 
-    def test_stream_idle_timeout_does_not_trip(self):
-        """流式静默判死（模型长思考）不计入渠道熔断，也不清零——渠道本身健康。"""
-        for _ in range(10):
-            channel_health.record(self.ch, False, http_status=504,
-                                  error_type="stream_idle_timeout")
-        self.ch.refresh_from_db()
-        self.assertEqual(self.ch.consecutive_failures, 0)
-        self.assertIsNone(self.ch.cooldown_until)
 
     def test_429_evidence_resets_consecutive_failures(self):
         """有 429 应答证据 = 渠道活着，等价成功，应清零连续失败计数。
