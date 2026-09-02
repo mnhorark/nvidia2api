@@ -70,6 +70,41 @@ class LogPaginationTests(TestCase):
         resp = admin_views.LogListView.as_view()(req)
         self.assertEqual(resp.status_code, 400)
 
+    def test_list_omits_heavy_detail_fields(self):
+        # 列表必须轻量：不带 routes/thinking 高成本字段（日志页轮询性能的回归守卫）
+        RequestLog.objects.create(
+            channel=self.ch, request_id="heavy", model="m", status="success",
+            routes=[{"name": "a", "kind": "direct", "key_name": "k",
+                     "proxy_name": "", "status": "winner", "latency_ms": 1,
+                     "error": "", "http_status": 200}],
+            client_thinking={"reasoning_effort": "high"},
+            upstream_thinking={"chat_template_kwargs": {"thinking": True}},
+        )
+        req = RequestFactory().get("/api/admin/logs?limit=100",
+                                   HTTP_AUTHORIZATION=f"Token {settings.ADMIN_TOKEN}",
+                                   HTTP_X_CHANNEL="ops")
+        resp = admin_views.LogListView.as_view()(req)
+        item = resp.data["results"][0]
+        self.assertNotIn("routes", item)
+        self.assertNotIn("client_thinking", item)
+        self.assertNotIn("upstream_thinking", item)
+
+    def test_detail_returns_heavy_fields(self):
+        log = RequestLog.objects.create(
+            channel=self.ch, request_id="detail-1", model="m", status="success",
+            routes=[{"name": "a", "kind": "direct", "key_name": "k",
+                     "proxy_name": "", "status": "winner", "latency_ms": 1,
+                     "error": "", "http_status": 200}],
+            client_thinking={"reasoning_effort": "high"},
+        )
+        req = RequestFactory().get(f"/api/admin/logs/{log.id}",
+                                   HTTP_AUTHORIZATION=f"Token {settings.ADMIN_TOKEN}",
+                                   HTTP_X_CHANNEL="ops")
+        resp = admin_views.LogDetailView.as_view()(req, pk=log.id)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["routes"], log.routes)
+        self.assertEqual(resp.data["client_thinking"], {"reasoning_effort": "high"})
+
 
 class LogCleanupTests(TestCase):
     @staticmethod
@@ -150,6 +185,52 @@ class ActiveRequestsTests(TestCase):
         self.assertIsInstance(resp.data["active_requests"], int)
 
 
+class UpstreamGateTests(TestCase):
+    """全局上游 socket 阀门：跨请求统计 & 余量校验（默认 0=不限制）。"""
+
+    def setUp(self):
+        # 模块级全局计数器不在 Django 事务内，测试间手动复位，避免串扰
+        openai_views._upstream_active = 0
+
+    def tearDown(self):
+        openai_views._upstream_active = 0
+
+    def test_reserve_caps_at_limit(self):
+        with patch.object(openai_views, "_upstream_limit", return_value=5):
+            self.assertEqual(openai_views._reserve_upstream(10), 5)
+            self.assertEqual(openai_views._reserve_upstream(10), 1)
+
+    def test_reserve_never_starves_to_zero(self):
+        """有限额度耗尽时至少保底 1 条，避免请求被裁成 0 线路重试风暴。"""
+        with patch.object(openai_views, "_upstream_limit", return_value=2):
+            self.assertEqual(openai_views._reserve_upstream(10), 2)
+            # 额度已耗尽，但仍保底 1
+            self.assertEqual(openai_views._reserve_upstream(10), 1)
+
+    def test_release_clamps_to_zero_and_reopens_slots(self):
+        with patch.object(openai_views, "_upstream_limit", return_value=5):
+            self.assertEqual(openai_views._reserve_upstream(10), 5)
+            openai_views._release_upstream(3)
+            self.assertEqual(openai_views._reserve_upstream(10), 3)
+            openai_views._release_upstream(999)
+            self.assertEqual(openai_views._reserve_upstream(10), 5)
+
+    def test_zero_limit_means_unlimited_default(self):
+        """max_concurrent_upstream=0（默认）视为不限制：全部放行，不裁剪、不饿死。"""
+        with patch.object(openai_views, "_upstream_limit", return_value=10**9):
+            self.assertEqual(openai_views._reserve_upstream(50), 50)
+            self.assertEqual(openai_views._reserve_upstream(50), 50)
+            self.assertEqual(openai_views._reserve_upstream(50), 50)
+
+    def test_configured_zero_is_unlimited(self):
+        # _upstream_limit 自身语义：0 -> 极大值（不限制）
+        from services import sysconfig
+        with patch("services.sysconfig.get", return_value=0):
+            self.assertEqual(openai_views._upstream_limit(), 10**9)
+        with patch("services.sysconfig.get", return_value=None):
+            self.assertGreaterEqual(openai_views._upstream_limit(), 10**9)
+
+
 class GenerationSpeedTests(TestCase):
     def setUp(self):
         self.ch = _make_channel()
@@ -163,12 +244,12 @@ class GenerationSpeedTests(TestCase):
             status="success", **kw)
         return RequestLogSerializer(log).data["generation_speed"]
 
-    def test_stream_speed_excludes_ttft(self):
-        # 流式：耗时 2000ms、首字 500ms、输出 150 token
-        # 生成耗时 = 1500ms -> 150 / 1.5 = 100.0 tok/s
+    def test_stream_speed_uses_total_duration(self):
+        # 流式：耗时 2000ms、输出 150 token -> 150 / 2.0 = 75.0 tok/s
+        # （对齐 new-api：速度不扣 TTFT，denominator 用总耗时）
         speed = self._serialize(is_stream=True, duration_ms=2000,
                                 first_token_ms=500, completion_tokens=150)
-        self.assertEqual(speed, 100.0)
+        self.assertEqual(speed, 75.0)
 
     def test_non_stream_speed_uses_total_duration(self):
         # 非流式：耗时 1000ms、输出 50 token -> 50 tok/s
@@ -179,21 +260,22 @@ class GenerationSpeedTests(TestCase):
     def test_no_output_returns_none(self):
         self.assertIsNone(self._serialize(is_stream=True, duration_ms=1000,
                                           completion_tokens=0))
+        self.assertIsNone(self._serialize(is_stream=True, duration_ms=0,
+                                          completion_tokens=10))
 
-    def test_ttft_geq_duration_returns_none(self):
-        # 首字不小于总耗时视为数据异常（与 new-api 口径一致），不计算
-        self.assertIsNone(self._serialize(is_stream=True, duration_ms=500,
-                                          first_token_ms=500, completion_tokens=10))
-        self.assertIsNone(self._serialize(is_stream=True, duration_ms=500,
-                                          first_token_ms=600, completion_tokens=10))
+    def test_burst_flush_no_longer_inflated(self):
+        # 上游批量冲刷：首字≈总耗时（12.71s→12.87s）、151 token 一次性涌入。
+        # 旧实现扣 TTFT 会把 denominator 压到 161ms 算出 ~938 tok/s 虚高值；
+        # 对齐 new-api 用总耗时后得到诚实的有效吞吐 ≈ 11.74 tok/s。
+        speed = self._serialize(is_stream=True, duration_ms=12866,
+                                first_token_ms=12705, completion_tokens=151)
+        self.assertAlmostEqual(speed, 11.74, places=2)
 
-    def test_stream_gen_time_too_short_returns_none(self):
-        # 生成阶段过短（首字≈总耗时、输出一次性涌入）会算出虚高 tok/s，
-        # 低于最小统计窗口时不展示。复现真实案例：首字 12.71s、总耗时 12.87s。
-        self.assertIsNone(self._serialize(is_stream=True, duration_ms=12866,
-                                          first_token_ms=12705, completion_tokens=151))
-        self.assertIsNone(self._serialize(is_stream=True, duration_ms=1000,
-                                          first_token_ms=700, completion_tokens=150))
+    def test_slow_model_keeps_precision(self):
+        # 慢模型 <1 tok/s：保留 2 位小数，避免被 round(…,1) 压成 0.0 显示 "—"
+        speed = self._serialize(is_stream=True, duration_ms=25000,
+                                completion_tokens=1)
+        self.assertEqual(speed, 0.04)
 
 
 class ModelAliasAdminTests(TestCase):
@@ -258,7 +340,7 @@ class DrainFirstContentTimeoutTests(unittest.IsolatedAsyncioTestCase):
         from api.openai_views import _drain
         winner = self._winner(lambda: _never_ends())
         with self.assertRaises(TimeoutError):
-            async for _ in _drain(winner, probe_interval=0.03, max_idle_probes=2):
+            async for _ in _drain(winner, idle_timeout=0.06):
                 pass
 
     async def test_reasoning_flow_does_not_timeout(self):
@@ -274,7 +356,7 @@ class DrainFirstContentTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
         winner = self._winner(stream)
         got = 0
-        async for _ in _drain(winner, probe_interval=0.03, max_idle_probes=2):
+        async for _ in _drain(winner, idle_timeout=0.06):
             got += 1
         # 总耗时 0.15s > 判死阈值 0.06s：若按"连续无数据"早该被掐断，但思考 token
         # 一直在流动（任一数据即清零重计），必须完整走完
@@ -298,9 +380,89 @@ class DrainFirstContentTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
         winner = self._winner(stream)
         got = []
-        async for chunk in _drain(winner, probe_interval=0.03, max_idle_probes=2):
+        async for chunk in _drain(winner, idle_timeout=0.06):
             got.append(chunk)
         self.assertEqual(len(got), 3)
+
+    async def test_content_silence_survives_probe_deadline(self):
+        """已产出真实内容（正文）后的长静默不再按 probe×probes 判死。
+
+        思考模型在吐出若干 token 后可能合法停顿数分钟不吐字节；旧实现 30s×4≈120s
+        就把胜出线路掐断、客户端收到"响应迟迟不回然后直接 [DONE] 中断"。
+        修复后：已产出真实内容则只由 max_duration 兜底，能撑过 probe 判死窗口。
+        """
+        import asyncio
+        import time as _t
+        from api.openai_views import _drain
+
+        async def stream():
+            yield ('data: {"choices":[{"index":0,"delta":{"content":"hi"},'
+                   '"finish_reason":null}]}\n\n')
+            await asyncio.Event().wait()  # 静默，远超 probe×probes
+
+        winner = self._winner(stream)
+        t0 = _t.monotonic()
+        got = 0
+        try:
+            async for _ in _drain(winner, idle_timeout=0.04,
+                                  max_duration=0.12):
+                got += 1
+        except TimeoutError:
+            pass
+        elapsed = _t.monotonic() - t0
+        self.assertEqual(got, 1)
+        # 若仍按 probe(0.02×2=0.04s) 判死，elapsed≈0.04；能撑到 max_duration≈0.12 证明已豁免
+        self.assertGreaterEqual(elapsed, 0.10)
+
+    async def test_no_signal_still_deadlines(self):
+        """从未产出真实信号（只有空 role/心跳行）的线路仍按短窗口判死——僵尸流换线兜底保留。"""
+        import asyncio
+        from api.openai_views import _drain
+
+        async def stream():
+            # 结构合法但无正文/思考/工具的空 choices 行，随后静默
+            yield 'data: {"choices":[{"index":0,"delta":{}}]}\n\n'
+            await asyncio.Event().wait()
+
+        winner = self._winner(stream)
+        with self.assertRaises(TimeoutError):
+            async for _ in _drain(winner, idle_timeout=0.04):
+                pass
+
+    async def test_reasoning_silence_still_killed_by_short_window(self):
+        """思考请求在"从未产出真实内容"时同样按短窗口判死（回归守卫：不按是否带
+        思考参数豁免）。思考模型也可能真卡死，统一由 probe×probes 兜底；需要更宽容忍
+        就调大 stream_idle_timeout，而非跳过判死。"""
+        import asyncio
+        from api.openai_views import _drain
+
+        async def stream():
+            # 只发一个空 role 块（结构合法、胜出依据），随后静默远超 probe 窗口
+            yield 'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n'
+            await asyncio.Event().wait()
+
+        winner = self._winner(stream)
+        # 即使假设 reasoning 场景（此处仅验证 probe 窗口对所有请求一视同仁），
+        # 未产出真实内容 + 静默超窗口 → 仍判死
+        with self.assertRaises(TimeoutError):
+            async for _ in _drain(winner, idle_timeout=0.04):
+                pass
+
+    async def test_content_idle_timeout_still_kills_when_configured(self):
+        """配置 stream_content_idle_timeout>0 时，已产出内容后的超静默仍判死（可选兜底）。"""
+        import asyncio
+        from api.openai_views import _drain
+
+        async def stream():
+            yield ('data: {"choices":[{"index":0,"delta":{"content":"hi"},'
+                   '"finish_reason":null}]}\n\n')
+            await asyncio.Event().wait()
+
+        winner = self._winner(stream)
+        with self.assertRaises(TimeoutError):
+            async for _ in _drain(winner, idle_timeout=0.5,
+                                  content_idle_timeout=0.08):
+                pass
 
     async def test_heartbeat_emitted_during_silence(self):
         """上游静默但未达判死阈值时，向客户端周期性发 `: keep-alive` 心跳（流式保活）。"""
@@ -316,7 +478,7 @@ class DrainFirstContentTimeoutTests(unittest.IsolatedAsyncioTestCase):
         winner = self._winner(stream)
         got_beat = 0
         try:
-            async for chunk in _drain(winner, probe_interval=1.0, max_idle_probes=3,
+            async for chunk in _drain(winner, idle_timeout=3,
                                       heartbeat=0.03, max_duration=0.15):
                 # max_duration 0.15s 内应至少收到 2 次心跳，未触发判死（1.0s×3）
                 if chunk.startswith(":"):
@@ -332,7 +494,7 @@ class DrainFirstContentTimeoutTests(unittest.IsolatedAsyncioTestCase):
                    '"finish_reason":null}]}\n\n')
         winner = self._winner(stream)
         out = []
-        async for chunk in _drain(winner, probe_interval=0.05, max_idle_probes=2):
+        async for chunk in _drain(winner, idle_timeout=0.1):
             out.append(chunk)
         self.assertIn("hi", out[0])
 
@@ -346,9 +508,90 @@ class DrainFirstContentTimeoutTests(unittest.IsolatedAsyncioTestCase):
                    '"finish_reason":null}]}\n\n')
         winner = self._winner(stream)
         out = []
-        async for chunk in _drain(winner, probe_interval=0, max_idle_probes=0):
+        async for chunk in _drain(winner, idle_timeout=0):
             out.append(chunk)
         self.assertIn("x", out[0])
+
+    async def test_data_arriving_after_probe_window_is_not_lost(self):
+        """回归：数据在"探测等待窗口之后"才完成时不得丢失、不得误判死。
+
+        旧实现 `if read_task is None or read_task.done(): read_task = ensure_future(...)`
+        会在数据完成恰落在"wait 超时返回之后"时直接覆盖已完成的 read_task——
+        那行数据丢失、last_data 不更新，判死计数从更早时刻累计，
+        导致"刚吐过思考链却被误判线路死亡"。此测试以每段静默(0.08s)略小于
+        判死阈值(0.09s)的节奏流动，任何一行丢失/时间戳停滞都会触发误判死；
+        3 行必须全部按序交付。
+        """
+        import asyncio
+        from api.openai_views import _drain
+
+        async def stream():
+            yield ('data: {"choices":[{"index":0,"delta":{"content":"c0"},'
+                   '"finish_reason":null}]}\n\n')  # 立即首行，建立 last_data
+            for i in (1, 2):
+                await asyncio.sleep(0.06)  # > wait 0.03；仍 < 阈值 0.12（余量足，防计时抖动）
+                yield (f'data: {{"choices":[{{"index":0,"delta":{{"content":"c{i}"}},'
+                       '"finish_reason":null}]}\n\n')
+
+        winner = self._winner(stream)
+        got = []
+        async for chunk in _drain(winner, idle_timeout=0.12):
+            got.append(chunk)
+        self.assertEqual(len(got), 3, f"数据行被丢弃或误判死: {got}")
+
+    async def test_flowing_data_keeps_full_length_flow_alive(self):
+        """持续流动的数据（思考链）在任何时刻都更新 last_data：
+        即使总时长远超判死阈值，只要数据在流（哪怕每行都落在探测窗口之后），
+        线路就保持存活，直到数据真正停止。"""
+        import asyncio
+        from api.openai_views import _drain
+
+        async def stream():
+            for i in range(8):
+                await asyncio.sleep(0.05)
+                yield (f'data: {{"choices":[{{"index":0,"delta":{{"reasoning_content":'
+                       f'"r{i}"}},"finish_reason":null}}]}}\n\n')
+
+        winner = self._winner(stream)
+        got = []
+        async for chunk in _drain(winner, idle_timeout=0.12):
+            got.append(chunk)
+        self.assertEqual(len(got), 8, f"思考链被误掐断: 只交付了 {len(got)}/8")
+
+    async def test_idle_timeout_kills_stalled_winner(self):
+        """宽松判胜锁定"先响应后卡死"的慢线：只发 role/空块、限时内无任何真实
+        内容（连思考都不吐）→ 抛 TimeoutError，由上层换线重试，而非让客户端干等。"""
+        import asyncio
+        from api.openai_views import _drain
+
+        async def stream():
+            # 模拟慢线：立即回一个纯 role 空块（宽松判胜因此"赢"了），之后永远卡死
+            yield ('data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n')
+            await asyncio.Event().wait()
+
+        winner = self._winner(stream)
+        with self.assertRaises(TimeoutError):
+            async for _ in _drain(winner, idle_timeout=0.05):
+                pass
+
+    async def test_reasoning_signal_resets_idle_timeout(self):
+        """思考增量算字节/信号：线路持续吐思考链时，last_data 持续刷新，
+        idle_timeout 不触发（防止把真在思考的长模型当慢线踢掉）。"""
+        import asyncio
+        from api.openai_views import _drain
+
+        async def stream():
+            for _ in range(4):
+                yield ('data: {"choices":[{"index":0,"delta":{"reasoning_content":"t"},'
+                       '"finish_reason":null}]}\n\n')
+                await asyncio.sleep(0.02)
+
+        winner = self._winner(stream)
+        got = 0
+        async for _ in _drain(winner, idle_timeout=0.05):
+            got += 1
+        # 每段静默 0.02s < idle_timeout 0.05，数据持续刷新 → 不触发超时
+        self.assertGreaterEqual(got, 4)
 
 
 class UpstreamBodyAndTokenTests(TestCase):

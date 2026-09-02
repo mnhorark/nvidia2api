@@ -130,10 +130,13 @@ class UserApiKeySerializer(serializers.ModelSerializer):
 
 
 class RequestLogSerializer(serializers.ModelSerializer):
-    # token 生成速度（tokens/s）：输出 tokens / 生成耗时。
-    # 口径与 new-api 日志「速度」列一致：流式扣除首字耗时（TTFT），非流式用总耗时。
-    # 补充保护：流式生成阶段过短（首字≈总耗时、输出一次性涌入）时样本无统计意义，
-    # 会算出虚高的 tok/s，此时不展示。new-api 仅做 genTime>0 判断，本实现更稳健。
+    # token 生成速度（tokens/s）：输出 tokens / 总耗时。
+    # 口径对齐 new-api / one-api：速度 = completion_tokens / use_time（总耗时，秒）。
+    # 不做 TTFT 扣除、也不设最小窗口截断——一方面上游网关会"批量冲刷"（整段
+    # 流缓冲到最后一次性下发，首字≈总耗时），扣 TTFT 会把分母压到极小、算出
+    # 938 tok/s 这类虚高值；另一方面短响应是正常样本，不应被 500ms 阈值吞掉。
+    # 只要求"有输出 + 有耗时"即给出有效吞吐。首字延迟（TTFT）由 first_token_ms
+    # 独立字段承载，无需在速度里二次扣除。
     generation_speed = serializers.SerializerMethodField()
 
     class Meta:
@@ -145,24 +148,32 @@ class RequestLogSerializer(serializers.ModelSerializer):
                   "cached_tokens", "first_token_ms", "generation_speed", "routes",
                   "client_thinking", "upstream_thinking"]
 
-    # 流式生成阶段的最小统计窗口：低于该值（毫秒）视为样本不可靠，不展示速度
-    _MIN_STREAM_GEN_MS = 500
-
     def get_generation_speed(self, obj) -> float | None:
-        duration_ms = obj.duration_ms or 0
-        if duration_ms <= 0:
-            return None
         completion = obj.completion_tokens or 0
-        if completion <= 0:
+        duration_ms = obj.duration_ms or 0
+        if completion <= 0 or duration_ms <= 0:
             return None
-        gen_ms = duration_ms
-        if obj.is_stream and obj.first_token_ms:
-            if obj.first_token_ms >= duration_ms:
-                return None
-            gen_ms = duration_ms - obj.first_token_ms
-            if gen_ms < self._MIN_STREAM_GEN_MS:
-                return None
-        return round(completion / (gen_ms / 1000.0), 1)
+        # 保留 2 位小数：慢模型（<1 tok/s）不至于被 round(…,1) 压成 0.0 显示成"—"
+        return round(completion / (duration_ms / 1000.0), 2)
+
+
+class RequestLogListSerializer(RequestLogSerializer):
+    """列表用轻量序列化：剔除高成本的明细字段。
+
+    `routes`（每条日志最多 50 条线路竞速明细）、`client_thinking` / `upstream_thinking`
+    仅在展开单条日志时才需要；列表每次轮询序列化 100 条时把它们整包带上会让响应
+    体积与序列化耗时翻数倍，是"日志页加载缓慢/加载失败"的主因。明细改由
+    LogDetailView（GET /api/admin/logs/<id>）按需返回全量序列化。
+    """
+
+    class Meta(RequestLogSerializer.Meta):
+        fields = [
+            "id", "request_id", "model", "created_at", "duration_ms",
+            "status", "http_status", "error_type", "winner_route_type",
+            "winner_key_name", "winner_proxy_name", "proxy_public_ip", "is_stream",
+            "routes_count", "prompt_tokens", "completion_tokens", "total_tokens",
+            "cached_tokens", "first_token_ms", "generation_speed",
+        ]
 
 
 class SettingSerializer(serializers.ModelSerializer):

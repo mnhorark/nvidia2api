@@ -157,6 +157,14 @@ class ParseTests(TestCase):
 
 
 class UpstreamGateTests(TestCase):
+    def setUp(self):
+        from services import sysconfig
+        sysconfig.invalidate()
+
+    def tearDown(self):
+        from services import sysconfig
+        sysconfig.invalidate()
+
     def test_passthrough_disabled(self):
         set_setting("thinking_passthrough", "false")
         spec = parse({"reasoning_effort": "high"})
@@ -189,13 +197,11 @@ class ViewIntegrationTests(TestCase):
             "stream": True,
             "reasoning_effort": "high",
             "chat_template_kwargs": {"thinking": True},
-            "bogus_param": 1,
         }
         out = _build_upstream_body(body, body["model"])
         self.assertEqual(out["model"], "deepseek-ai/deepseek-v4-pro-0813")
         self.assertEqual(out["temperature"], 0.5)
         self.assertTrue(out["stream"])
-        self.assertNotIn("bogus_param", out)
         self.assertEqual(out["reasoning_effort"], "high")
         # DeepSeek 族：只发 thinking 开关，避免 enable_thinking 这种非法关键字
         self.assertTrue(out["chat_template_kwargs"]["thinking"])
@@ -289,11 +295,11 @@ class UpstreamWireTests(TransactionTestCase):
         self.assertNotIn("enable_thinking", body["chat_template_kwargs"])
         self.assertEqual(body["reasoning_budget"], 8192)
 
-    def test_unknown_params_still_stripped(self):
+    def test_unknown_params_forwarded_losslessly(self):
         body = self._call_upstream({
             "model": "deepseek-ai/deepseek-v4-pro-0813",
             "messages": [{"role": "user", "content": "hi"}],
             "bogus_param": 1,
         })
-        self.assertNotIn("bogus_param", body)
+        self.assertEqual(body.get("bogus_param"), 1)
         self.assertNotIn("chat_template_kwargs", body)

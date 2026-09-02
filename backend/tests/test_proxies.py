@@ -92,6 +92,7 @@ class EnableLimitTests(TestCase):
         self.assertFalse(proxy_service.set_enabled(p2, True)[0])
 
     def test_failure_cooldown(self):
+        # 连续失败达到默认阈值(proxy_unhealthy_threshold=3)才标 unhealthy 并进冷却
         p = Proxy.objects.create(channel=self.channel, name="p", protocol="socks5",
                                  host="1.1.1.1", port=1)
         for _ in range(3):

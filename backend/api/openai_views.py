@@ -1,4 +1,12 @@
-"""OpenAI-compatible endpoints: GET /v1/models, POST /v1/chat/completions."""
+"""OpenAI-compatible endpoints: GET /v1/models, POST /v1/chat/completions.
+
+协议转换设计原则（参考 RikkaHub / one-api / new-api）：
+1. 入口转换：客户端协议 -> 内部 chat 格式（仅做结构性映射，不丢字段）
+2. 出口转换：内部 chat 格式 -> 客户端协议（仅做结构性映射，不丢字段）
+3. 竞速/重试/日志/限流等核心链路完全复用内部 chat 格式
+4. 同名参数忠实透传；仅对协议结构不同的字段做映射
+5. 思考参数归一化：支持任意 agent 框架的写法，按目标 host 分发
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +16,7 @@ import threading
 import time
 
 from django.conf import settings
+from django.core.exceptions import RequestDataTooBig
 from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.csrf import csrf_exempt
 
@@ -24,15 +33,30 @@ from .auth import openai_error
 
 logger = logging.getLogger("nvidia2api.openai")
 
-_request_semaphore = threading.BoundedSemaphore(settings.MAX_CONCURRENT_REQUESTS)
-
-# 实时在途请求计数：线程安全，供仪表盘"实时并发"展示。
 _active_lock = threading.Lock()
 _active_count = 0
 
 
+def _try_acquire_request() -> bool:
+    global _active_count
+    from services import sysconfig
+    try:
+        limit = int(
+            sysconfig.get("max_concurrent_requests") or settings.MAX_CONCURRENT_REQUESTS
+        )
+    except (TypeError, ValueError):
+        limit = settings.MAX_CONCURRENT_REQUESTS
+    # 0 = 不限制并发请求数
+    if limit is None or limit <= 0:
+        return True
+    with _active_lock:
+        if _active_count >= limit:
+            return False
+        _active_count += 1
+        return True
+
+
 def active_requests() -> int:
-    """当前在途（已通过并发闸门且未结束）的请求数。"""
     with _active_lock:
         return _active_count
 
@@ -41,6 +65,61 @@ def _bump_active(delta: int) -> None:
     global _active_count
     with _active_lock:
         _active_count = max(0, _active_count + delta)
+
+
+_upstream_lock = threading.Lock()
+_upstream_active = 0
+
+# max_concurrent_upstream <= 0 视为"不限制"（默认），仅受
+# max_concurrent_requests × max_routes_per_request 自然约束。
+# 需要在上游总线制上限时（Windows SelectorEventLoop 受限）再调小。
+_UNLIMITED = 10**9
+
+
+def _upstream_limit() -> int:
+    global _upstream_active
+    try:
+        limit = int(
+            sysconfig.get("max_concurrent_upstream") or settings.MAX_CONCURRENT_UPSTREAM
+        )
+    except (TypeError, ValueError):
+        limit = settings.MAX_CONCURRENT_UPSTREAM
+    if limit is None or limit <= 0:
+        return _UNLIMITED
+    return limit
+
+
+def _reserve_upstream(n: int) -> int:
+    """预留上游连接额度。
+
+    - n<=0 没有可预留的，直接返回 0。
+    - 全局 unlimited 时全部放行，避免大并发下被裁剪饿死。
+    - 有限额度且余量不足时：能拿多少拿多少，但**至少保底 1 条**，
+      防止请求被裁成 0 线路走 no_available_route 重试风暴（挤兑饿死）。
+    """
+    global _upstream_active
+    n = max(0, int(n or 0))
+    if n == 0:
+        return 0
+    with _upstream_lock:
+        limit = _upstream_limit()
+        if limit >= _UNLIMITED:
+            _upstream_active += n
+            return n
+        available = max(0, limit - _upstream_active)
+        take = min(n, available)
+        # 保底 1 条：宁可轻微超额度也不让请求空路由重试
+        if take == 0 and available <= 0 and limit > 0:
+            take = 1
+        _upstream_active += take
+        return take
+
+
+def _release_upstream(n: int) -> None:
+    global _upstream_active
+    n = max(0, int(n or 0))
+    with _upstream_lock:
+        _upstream_active = max(0, _upstream_active - n)
 
 
 def _authenticate(request):
@@ -60,9 +139,6 @@ def _model_entry(m: AIModel, name: str | None = None) -> dict:
 
 
 def list_models(request, channel_slug: str | None = None):
-    """/v1/models 汇总所有渠道；/c/<slug>/v1/models 只看该渠道。
-    每个对外名（主对外名 + 附加别名）各返回一条记录。
-    """
     user_key = _authenticate(request)
     if user_key is None:
         return openai_error("Invalid API key", "invalid_api_key", 401, "authentication_error")
@@ -84,15 +160,12 @@ def list_models(request, channel_slug: str | None = None):
 
 
 class ChannelNotFound(Exception):
-    """/c/<slug>/ 指定的渠道不存在。必须 404，不能静默回落到默认渠道。"""
-
     def __init__(self, slug: str):
         self.slug = slug
         super().__init__(f"channel not found: {slug}")
 
 
 def _resolve_channel(slug: str | None) -> Channel | None:
-    """解析 /c/<slug> 指定的渠道；不存在时抛 ChannelNotFound。"""
     if not slug:
         return None
     channel = channel_service.lookup(slug)
@@ -102,11 +175,6 @@ def _resolve_channel(slug: str | None) -> Channel | None:
 
 
 def _resolve_target(name: str, channel_slug: str | None):
-    """把客户端的 model 名解析成 (AIModel, Channel)；失败返回 (None, None)。
-
-    /c/<slug> 前缀严格锁定渠道（未知 slug -> ChannelNotFound，由调用方转 404）；
-    否则走全局注册表（跨渠道）。
-    """
     if channel_slug:
         channel = _resolve_channel(channel_slug)
         model = model_registry.resolve_in_channel(name, channel)
@@ -120,37 +188,74 @@ def _not_found_error(name: str, channel_slug: str | None):
     if not channel_slug:
         owners = model_registry.channels_with_model(name)
         if owners:
-            # 模型存在但所属渠道被禁用，给个可操作的提示
             msg += f" (disabled channel(s): {', '.join(c.slug for c in owners)})"
     return openai_error(msg, "model_not_found", 404, "invalid_request_error")
 
 
-ALLOWED_PARAMS = {
-    "model", "messages", "temperature", "top_p", "max_tokens", "stream",
-    "stop", "frequency_penalty", "presence_penalty", "response_format",
-    "tools", "tool_choice", "n", "seed",
-}
+# 协议转换的内部控制字段——绝不透传给上游
+_INTERNAL_ONLY = frozenset({"channel"})
+# 显式不透传给上游的字段（避免 400 或语义错误）
+# - thinking 族由 thinking.build_upstream 按目标 host 归一化后透传
+_DROP_FOR_UPSTREAM = frozenset({
+    "channel",
+    "thinking",
+    "enable_thinking",
+    "reasoning",
+    "reasoning_content",
+    "reasoning_budget",
+    "reasoning_effort",
+    "reasoning_effort_override",
+    "reasoning_enabled",
+    "reasoning_config",
+    "reasoning_level",
+    "reasoning_mode",
+    "reasoning_type",
+    "reasoning_detail",
+    "reasoning_details",
+    "thinking_budget",
+    "thinking_config",
+    "thinking_enabled",
+    "thinking_level",
+    "thinking_mode",
+    "thinking_type",
+    "enable_thinking",
+    "enabled_thinking",
+    "is_thinking",
+    "chat_template_kwargs",
+    "clear_thinking",
+    "grok_thinking",
+    "thinking_beta",
+    "betas",
+    "openai",
+    "anthropic",
+})
 
 
-def _build_upstream_body(body: dict, model_name: str) -> dict:
-    """通用参数透传 + 思考强度参数归一化下发。"""
+def _build_upstream_body(body: dict, model_name: str, channel=None) -> dict:
+    """通用参数透传 + 思考强度参数归一化下发。
+
+    无损原则（对标 one-api / new-api / RikkaHub）：
+    - 除 _DROP_FOR_UPSTREAM 的思考族字段外，全部忠实透传
+    - 不要用白名单过滤未知字段——未来的官方参数会因此被静默丢弃
+    - model 始终用真实模型名覆盖
+    """
+    # 透传所有非思考族参数（thinking 族由 build_upstream 归一化后透传）
     upstream = {
         k: v for k, v in body.items()
-        if k in ALLOWED_PARAMS and k not in thinking.THINKING_PARAM_KEYS and v is not None
+        if k not in _DROP_FOR_UPSTREAM and v is not None
     }
-    upstream.update(thinking.build_upstream(body, model_name))
-    # 关键：上游必须用真实模型名。别名只在平台对外这一层存在，
-    # 客户端用别名调用时，绝不能把别名原样透传给上游（否则上游 404）。
+    # 思考参数归一化后下发（按渠道隔离）
+    upstream.update(thinking.build_upstream(body, model_name, channel))
+    # 上游必须用真实模型名（别名不透传）
     upstream["model"] = model_name
+    # 流式 usage 选项
     if body.get("stream"):
-        # 请求流式 usage：部分上游（如 NVIDIA DeepSeek）默认流式不返回 usage，
-        # 需显式 include_usage 才在收尾 chunk 里给出 token 统计。
-        upstream["stream_options"] = {"include_usage": True}
+        if "stream_options" not in upstream:
+            upstream["stream_options"] = {"include_usage": True}
     return upstream
 
 
 def _authorize(request):
-    """校验用户 API Key 与限流；返回 (user_key, error_response)。"""
     user_key = _authenticate(request)
     if user_key is None:
         return None, openai_error("Invalid API key", "invalid_api_key", 401, "authentication_error")
@@ -168,20 +273,10 @@ def _authorize(request):
     return user_key, None
 
 
-# 请求体大小上限（字节）。必须在 json.loads 之前校验，否则"解析后再判大小"
-# 形同虚设——超大请求照样吃满内存。
 MAX_BODY_BYTES = 4 * 1024 * 1024
 
 
 def _parse_body(request):
-    """解析 JSON 请求体；返回 (body, error_response)。
-
-    严格区分三类失败，避免把客户端的畸形输入变成 500：
-    - 超出大小上限 -> 413（在解析之前按 Content-Length / 实际长度拦截）
-    - 非法 JSON    -> 400 invalid_request
-    - 合法 JSON 但不是对象（数组/字符串/数字/null）-> 400 invalid_request
-      这类请求过去会让 `body.get(...)` 抛 AttributeError 直接 500。
-    """
     declared = request.headers.get("Content-Length")
     if declared is not None:
         try:
@@ -190,7 +285,10 @@ def _parse_body(request):
                                           "payload_too_large", 413)
         except (TypeError, ValueError):
             pass
-    raw = request.body or b""
+    try:
+        raw = request.body or b""
+    except RequestDataTooBig:
+        return None, openai_error("Request body too large", "payload_too_large", 413)
     if len(raw) > MAX_BODY_BYTES:
         return None, openai_error("Request body too large", "payload_too_large", 413)
     try:
@@ -206,23 +304,13 @@ def _parse_body(request):
 
 
 def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
-    """核心执行：校验 -> 建路由 -> 竞速(带重试) -> 按协议返回结果。
-
-    `protocol`: "chat" | "responses"。内部一律以 chat 格式处理，
-    responses 协议在入口(responses_to_chat_body)与出口(响应/SSE 转换)
-    做格式转换，其余（竞速、重试、日志、限流）完全复用。
-    `echo_body`: responses 协议出口回显用的原始 Responses 请求体。
-    调用方已持有 _request_semaphore，此处负责释放。
-    """
-    if not _request_semaphore.acquire(blocking=False):
+    if not _try_acquire_request():
         return openai_error("Server busy, too many concurrent requests",
                             "server_overloaded", 429)
-    _bump_active(1)
     log = None
-    # 流式响应由 _stream_response 生成器在结束时释放信号量（覆盖客户端断开）。
     semaphore_released_by_stream = False
+    upstream_reserved = 0
     try:
-        # 渠道优先级：URL 前缀 > 请求体里的 channel 字段 > 按 model 名跨渠道解析
         requested_name = body.get("model", "")
         messages = body.get("messages")
         if not requested_name or not isinstance(messages, list) or not messages:
@@ -238,22 +326,26 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
         if model is None:
             return _not_found_error(requested_name, slug)
 
-        # 上游必须用真实模型名，别名只在平台对外这一层存在
         model_name = model.model_name
         stream = bool(body.get("stream"))
-        upstream_body = _build_upstream_body(body, model_name)
-        # 记录思考参数：客户端原始传入 + 实际下发到上游，供日志页排查
-        upstream_thinking = thinking.build_upstream(body, model_name)
+        upstream_body = _build_upstream_body(body, model_name, channel)
+        upstream_thinking = thinking.build_upstream(body, model_name, channel)
+        try:
+            _flat_for_log = thinking._flatten(body)
+        except Exception:
+            _flat_for_log = dict(body)
         client_thinking = {
-            k: body.get(k) for k in thinking.THINKING_PARAM_KEYS
-            if k in body and body.get(k) is not None
+            k: _flat_for_log.get(k) for k in thinking.THINKING_PARAM_KEYS
+            if k in _flat_for_log and _flat_for_log.get(k) is not None
         }
 
         request_id = key_service.new_request_id()
-        # 若模型绑定了独立代理分组，则仅在该分组内选代理；
-        # 若模型设置了独立端点（如 /v1/responses），则覆盖渠道 chat 端点
         routes = build_routes(channel, proxy_group=model.proxy_group_id,
                               endpoint=model.endpoint)
+        if not stream:
+            upstream_reserved = _reserve_upstream(len(routes))
+            if upstream_reserved < len(routes):
+                routes = routes[:upstream_reserved]
         log = RequestLog.objects.create(
             channel=channel, request_id=request_id, user_api_key=user_key,
             model=requested_name, routes_count=len(routes), is_stream=stream,
@@ -267,7 +359,6 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
             return openai_error("当前没有可用线路（该渠道没有可用的 Key）",
                                 "no_available_route", 503)
 
-        # 自动重试:竞速失败时重建线路再试(retry_count 系统参数,上限 5)
         retries = max(0, min(int(sysconfig.get("retry_count", channel) or 0), 5))
         max_attempts = 1 + retries
 
@@ -336,13 +427,12 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
         return JsonResponse(payload, status=200)
     finally:
         if not semaphore_released_by_stream:
-            _request_semaphore.release()
             _bump_active(-1)
+            _release_upstream(upstream_reserved)
 
 
 @csrf_exempt
 def chat_completions(request, channel_slug: str | None = None):
-    """POST /v1/chat/completions —— Chat Completions 协议。"""
     if request.method != "POST":
         return openai_error("Method not allowed", "method_not_allowed", 405)
     user_key, err = _authorize(request)
@@ -356,11 +446,6 @@ def chat_completions(request, channel_slug: str | None = None):
 
 @csrf_exempt
 def responses(request, channel_slug: str | None = None):
-    """POST /v1/responses —— Responses API 协议。
-
-    客户端请求体(input/max_output_tokens)转成内部 chat 后复用整套链路，
-    出口再转回 Responses 响应/SSE 事件流。
-    """
     if request.method != "POST":
         return openai_error("Method not allowed", "method_not_allowed", 405)
     user_key, err = _authorize(request)
@@ -377,11 +462,6 @@ def responses(request, channel_slug: str | None = None):
 
 @csrf_exempt
 def anthropic_messages(request, channel_slug: str | None = None):
-    """POST /v1/messages —— Anthropic Messages 协议。
-
-    请求体（system/messages/tools/tool_choice/thinking/max_tokens）转成内部
-    chat 后复用整套链路，出口再转回 Anthropic Message 对象 / SSE 事件流。
-    """
     if request.method != "POST":
         return openai_error("Method not allowed", "method_not_allowed", 405)
     user_key, err = _authorize(request)
@@ -398,7 +478,6 @@ def anthropic_messages(request, channel_slug: str | None = None):
 
 @csrf_exempt
 def anthropic_count_tokens(request, channel_slug: str | None = None):
-    """POST /v1/messages/count_tokens —— 估算 Anthropic 请求的 input token 数。"""
     if request.method != "POST":
         return openai_error("Method not allowed", "method_not_allowed", 405)
     user_key, err = _authorize(request)
@@ -410,19 +489,10 @@ def anthropic_count_tokens(request, channel_slug: str | None = None):
     return JsonResponse({"input_tokens": anthropic_api.count_tokens(body)})
 
 
-# 只有"最终答案内容"才算已提交：content（正文）与 tool_calls（已承诺的
-# 工具调用）。reasoning_content / reasoning 是思考过程，不属于最终答案——
-# 思考阶段流中断（用户还没收到任何正文）应允许重建线路自动重试。
 _CONTENT_DELTA_KEYS = ("content", "tool_calls")
 
 
 def _chunk_has_content(line: str) -> bool:
-    """该 SSE 行是否已向客户端交付"最终答案"级别的实际内容。
-
-    纯心跳（choices 为空、delta 全空、无 finish_reason、无 usage）以及
-    思考类 delta（reasoning_content / reasoning）不算——流在此阶段中断时
-    客户端还未收到正文，可以安全重建线路重试。
-    """
     if not line.startswith("data:"):
         return False
     payload = line[5:].strip()
@@ -430,7 +500,7 @@ def _chunk_has_content(line: str) -> bool:
         return True
     try:
         data = json.loads(payload)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
     if not isinstance(data, dict):
         return False
@@ -452,92 +522,134 @@ def _chunk_has_content(line: str) -> bool:
     return False
 
 
+def _chunk_has_any_signal(line: str) -> bool:
+    if not line.startswith("data:"):
+        return False
+    payload = line[5:].strip()
+    if payload == "[DONE]":
+        return True
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    if data.get("usage"):
+        return True
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    first = choices[0]
+    if not isinstance(first, dict):
+        return False
+    if first.get("finish_reason"):
+        return True
+    if isinstance(first.get("text"), str) and first["text"]:
+        return True
+    delta = first.get("delta")
+    if isinstance(delta, dict):
+        for key in ("content", "reasoning_content", "reasoning", "tool_calls"):
+            if delta.get(key):
+                return True
+    return False
+
+
 async def _stream_response(routes, upstream_body, holder, user_key, channel,
                            max_attempts: int = 1, proxy_group: int | None = None,
                            endpoint: str | None = None):
-    """流式响应（异步生成器）：竞速胜出后逐块转发上游 SSE。
-
-    必须是 async 生成器：Django 对同步流式内容会 `sync_to_async(list(...))`
-    一次性消费完整个生成器才下发，导致"假流式"。async 生成器被 ASGI 逐块下发。
-
-    心跳与掐线（参考 new-api / sub-api / cliproxy 思路）：
-    - stream_heartbeat_interval：上游静默时向客户端发 `: keep-alive` 心跳，
-      防 NAT/负载均衡/客户端把连接误判为死，保持链路活性（流式保活）；
-    - stream_probe_interval × stream_max_idle_probes：判死的"心跳机制"——
-      连续 N 个探测周期无任何数据（含思考 token）判定线路死亡，
-      思考模型持续吐 reasoning token 时不会被误掐；
-    - stream_max_duration：整条流总时长兜底，防僵尸流；
-    - 已向客户端交付正文后断流：绝不发 error 事件（会破坏 OpenAI SSE 解析，
-      客户端报 "error decoding response body"），干净收尾 [DONE]；
-    - 未交付正文前的失败：按 retry_count 重建线路重试（含停滞死线）。
-    """
     import asyncio
 
     winner = None
     sent_content = False
     done_sent = False
     last_exc: Exception | None = None
-    # 判死：连续 stream_max_idle_probes 个 stream_probe_interval 周期无任何数据
-    # （含思考 token）视为"连续心跳失败"，总容忍 ≈ probe × count。
-    probe_interval = float(sysconfig.get("stream_probe_interval", channel) or 0)
-    max_idle_probes = int(sysconfig.get("stream_max_idle_probes", channel) or 0)
+    idle_timeout = float(sysconfig.get("stream_idle_timeout", channel) or 0)
     heartbeat = float(sysconfig.get("stream_heartbeat_interval", channel) or 0)
     max_duration = float(sysconfig.get("stream_max_duration", channel) or 0)
-    # 被静默/断流掐断的死线路（Key_id, proxy_id）集合：重试时排除，
-    # 避免下一轮竞速又抽到同一假死线路（代理池质量差时尤其关键）。
+    backoff = float(sysconfig.get("retry_backoff_seconds", channel) or 0)
+    content_idle_timeout = float(
+        sysconfig.get("stream_content_idle_timeout", channel) or 0)
     excluded: set[tuple[int, int | None]] = set()
-    # 被判定死亡的坏代理集合：组合排除会被"同一代理换一把 Key"绕过，
-    # 代理才是坏源大头，因此被掐断/竞速失败的线路的代理也一并即时排除。
     excluded_proxies: set[int] = set()
-    # 每轮尝试的竞速明细累积展示（用户可在日志页看到发生过几次换线重试）。
     all_reports: list[dict] = []
 
-    # 一次请求只能记一次成败。竞速胜出时并不代表请求成功：流式中途断流仍会
-    # 走到失败分支，若两处各自 record_result，会出现 success/failed 各 +1 而
-    # total 只 +1 的"双计"，成功率统计失真。这里用 settled 保证只结算一次，
-    # 且成功判定推迟到流真正结束（见下方 settle(True)）。
     settled = {"done": False}
+    reserved = 0
 
-    def settle(success: bool) -> None:
+    from services.loop_offload import run_db
+
+    async def settle(success: bool) -> None:
         if settled["done"]:
             return
         settled["done"] = True
-        api_key_service.record_result(user_key, success)
+        rec = holder["log"]
+        await run_db(api_key_service.record_result, user_key, success)
+        await run_db(
+            api_key_service.record_usage,
+            user_key, rec.prompt_tokens or 0,
+            rec.completion_tokens or 0, rec.cached_tokens or 0)
+
+    async def _safe_finish(*args, **kwargs):
+        try:
+            await run_db(_finish_log, *args, **kwargs)
+        except Exception:
+            logger.exception("stream finish log save failed")
 
     try:
         for attempt in range(max_attempts):
-            rs = routes if attempt == 0 else build_routes(
-                channel, proxy_group=proxy_group, endpoint=endpoint,
+            rs = routes if attempt == 0 else await run_db(
+                build_routes, channel, proxy_group=proxy_group, endpoint=endpoint,
                 exclude=excluded or None, exclude_proxies=excluded_proxies or None)
             if not rs:
                 last_exc = NoRouteAvailable()
+                if attempt + 1 < max_attempts and backoff > 0:
+                    await asyncio.sleep(backoff)
+                continue
+            reserved = _reserve_upstream(len(rs))
+            if reserved < len(rs):
+                rs = rs[:reserved]
+            if not rs:
+                last_exc = NoRouteAvailable()
+                _release_upstream(reserved)
+                reserved = 0
+                if attempt + 1 < max_attempts and backoff > 0:
+                    await asyncio.sleep(backoff)
                 continue
             w = None
             try:
                 w = await race_stream(rs, upstream_body)
+                if reserved > 1:
+                    _release_upstream(reserved - 1)
+                    reserved = 1
                 winner = w
                 log = holder["log"]
                 log.winner_route_type = w.route.kind
                 log.winner_key_name = w.route.key.name
                 log.winner_proxy_name = w.route.proxy.name if w.route.proxy else ""
                 log.proxy_public_ip = w.route.proxy.public_ip if w.route.proxy else ""
-                log.status = "success"
+                # 关键：流式请求在 winner 出现时**不**标记 success，仅记录首字耗时与线路；
+                # status 保持 pending，直到 _drain 完整结束再置为 success。
+                # 否则若客户端在 drain 结束前断开（0ms 现象），success 记录会永久残留 0ms/0 token。
+                log.first_token_ms = round(
+                    (time.monotonic() - holder["started"]) * 1000, 1)
+                log.duration_ms = log.first_token_ms
                 log.http_status = 200
-                # 首字 = 首个正文（content/tool_calls）到达时间，非首个思考 chunk
                 all_reports.extend(w.report or [])
                 log.routes = all_reports
-                log.save()
-                # 注意：此处不结算成功。竞速胜出 ≠ 请求成功，流式中途断流仍会
-                # 计入失败；成功统一在流正常结束后由 settle(True) 结算。
+                # 预填 prompt token，避免前端在 pending 阶段看到 0 token（NV 渠道常无 usage）
+                try:
+                    from services import tokenizer as _tok
+                    log.prompt_tokens = _tok.estimate_messages_tokens(upstream_body.get("messages"))
+                    log.total_tokens = log.prompt_tokens
+                except Exception:
+                    pass
+                await run_db(log.save)
                 usage: dict = {}
                 completion_text: list[str] = []
                 try:
-                    async for chunk in _drain(w, probe_interval, max_idle_probes,
-                                      heartbeat, max_duration):
+                    async for chunk in _drain(w, idle_timeout, heartbeat,
+                                      max_duration, content_idle_timeout):
                         if _chunk_has_content(chunk):
-                            if not sent_content:
-                                log.first_token_ms = round(
-                                    (time.monotonic() - holder["started"]) * 1000, 1)
                             sent_content = True
                         if chunk.strip() == "data: [DONE]":
                             done_sent = True
@@ -547,7 +659,6 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                                 if isinstance(payload, dict):
                                     if payload.get("usage"):
                                         usage = payload["usage"]
-                                    # 累积正文，供上游未返回 usage 时本地估算 token
                                     choices = payload.get("choices")
                                     if choices:
                                         delta = choices[0].get("delta") or {}
@@ -559,37 +670,34 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                                         text = choices[0].get("text")
                                         if isinstance(text, str) and text:
                                             completion_text.append(text)
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             pass
                         yield chunk
                 finally:
-                    # 正常结束或客户端断开/超时都收尾：记录耗时与已解析 token
+                    log.status = "success"
                     log.duration_ms = round((time.monotonic() - holder["started"]) * 1000, 1)
                     if usage.get("prompt_tokens"):
                         log.prompt_tokens = usage["prompt_tokens"]
+                    elif log.prompt_tokens:
+                        pass
                     else:
-                        # 上游未返回流式 usage（如 NVIDIA DeepSeek）：本地估算兜底
                         from services import tokenizer
                         log.prompt_tokens = tokenizer.estimate_messages_tokens(
                             upstream_body.get("messages"))
                     if usage.get("completion_tokens"):
                         log.completion_tokens = usage["completion_tokens"]
-                    else:
+                    elif "".join(completion_text).strip():
                         from services import tokenizer
                         log.completion_tokens = tokenizer.estimate_tokens(
                             "".join(completion_text))
                     log.total_tokens = (log.prompt_tokens or 0) + (log.completion_tokens or 0)
                     log.cached_tokens = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
-                    log.save()
-                    api_key_service.record_usage(
-                        user_key,
-                        log.prompt_tokens, log.completion_tokens, log.cached_tokens)
-                settle(True)
+                    await run_db(log.save)
+                await settle(True)
+                from services import channel_health
+                await run_db(channel_health.record, log.channel, True, 200)
                 return
             except (NoRouteAvailable, AllRoutesFailed) as exc:
-                # 竞速阶段全部失败（连接/超时/401/403/429/5xx/无效响应等）：
-                # 重建线路重新竞速（重试线路竞速）。失败线路（及其代理）即时
-                # 纳入排除，避免重试原样再打同一批已失败的线路。
                 if isinstance(exc, AllRoutesFailed):
                     comb_by_name = {
                         r.name: (getattr(r.key, "id", None),
@@ -609,76 +717,74 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                 last_exc = exc
                 logger.info("stream attempt %d failed, retrying: %s",
                             attempt + 1, exc)
-            except Exception as exc:  # noqa: BLE001
-                # 已向客户端交付过实际内容（正文/tool_calls/已发 [DONE]）：
-                # 响应已提交，无法也不应重试。上游中途断流时绝不能发 error 事件
-                # （会破坏 OpenAI SSE 解析，客户端报 "Transport error: error
-                # decoding response body"），这里干净收尾 [DONE]。
+                if attempt + 1 < max_attempts and backoff > 0:
+                    await asyncio.sleep(backoff)
+            except Exception as exc:
                 if sent_content or done_sent:
                     try:
                         if (w is not None and w.route is not None
                                 and w.route.proxy is not None):
                             from services.proxy_service import report_proxy_result
-                            report_proxy_result(w.route.proxy.id, False)
-                    except Exception:  # noqa: BLE001
+                            await run_db(report_proxy_result, w.route.proxy.id, False)
+                    except Exception:
                         pass
                     logger.warning("stream truncated after content (req %s): %s",
                                    log.request_id, exc)
+                    log.error_type = "stream_truncated"
+                    await run_db(log.save)
                     if not done_sent:
                         yield "data: [DONE]\n\n"
+                    await settle(True)
                     return
-                # 未交付任何内容：视为线路失败，重建线路重试。
                 if w is not None and w.route is not None:
                     try:
                         from services.proxy_service import report_proxy_result
                         if w.route.proxy is not None:
-                            report_proxy_result(w.route.proxy.id, False)
-                    except Exception:  # noqa: BLE001
+                            await run_db(report_proxy_result, w.route.proxy.id, False)
+                    except Exception:
                         pass
-                    # 被静默/断流掐断的死线路（Key+代理组合）加入排除集合，
-                    # 下一轮竞速不再抽到同一组合，避免立刻又打到死线路。
-                    # （getattr 兼容测试用 SimpleNamespace mock）
                     excluded.add((getattr(w.route.key, "id", None),
                                   getattr(w.route.proxy, "id", None)
                                   if w.route.proxy is not None else None))
-                    # 组合排除会被"同一坏代理换一把 Key"绕过：代理才是坏源大头，
-                    # 掐断线路的代理也一并即时排除（代理池质量差时尤为关键）。
                     if (w.route.proxy is not None
                             and getattr(w.route.proxy, "id", None) is not None):
                         excluded_proxies.add(w.route.proxy.id)
                 last_exc = exc
                 logger.info("stream attempt %d failed before any content, retrying: %s",
                             attempt + 1, exc)
+                if attempt + 1 < max_attempts and backoff > 0:
+                    await asyncio.sleep(backoff)
             finally:
                 if w is not None:
                     try:
                         await w.close()
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         pass
-        # 所有尝试均失败：竞速失败重建线路也无济于事，直接回上游错误
+                if reserved:
+                    _release_upstream(reserved)
+                    reserved = 0
         if isinstance(last_exc, TimeoutError):
-            _finish_log(holder["log"], holder["started"], False, 504,
+            await _safe_finish(holder["log"], holder["started"], False, 504,
                         "stream_idle_timeout", routes=all_reports or None)
-            settle(False)
+            await settle(False)
             yield "data: " + json.dumps({
                 "error": {"message": "上游连续无响应（"
-                          f"{int(max_idle_probes or 0)}×{round(probe_interval or 0, 1)} 秒"
-                          "未收到任何数据），已判定线路死亡。可调大 stream_probe_interval"
-                          " / stream_max_idle_probes",
+                          f"{round(idle_timeout or 0, 1)} 秒"
+                          "未收到任何数据），已判定线路死亡。可调大 stream_idle_timeout",
                           "type": "api_error", "param": None, "code": "stream_error"}
             }) + "\n\n"
         elif isinstance(last_exc, NoRouteAvailable):
-            _finish_log(holder["log"], holder["started"], False, 503, "no_available_route")
-            settle(False)
+            await _safe_finish(holder["log"], holder["started"], False, 503, "no_available_route")
+            await settle(False)
             yield "data: " + json.dumps({
                 "error": {"message": "当前没有可用线路或所有线路均失败", "type": "api_error",
                            "param": None, "code": "no_available_route"}
             }) + "\n\n"
         else:
             report = getattr(last_exc, "report", None)
-            _finish_log(holder["log"], holder["started"], False, 502,
+            await _safe_finish(holder["log"], holder["started"], False, 502,
                         "stream_error", routes=all_reports or report or None)
-            settle(False)
+            await settle(False)
             yield "data: " + json.dumps({
                 "error": {"message": "上游服务暂时不可用，请稍后重试", "type": "api_error",
                            "param": None, "code": "stream_error"}
@@ -686,18 +792,18 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
         yield "data: [DONE]\n\n"
     except (NoRouteAvailable, AllRoutesFailed) as exc:
         report = exc.report if isinstance(exc, AllRoutesFailed) else None
-        _finish_log(holder["log"], holder["started"], False, 503, "no_available_route",
-                    routes=report)
-        settle(False)
+        await _safe_finish(holder["log"], holder["started"], False, 503, "no_available_route",
+                     routes=report)
+        await settle(False)
         yield "data: " + json.dumps({
             "error": {"message": "当前没有可用线路或所有线路均失败", "type": "api_error",
                        "param": None, "code": "no_available_route"}
         }) + "\n\n"
         yield "data: [DONE]\n\n"
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("stream failed")
-        _finish_log(holder["log"], holder["started"], False, 502, "stream_error")
-        settle(False)
+        await _safe_finish(holder["log"], holder["started"], False, 502, "stream_error")
+        await settle(False)
         yield "data: " + json.dumps({
             "error": {"message": "上游服务暂时不可用，请稍后重试", "type": "api_error",
                        "param": None, "code": "stream_error"}
@@ -707,34 +813,17 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
         try:
             if winner is not None:
                 await winner.close()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
-        _request_semaphore.release()
+        if reserved:
+            _release_upstream(reserved)
+            reserved = 0
         _bump_active(-1)
 
 
-async def _drain(winner, probe_interval: float = 0, max_idle_probes: int = 0,
-                 heartbeat: float = 0, max_duration: float = 0):
-    """逐块转发上游 SSE：心跳保活 + 连续"心跳探测"失败判死 + 总时长兜底。
-
-    - `heartbeat` > 0：上游静默超过该秒数时向客户端发送 SSE 注释心跳
-      `: keep-alive`，证明平台↔客户端的连接仍然活着（NAT / 负载均衡 /
-      客户端读超时不会误杀），实现"流式保活"；
-    - `probe_interval` / `max_idle_probes`：**判死的心跳机制**。SSE 是 HTTP 单向流，
-      没有 WebSocket 那种应用层 Pong 帧，平台无法向上游"发心跳等响应"；此处取其
-      在 HTTP 上的等价形式：上游在单个探测周期内没有任何字节（含思考 token）即
-      视为一次"心跳失败"，**连续 max_idle_probes 次失败**（总时长 ≈ probe_interval
-      × max_idle_probes）才判定连接真死——对应参考项目"连续 N 次 Pong 超时"的判死
-      逻辑，避免网络抖动一次误杀。任何数据（含 token 流）到达即清零重计：
-      生成慢但连接活着绝不误杀，"无 token 判死"与"心跳判死"互相辅助；
-    - `max_duration` > 0：整条流超过该秒数强制收尾（僵尸流兜底）。
-
-    实现要点：上游读取使用**常驻 read_task**，心跳期间不取消这个 pending read
-    （asyncio.wait_for 会在超时瞬间取消底层读取，导致真实流被误杀）。因此
-    心跳/探测只是"观察"read_task 是否完成，而永不打断它。
-
-    其余任何异常（连接被切断 / 解码失败等）原样上抛，由上层决定重试或收尾。
-    """
+async def _drain(winner, idle_timeout: float = 0,
+                 heartbeat: float = 0, max_duration: float = 0,
+                 content_idle_timeout: float = 0):
     import asyncio
     import time as _time
 
@@ -748,7 +837,8 @@ async def _drain(winner, probe_interval: float = 0, max_idle_probes: int = 0,
         except StopAsyncIteration:
             return None
 
-    read_task: asyncio.Task | None = asyncio.ensure_future(take())
+    read_task: asyncio.Task | None = None
+    seen_signal = False
     try:
         while True:
             if max_duration and max_duration > 0:
@@ -759,36 +849,52 @@ async def _drain(winner, probe_interval: float = 0, max_idle_probes: int = 0,
             else:
                 remaining = 0.0
 
-            # 本轮等待间隔 = 心跳节拍与探测节拍中较细的一个（有数据/心跳交错的粒度）
             interval = 0.0
-            for tick in (heartbeat, probe_interval):
+            for tick in (heartbeat, idle_timeout):
                 if tick and tick > 0:
                     interval = min(interval, tick) if interval > 0 else tick
             if remaining > 0:
                 interval = min(interval, remaining) if interval > 0 else remaining
 
-            if read_task is None or read_task.done():
+            if read_task is None:
                 read_task = asyncio.ensure_future(take())
+            if read_task.done():
+                chunk = read_task.result()
+                read_task = None
+                if chunk is None:
+                    break
+                last_data = _time.monotonic()
+                if not seen_signal and _chunk_has_any_signal(chunk):
+                    seen_signal = True
+                yield chunk
+                continue
+
             if interval > 0:
                 done, _ = await asyncio.wait({read_task}, timeout=interval)
             else:
                 done, _ = await asyncio.wait({read_task})
             if read_task.done():
-                chunk = read_task.result()  # 异常（断流/解码失败）原样上抛
+                chunk = read_task.result()
+                read_task = None
                 if chunk is None:
                     break
-                last_data = _time.monotonic()  # 任何数据到达：心跳探测计数清零
-                read_task = None
+                last_data = _time.monotonic()
+                if not seen_signal and _chunk_has_any_signal(chunk):
+                    seen_signal = True
                 yield chunk
             else:
-                # 静默期：推进"心跳失败"计数，达到连续失败上限才判真死；期间发客户端保活
-                if probe_interval and probe_interval > 0 and max_idle_probes and max_idle_probes > 0:
-                    elapsed = _time.monotonic() - last_data
-                    misses = int(elapsed // probe_interval)
-                    if misses >= max_idle_probes:
+                elapsed = _time.monotonic() - last_data
+                if not seen_signal:
+                    if idle_timeout and idle_timeout > 0 and elapsed > idle_timeout:
                         raise TimeoutError(
                             "upstream unresponsive: no bytes for "
-                            f"{round(elapsed, 1)}s (> {max_idle_probes}×{probe_interval}s)")
+                            f"{round(elapsed, 1)}s (> idle_timeout {idle_timeout}s)")
+                elif content_idle_timeout and content_idle_timeout > 0:
+                    if elapsed > content_idle_timeout:
+                        raise TimeoutError(
+                            "upstream idle after content: no bytes for "
+                            f"{round(elapsed, 1)}s (> content_idle_timeout "
+                            f"{content_idle_timeout}s)")
                 if heartbeat and heartbeat > 0:
                     yield ": keep-alive\n\n"
     finally:
@@ -796,7 +902,7 @@ async def _drain(winner, probe_interval: float = 0, max_idle_probes: int = 0,
             read_task.cancel()
             try:
                 await read_task
-            except (asyncio.CancelledError, TimeoutError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, TimeoutError, Exception):
                 pass
 
 
@@ -822,4 +928,5 @@ def _finish_log(log: RequestLog, started: float, success: bool, http_status: int
         log.routes = routes
     log.save()
     from services import channel_health
-    channel_health.record(log.channel, success, http_status, error_type)
+    channel_health.record(log.channel, success, http_status, error_type,
+                          routes=routes if isinstance(routes, list) else None)

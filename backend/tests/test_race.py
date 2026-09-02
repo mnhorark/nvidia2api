@@ -56,10 +56,13 @@ class ValidationTests(TestCase):
         """
         self.assertIsNone(is_valid_stream_chunk("data: [DONE]"))
 
-    def test_contentless_chunks_are_not_valid_first_chunks(self):
-        """空 delta 心跳 / 纯角色标记不算有效首块（线路尚未真正产出内容）。"""
-        self.assertIsNone(is_valid_stream_chunk('data: {"choices":[{"delta":{}}]}'))
-        self.assertIsNone(is_valid_stream_chunk(
+    def test_contentless_chunks_are_valid_first_chunks(self):
+        """空 delta / 纯角色标记也算"线路开始响应"（回归宽松判胜）：
+        竞速胜负锁定在"谁先开始出流"，而非"谁先产出内容"——思考模型会静默
+        几十秒才吐首个内容块，若等内容才判胜，竞速窗口会被模型思考时间拖长。
+        正文延迟由 _drain 的心跳探测与停滞判死兜底。"""
+        self.assertIsNotNone(is_valid_stream_chunk('data: {"choices":[{"delta":{}}]}'))
+        self.assertIsNotNone(is_valid_stream_chunk(
             'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}'))
 
     def test_content_chunks_are_valid(self):

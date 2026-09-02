@@ -31,10 +31,96 @@ class CircuitBreakerTests(TestCase):
         self.assertIsNone(self.ch.cooldown_until)
         self.assertFalse(channel_health.is_open(self.ch))
 
+    def test_no_available_route_does_not_self_trip(self):
+        """no_available_route 是"熔断/Key 用尽"的结果而非上游故障：
+        一旦计入熔断计数，冷却结束后瞬间再次熔断，形成自我强化的死循环。
+        多次返回 503 no_available_route 不得累计熔断计数、不得触发熔断。"""
+        for _ in range(12):
+            channel_health.record(self.ch, False, http_status=503,
+                                  error_type="no_available_route")
+        self.ch.refresh_from_db()
+        self.assertEqual(self.ch.consecutive_failures, 0)
+        self.assertIsNone(self.ch.cooldown_until)
+        self.assertFalse(channel_health.is_open(self.ch))
+
     def test_success_resets_failures(self):
         channel_health.record(self.ch, False, http_status=500, error_type="upstream_error")
         channel_health.record(self.ch, False, http_status=500, error_type="upstream_error")
         channel_health.record(self.ch, True)
+        self.ch.refresh_from_db()
+        self.assertEqual(self.ch.consecutive_failures, 0)
+        self.assertIsNone(self.ch.cooldown_until)
+
+    def test_capacity_failures_with_429_evidence_do_not_trip(self):
+        """429 风暴里夹带 502 的竞速失败属于"号池容量/代理质量"问题，
+        不是渠道宕机：线路明细只要出现 rate_limited/429 证据，就不计入熔断。
+        否则 5 次这类请求就能把全渠道熔断，期间所有可用 Key 一律 503。"""
+        routes = [
+            {"name": "p1+k1", "status": "failed", "error": "rate_limited",
+             "http_status": 429},
+            {"name": "p2+k2", "status": "failed", "error": "upstream_server_error",
+             "http_status": 502},
+        ]
+        for _ in range(10):
+            channel_health.record(self.ch, False, http_status=502,
+                                  error_type="all_routes_failed", routes=routes)
+        self.ch.refresh_from_db()
+        self.assertEqual(self.ch.consecutive_failures, 0)
+        self.assertIsNone(self.ch.cooldown_until)
+        self.assertFalse(channel_health.is_open(self.ch))
+
+    def test_pure_channel_failure_still_trips(self):
+        """没有 Key 级应答证据（无 429/401/403）、全是连接/5xx 失败，
+        仍是确凿的渠道级故障，照常熔断。"""
+        routes = [
+            {"name": "p1+k1", "status": "failed", "error": "upstream_server_error",
+             "http_status": 502},
+            {"name": "p2+k2", "status": "failed", "error": "connect_error",
+             "http_status": 0},
+        ]
+        for _ in range(5):
+            channel_health.record(self.ch, False, http_status=502,
+                                  error_type="all_routes_failed", routes=routes)
+        self.ch.refresh_from_db()
+        self.assertEqual(self.ch.consecutive_failures, 5)
+        self.assertIsNotNone(self.ch.cooldown_until)
+        self.assertTrue(channel_health.is_open(self.ch))
+
+    def test_stream_idle_timeout_does_not_trip(self):
+        """流式判死超时（504）是"模型长思考静默过久"，不是"渠道宕机"：
+        http_status=504 满足 >=500，但绝不能因此熔断整个渠道——
+        否则几次 kimi/R1 长思考超时就把 312 Key 渠道整锅熔断。"""
+        for _ in range(10):
+            channel_health.record(self.ch, False, http_status=504,
+                                  error_type="stream_idle_timeout")
+        self.ch.refresh_from_db()
+        self.assertEqual(self.ch.consecutive_failures, 0)
+        self.assertIsNone(self.ch.cooldown_until)
+        self.assertFalse(channel_health.is_open(self.ch))
+
+    def test_stream_idle_timeout_does_not_trip(self):
+        """流式静默判死（模型长思考）不计入渠道熔断，也不清零——渠道本身健康。"""
+        for _ in range(10):
+            channel_health.record(self.ch, False, http_status=504,
+                                  error_type="stream_idle_timeout")
+        self.ch.refresh_from_db()
+        self.assertEqual(self.ch.consecutive_failures, 0)
+        self.assertIsNone(self.ch.cooldown_until)
+
+    def test_429_evidence_resets_consecutive_failures(self):
+        """有 429 应答证据 = 渠道活着，等价成功，应清零连续失败计数。
+        先累计 3 次确凿失败，再来一次 429 风暴请求，计数应归零而非继续累加。"""
+        for _ in range(3):
+            channel_health.record(self.ch, False, http_status=502,
+                                  error_type="all_routes_failed", routes=[
+                                      {"name": "x", "status": "failed",
+                                       "error": "connect_error", "http_status": 0}])
+        self.ch.refresh_from_db()
+        self.assertEqual(self.ch.consecutive_failures, 3)
+        channel_health.record(self.ch, False, http_status=502,
+                              error_type="all_routes_failed", routes=[
+                                  {"name": "p1+k1", "status": "failed",
+                                   "error": "rate_limited", "http_status": 429}])
         self.ch.refresh_from_db()
         self.assertEqual(self.ch.consecutive_failures, 0)
         self.assertIsNone(self.ch.cooldown_until)

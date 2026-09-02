@@ -669,6 +669,59 @@ class StreamRetryTests(TransactionTestCase):
         self.assertEqual(calls["n"], 3)
         self.assertIn("stream_error", body)
 
+    def test_stream_failure_tail_persists_failed_log(self):
+        """失败收尾日志必须落库为 failed（锁死 _safe_finish 递归不再吞掉落库）。"""
+        from services import sysconfig
+        sysconfig.set_params({"retry_count": 0}, self.channel)
+        behaviors = [_FakeStreamWinner(error=httpx.ReadError("boom"))]
+        calls = {"n": 0}
+
+        async def fake_race_stream(*args, **kwargs):
+            calls["n"] += 1
+            return behaviors.pop(0)
+
+        with patch.object(openai_views, "race_stream", new=fake_race_stream):
+            resp = self._call()
+            _consume_stream(resp)
+        self.assertEqual(calls["n"], 1)
+        log = RequestLog.objects.order_by("-id").first()
+        self.assertIsNotNone(log)
+        self.assertEqual(log.status, "failed")
+
+    def test_stream_releases_upstream_slots_when_done(self):
+        """流结束后全局上游阀门必须归零（锁死 slot 泄漏，防并发流被拖到 no_available_route）。"""
+        openai_views._upstream_active = 0
+        ok_chunk = 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+
+        async def fake_race_stream(*args, **kwargs):
+            return _FakeStreamWinner(chunks=[ok_chunk, "data: [DONE]\n\n"])
+
+        with patch.object(openai_views, "race_stream", new=fake_race_stream):
+            before = openai_views._upstream_active
+            resp = self._call()
+            body = _consume_stream(resp)
+        self.assertIn("data: [DONE]", body)
+        self.assertEqual(openai_views._upstream_active, before)
+
+    def test_truncated_after_content_is_marked_not_silent(self):
+        """已交付内容后上游断流：必须在日志里留下 stream_truncated 标记，
+        而非伪装成"正常成功"的无声中断（锁死无报错中断的可见性）。"""
+        from services import sysconfig
+        sysconfig.set_params({"retry_count": 0}, self.channel)
+        answer = 'data: {"choices":[{"delta":{"content":"ans"}}]}\n\n'
+        behaviors = [_FakeStreamWinner(chunks=[answer], error_after=1)]
+
+        async def fake_race_stream(*args, **kwargs):
+            return behaviors.pop(0)
+
+        with patch.object(openai_views, "race_stream", new=fake_race_stream):
+            resp = self._call()
+            body = _consume_stream(resp)
+        self.assertIn("data: [DONE]", body)
+        log = RequestLog.objects.order_by("-id").first()
+        self.assertIsNotNone(log)
+        self.assertEqual(log.error_type, "stream_truncated")
+
 
 class _FakeStreamWinner:
     """模拟 race_stream 返回的 winner：可按行产出 SSE，或在指定位置抛错。"""
