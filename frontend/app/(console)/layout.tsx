@@ -38,7 +38,12 @@ export default function ConsoleLayout({ children }: { children: React.ReactNode 
   const router = useRouter();
   const [ready, setReady] = useState(false);
   const [channels, setChannels] = useState<Channel[]>([]);
-  const [channel, setChannelSlug] = useState("");
+  // 关键：初始化时同步读 localStorage 里的渠道——否则挂载时 channel=""，
+  // 首个 loadChannels 回来再 setChannel 会变更 <main key>、整页重挂载，
+  // 各页面的 load() 会双发（实测每页 API 请求翻倍就是这样来的）。
+  const [channel, setChannelSlug] = useState(() =>
+    typeof window !== "undefined" ? getChannel() : ""
+  );
 
   const loadChannels = useCallback(async () => {
     try {
