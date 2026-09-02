@@ -23,10 +23,15 @@ import {
 } from "@/components/ui";
 import { toast } from "@/components/toaster";
 
+// 大列表渲染窗口：每次“加载更多”展开的行数
+const RENDER_WINDOW = 200;
+
 export default function ModelsPage() {
   const [models, setModels] = useState<Model[]>([]);
   const [groups, setGroups] = useState<ProxyGroup[]>([]);
   const [q, setQ] = useState("");
+  // 渲染窗口大小：行内操作后的全量 load() 不重置它，仅搜索词变化时重置
+  const [windowSize, setWindowSize] = useState(RENDER_WINDOW);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState("");
@@ -66,6 +71,11 @@ export default function ModelsPage() {
     load();
   }, [load]);
 
+  // 搜索词变化时回到初始窗口；load() 全量重拉不重置，避免已展开的行被收起
+  useEffect(() => {
+    setWindowSize(RENDER_WINDOW);
+  }, [q]);
+
   const filtered = models.filter(
     (m) =>
       !q ||
@@ -73,6 +83,8 @@ export default function ModelsPage() {
       (m.alias || "").toLowerCase().includes(q.toLowerCase()) ||
       (m.aliases ?? []).some((a) => a.toLowerCase().includes(q.toLowerCase()))
   );
+  // 渲染窗口：全选/反选仍作用于 filtered 全集，这里只控制 DOM 渲染行数
+  const visible = filtered.slice(0, windowSize);
 
   async function sync(prune = false, pruneOnly = false) {
     setSyncing(true);
@@ -251,7 +263,7 @@ export default function ModelsPage() {
 
       <DataTable
         loading={loading}
-        empty="暂无模型，点击「同步渠道模型」拉取"
+        empty={q.trim() ? "没有匹配的模型" : "暂无模型，点击「同步渠道模型」拉取"}
         head={
           <>
             <Th>
@@ -272,7 +284,7 @@ export default function ModelsPage() {
           </>
         }
       >
-        {filtered.map((m) => (
+        {visible.map((m) => (
           <tr key={m.id} className="transition-colors hover:bg-white/[0.025]">
             <Td>
               <Checkbox
@@ -359,6 +371,20 @@ export default function ModelsPage() {
           </tr>
         ))}
       </DataTable>
+
+      {!loading && filtered.length > 0 && (
+        <div className="mt-3 flex items-center justify-between text-xs text-faint">
+          <span className="tabular-nums">
+            已显示 {visible.length} / 共 {filtered.length}
+            {q.trim() ? `（全部 ${models.length}）` : ""}
+          </span>
+          {visible.length < filtered.length && (
+            <Button size="sm" onClick={() => setWindowSize((n) => n + RENDER_WINDOW)}>
+              加载更多
+            </Button>
+          )}
+        </div>
+      )}
 
       <Modal open={!!edit} title={edit?.id ? "编辑模型" : "添加模型"} onClose={() => setEdit(null)}>
         <form onSubmit={save} className="space-y-3.5">

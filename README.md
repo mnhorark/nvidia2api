@@ -88,7 +88,7 @@ cp .env.example .env
 cd backend
 pip install -r requirements.txt
 python manage.py migrate
-python -m pytest tests          # 275 个测试：导入/限流/代理限制/竞速/并发安全/思考强度/多渠道/额度/熔断/回归守卫/前端静态托管/心跳探测/R4 性能/R5 宽松判胜守卫/R10 上游错误详情
+python -m pytest tests          # 337 个测试：导入/限流/代理限制/竞速/并发安全/思考强度/多渠道/额度/熔断/回归守卫/前端静态托管/心跳探测/R4 性能/R5 宽松判胜守卫/R10 上游错误详情
 python manage.py runserver 0.0.0.0:8000
 
 # 前端

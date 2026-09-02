@@ -25,6 +25,9 @@ import {
 } from "@/components/ui";
 import { toast } from "@/components/toaster";
 
+// 大列表渲染窗口：每次“加载更多”展开的行数（一千多代理全量渲染会卡顿）
+const RENDER_WINDOW = 200;
+
 export default function ProxiesPage() {
   const [proxies, setProxies] = useState<Proxy[]>([]);
   const [groups, setGroups] = useState<ProxyGroup[]>([]);
@@ -48,6 +51,8 @@ export default function ProxiesPage() {
   const [batchBusy, setBatchBusy] = useState(false);
   // 节点关键字
   const [kw, setKw] = useState("");
+  // 渲染窗口大小：测速/启停触发的全量 load() 不重置它，仅关键字变化时重置
+  const [windowSize, setWindowSize] = useState(RENDER_WINDOW);
   // 批量分组
   const [groupTarget, setGroupTarget] = useState("");
 
@@ -82,6 +87,24 @@ export default function ProxiesPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // 关键字变化时回到初始窗口；load() 全量重拉不重置，避免已展开的行被收起
+  useEffect(() => {
+    setWindowSize(RENDER_WINDOW);
+  }, [kw]);
+
+  // 渲染列表的真过滤：名称 / host / 分组名命中即保留；
+  // 注：上面的批量选择 chips 与“匹配 N”统计仍沿用原有的 name/host 语义，不受影响
+  const needle = kw.trim().toLowerCase();
+  const filtered = !needle
+    ? proxies
+    : proxies.filter(
+        (p) =>
+          (p.name || "").toLowerCase().includes(needle) ||
+          (p.host || "").toLowerCase().includes(needle) ||
+          (p.group_name || "").toLowerCase().includes(needle)
+      );
+  const visible = filtered.slice(0, windowSize);
 
   async function setEnabled(p: Proxy, enabled: boolean) {
     setBusyId(p.id);
@@ -454,7 +477,7 @@ export default function ProxiesPage() {
 
       <DataTable
         loading={loading}
-        empty="暂无代理"
+        empty={kw.trim() ? "没有匹配的代理" : "暂无代理"}
         head={
           <>
             <Th>
@@ -479,7 +502,7 @@ export default function ProxiesPage() {
           </>
         }
       >
-        {proxies.map((p) => (
+        {visible.map((p) => (
           <tr key={p.id} className="transition-colors hover:bg-white/[0.025]">
             <Td>
               <Checkbox
@@ -564,6 +587,20 @@ export default function ProxiesPage() {
           </tr>
         ))}
       </DataTable>
+
+      {!loading && filtered.length > 0 && (
+        <div className="mt-3 flex items-center justify-between text-xs text-faint">
+          <span className="tabular-nums">
+            已显示 {visible.length} / 共 {filtered.length}
+            {kw.trim() ? `（全部 ${proxies.length}）` : ""}
+          </span>
+          {visible.length < filtered.length && (
+            <Button size="sm" onClick={() => setWindowSize((n) => n + RENDER_WINDOW)}>
+              加载更多
+            </Button>
+          )}
+        </div>
+      )}
 
       <Modal open={importOpen} wide title="批量导入代理" onClose={() => setImportOpen(false)}>
         <p className="mb-3 text-xs leading-relaxed text-mute">

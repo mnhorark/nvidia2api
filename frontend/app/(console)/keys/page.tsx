@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Ban, Check, FlaskConical, Gauge, Pencil, Plus, RefreshCw, Trash2, Upload, Wand2 } from "lucide-react";
+import { Ban, Check, FlaskConical, Gauge, Pencil, Plus, RefreshCw, Search, Trash2, Upload, Wand2 } from "lucide-react";
 import { api, asList, Channel, ChannelKey } from "@/lib/api";
 import { useSubmitGuard } from "@/lib/use-submit-guard";
 import {
@@ -23,6 +23,9 @@ import {
   Th,
 } from "@/components/ui";
 import { toast } from "@/components/toaster";
+
+// 大列表渲染窗口：每次“加载更多”展开的行数（两千+ Key 全量渲染会卡死页面）
+const RENDER_WINDOW = 200;
 
 interface ImportResult {
   success?: number;
@@ -50,6 +53,21 @@ export default function ChannelKeysPage() {
   const [saving, submit] = useSubmitGuard();
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
+  // 本地搜索：按名称 / 掩码后的 Key 过滤（全量数据仍在 keys 里，统计、批量选择不受影响）
+  const [q, setQ] = useState("");
+  // 渲染窗口大小：行内操作触发的全量 load() 不重置它，仅搜索词变化时重置
+  const [windowSize, setWindowSize] = useState(RENDER_WINDOW);
+
+  const filtered = q.trim()
+    ? keys.filter((k) => {
+        const needle = q.trim().toLowerCase();
+        return (
+          (k.name || "").toLowerCase().includes(needle) ||
+          (k.api_key || "").toLowerCase().includes(needle)
+        );
+      })
+    : keys;
+  const visible = filtered.slice(0, windowSize);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -73,6 +91,11 @@ export default function ChannelKeysPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // 搜索词变化时回到初始窗口；load() 全量重拉不重置，避免已展开的行被收起
+  useEffect(() => {
+    setWindowSize(RENDER_WINDOW);
+  }, [q]);
 
   async function doImport() {
     try {
@@ -272,6 +295,16 @@ export default function ChannelKeysPage() {
         </div>
       )}
 
+      <div className="relative mb-4 max-w-sm">
+        <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-faint" />
+        <Input
+          className="pl-9"
+          placeholder="搜索名称 / Key…"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+        />
+      </div>
+
       <BatchBar count={selected.size}>
         <Button size="sm" disabled={batchBusy} onClick={() => batch("enable")}>启用</Button>
         <Button size="sm" disabled={batchBusy} onClick={() => batch("disable")}>禁用</Button>
@@ -291,7 +324,7 @@ export default function ChannelKeysPage() {
 
       <DataTable
         loading={loading}
-        empty="暂无 Key，点击右上角添加或批量导入"
+        empty={q.trim() ? "没有匹配的 Key" : "暂无 Key，点击右上角添加或批量导入"}
         head={
           <>
             <Th>
@@ -314,7 +347,7 @@ export default function ChannelKeysPage() {
           </>
         }
       >
-        {keys.map((k) => {
+        {visible.map((k) => {
           const enabled = k.enabled ?? k.status !== "disabled";
           return (
             <tr key={k.id} className="transition-colors hover:bg-white/[0.025]">
@@ -382,6 +415,20 @@ export default function ChannelKeysPage() {
           );
         })}
       </DataTable>
+
+      {!loading && filtered.length > 0 && (
+        <div className="mt-3 flex items-center justify-between text-xs text-faint">
+          <span className="tabular-nums">
+            已显示 {visible.length} / 共 {filtered.length}
+            {q.trim() ? `（全部 ${keys.length}）` : ""}
+          </span>
+          {visible.length < filtered.length && (
+            <Button size="sm" onClick={() => setWindowSize((n) => n + RENDER_WINDOW)}>
+              加载更多
+            </Button>
+          )}
+        </div>
+      )}
 
       {/* 批量导入 */}
       <Modal
