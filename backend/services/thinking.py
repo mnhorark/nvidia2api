@@ -120,6 +120,11 @@ class ThinkingCapability:
     # 通用 budget_to_effort 换算（通用表是 Anthropic/CLAUDE 锚点，
     # 与 qwen 官方换算完全不同）。
     budget_effort_tiers: tuple[tuple[int, str], ...] = ()
+    # 开关意图不发默认档（qwen 专用）：客户端只开 toggle 键、没给档位时
+    # **不**注入默认 effort。仅词表特殊（通用档不在词表会 400）且开关
+    # 通道已完整表达"开启"意图的模型需要。普通开关模型保持旧行为：
+    # 开关 + 默认档双发（档位是它们的强度表达）。
+    suppress_toggle_default: bool = False
 
 
 _THINKING_CAPABILITIES: list[tuple[str, ThinkingCapability]] = [
@@ -155,6 +160,7 @@ _THINKING_CAPABILITIES: list[tuple[str, ThinkingCapability]] = [
         effort_budget_exclusive=True,
         budget_effort_tiers=((4096, "low"), (16384, "medium"),
                              (262144, "xhigh")),
+        suppress_toggle_default=True,
     )),
     ("gemma", ThinkingCapability(toggle_keys=("enable_thinking",),
                                  effort_key=None)),
@@ -625,15 +631,12 @@ def to_upstream(spec: ThinkingSpec, model_name: str = "", channel=None) -> dict:
     if cap.effort_key:
         effort = spec.effort
         # 开关意图（只开了 enable_thinking/thinking，无档位无预算）是否
-        # 值得注入默认档位：仅对"档位驱动"的模型成立（default_effort
-        # 显式声明，或无开关通道的 always-on 模型）——注入默认档是它们
-        # 的"开启"表达；对开关驱动的模型（qwen/gemma/step，靠
-        # chat_template_kwargs 开关表达意图），客户端没要档位就不该
-        # 发明档位：qwen3.8-flash 词表特殊（xhigh/medium/low），注入的
-        # 默认档 high 不在词表直接整包 400（req_68ec7675 案），上游本
-        # 就以开关为准。
-        inject_default = (cap.default_effort is not None
-                          or not cap.toggle_keys)
+        # 值得注入默认档位：默认注入（旧行为——普通开关模型靠"开关+默认
+        # 档"表达强度）；仅显式声明 suppress_toggle_default 的模型跳过
+        # （qwen3.8-flash：词表特殊 xhigh/medium/low，注入的默认档 high
+        # 不在词表整包 400（req_68ec7675 案），且上游以开关为准，
+        # 发明档位属添加客户端未给的语义）。
+        inject_default = not cap.suppress_toggle_default
         if effort is None and spec.enabled is True and spec.budget is None \
                 and inject_default:
             effort = cap.default_effort or _default_effort(channel)

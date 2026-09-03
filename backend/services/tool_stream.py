@@ -213,12 +213,16 @@ class ToolCallStreamNormalizer:
         main = "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
         if not finish_split_pending:
             return [main]
-        # finish 追随帧：空 delta + finish_reason + usage
+        # finish 追随帧：空 delta + finish_reason + usage。
+        # usage 只放追随帧（帧序语义：finish 之后才到 usage，与上游
+        # 标准流一致）——main 帧若同时带 usage 会让按帧计费的客户端双计。
+        usage = data.pop("usage", None)
+        main = "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
         tail_choices = [
             {"index": idx, "delta": {}, "finish_reason": fr}
             for idx, fr in split_finishes
         ]
         tail: dict[str, Any] = {"choices": tail_choices}
-        if data.get("usage"):
-            tail["usage"] = data["usage"]
+        if usage:
+            tail["usage"] = usage
         return [main, "data: " + json.dumps(tail, ensure_ascii=False) + "\n\n"]

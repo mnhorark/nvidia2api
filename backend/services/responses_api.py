@@ -596,13 +596,36 @@ def _input_item_to_message(item):
         if isinstance(content, list):
             parts = []
             for p in content:
-                if isinstance(p, dict) and p.get("type") in ("input_text", "output_text"):
+                if not isinstance(p, dict):
+                    parts.append({"type": "text", "text": str(p)})
+                    continue
+                ptype = p.get("type")
+                if ptype in ("input_text", "output_text"):
                     parts.append({"type": "text", "text": str(p.get("text") or "")})
-                elif isinstance(p, dict) and p.get("type") == "input_image":
+                elif ptype == "input_image":
                     img = {"url": str(p.get("image_url") or "")}
                     if p.get("detail") is not None:
                         img["detail"] = p["detail"]
                     parts.append({"type": "image_url", "image_url": img})
+                elif ptype == "input_file":
+                    # 零丢失：文件分片保留（chat 侧以 file 分片形态透传，
+                    # 上游是否支持由上游裁决，不再静默剥离）
+                    f = {"type": "file",
+                         "file": {k: p[k] for k in
+                                  ("filename", "file_data", "file_id")
+                                  if k in p}}
+                    parts.append(f)
+                elif ptype == "input_audio":
+                    # 零丢失：音频分片保留（chat 侧 input_audio 同构）
+                    parts.append({"type": "input_audio",
+                                  "input_audio": p.get("input_audio") or {}})
+                elif ptype == "refusal":
+                    # 客户端回传的历史 refusal 文本，保留为文本
+                    parts.append({"type": "text", "text": str(p.get("refusal") or "")})
+                else:
+                    # 未知分片类型：以规范 JSON 文本降级保留，不蒸发
+                    parts.append({"type": "text",
+                                  "text": json.dumps(p, ensure_ascii=False)})
             content = parts
         return {"role": role, "content": content}
     # 未知 input 条目类型（item_reference / 未来新增）：以规范 JSON 文本
@@ -724,6 +747,17 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
     if state is None:
         state = {}
     args_seen = state.setdefault("args_seen", set())
+    # 并行工具调用的 chat 侧槽位分配表：item_id/call_id -> tool index。
+    # Responses 上游按 item_id 区分多个并行 function_call，翻译成 chat
+    # delta 必须各占一个 index——旧实现硬编码 index 0，openai-python 等
+    # 按 index 累积的 SDK 会把第二个调用的参数追加到第一个上（参数损坏）。
+    tool_index: dict = state.setdefault("tool_index_by_id", {})
+
+    def _slot_for(call_id: str) -> int:
+        if call_id not in tool_index:
+            tool_index[call_id] = len(tool_index)
+        return tool_index[call_id]
+
     etype = data.get("type")
     if etype in ("error", "response.failed"):
         err = data.get("error") or {}
@@ -758,10 +792,12 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
             return None
         if item.get("type") == "function_call":
             # 工具开始：先发 id + name，参数随后按增量透传
+            call_id = str(item.get("call_id") or "")
+            slot = _slot_for(call_id)
             return json.dumps({"choices": [{"index": 0,
                                             "delta": {"tool_calls": [{
-                                                "index": 0,
-                                                "id": str(item.get("call_id") or ""),
+                                                "index": slot,
+                                                "id": call_id,
                                                 "type": "function",
                                                 "function": {
                                                     "name": str(item.get("name") or ""),
@@ -775,12 +811,19 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
         return json.dumps({"choices": [{"index": 0,
                                         "delta": {"content": str(data.get("delta") or "")},
                                         "finish_reason": None}]})
+    if etype == "response.refusal.delta":
+        # [OI] refusal 流式增量：内容性字节，翻译为 chat 的 refusal 字段，
+        # 不得丢弃（旧实现无此分支 → 透传到下游出口后被 choices 判空吞掉）
+        return json.dumps({"choices": [{"index": 0,
+                                        "delta": {"refusal": str(data.get("delta") or "")},
+                                        "finish_reason": None}]})
     if etype == "response.function_call_arguments.delta":
         call_id = str(data.get("item_id") or "")
         args_seen.add(call_id)
+        slot = _slot_for(call_id)
         return json.dumps({"choices": [{"index": 0,
                                         "delta": {"tool_calls": [{
-                                            "index": 0,
+                                            "index": slot,
                                             "id": call_id,
                                             "type": "function",
                                             "function": {
@@ -830,9 +873,10 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
             # 若上游只发 done 未发 delta（非标准），则在此兜底补发一次完整参数
             if call_id in args_seen:
                 return None
+            slot = _slot_for(call_id)
             return json.dumps({"choices": [{"index": 0,
                                             "delta": {"tool_calls": [{
-                                                "index": 0,
+                                                "index": slot,
                                                 "id": call_id,
                                                 "type": "function",
                                                 "function": {
@@ -857,13 +901,26 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
 
 async def iter_responses_sse(first_line: str, aiter,
                              include_first: bool = True,
-                             done_state: dict | None = None) -> AsyncIterator[str]:
+                             done_state: dict | None = None,
+                             prelude: list[str] | None = None) -> AsyncIterator[str]:
     """把 Responses 流式事件流转成 chat 格式的 SSE 行序列。
 
     **不再伪造结尾 [DONE]**：上游未发 [DONE] 即结束 = 静默截断，
     如实通过 `done_state["saw_done"]` 上报，由调用方决定重试/报错。
+
+    `prelude`：竞速窗口期（判胜首帧之前）上游已发出的行——零丢失原则
+    下必须先于 first_line 重放，否则 usage 预告帧/自定义事件会蒸发。
     """
     state: dict = {"args_seen": set()}
+    if prelude:
+        for line in prelude:
+            if not line.strip():
+                continue
+            if line.strip() == "data: [DONE]" or (
+                    line.startswith("data:") and line[5:].strip() == "[DONE]"):
+                if done_state is not None:
+                    done_state["saw_done"] = True
+            yield line + "\n\n"
     if include_first and first_line:
         translated = _translate_event(first_line, state)
         if translated == "[DONE]":
@@ -1000,9 +1057,22 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
                 continue
             if data.get("error"):
                 error_seen = True
+                # error 即返（与 anthropic 出口同语义）：error 后继续翻译
+                # 会产出 response.failed 之后的 delta/done 矛盾序列；
+                # created 前置保证 response.failed 不悬空。
+                if not emitted_created:
+                    emitted_created = True
+                    yield _sse_event("response.created", {
+                        "type": "response.created",
+                        "response": {"id": data.get("id") or "resp_x",
+                                     "object": "response",
+                                     "status": "in_progress", "model": ""},
+                    })
                 yield _sse_event("response.failed",
                                  {"type": "response.failed", "error": data["error"]})
-                continue
+                yield "data: [DONE]\n\n"
+                done_sent = True
+                return
             # usage 捕获先于 choices 判空：usage 常在独立空 choices 尾帧
             if data.get("usage"):
                 usage = data["usage"]
@@ -1024,6 +1094,12 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
                                  "status": "in_progress", "model": data.get("model") or ""},
                 })
             delta = ch.get("delta") or {}
+            if pending_finish is not None:
+                # 终结守卫生效期：条目已全部 output_item.done，此帧的增量
+                # 不再翻译成 delta（delta-after-done 非法）。零丢失：原样
+                # 透传给客户端自行裁决（bytes 不蒸发的口径）。
+                yield "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
+                continue
             reasoning = delta.get("reasoning_content")
             if reasoning:
                 reasoning_acc += str(reasoning)
@@ -1100,7 +1176,11 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
                             "delta": args,
                         })
             finish = ch.get("finish_reason")
-            if finish:
+            if finish and pending_finish is None:
+                # 终结守卫：首个 finish 帧才关条目（重复 finish 帧不再重发
+                # 全部 done 事件、不再覆盖 pending_finish）；finish 之后
+                # 到达的增量帧也不再翻译（条目已 done，delta-after-done
+                # 是非法序列）。异常上游的残余字节按零丢失原样透传。
                 # 结束各 output_item（内容已定）；response.completed 延迟到
                 # [DONE]/流尾——usage 尾帧在 finish 之后才到
                 if "rs_0" in announced:

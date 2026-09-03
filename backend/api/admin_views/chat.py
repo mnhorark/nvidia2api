@@ -190,10 +190,12 @@ class AdminChatView(AdminRequiredMixin, APIView):
                                               content_idle_timeout, tap=tap):
                         yield chunk
                     # 静默截断检测（与 /v1 流式同语义）：流结束但既无 finish_reason
-                    # 也无上游 [DONE] = 上游掐断，必须如实上报而非伪装成功
+                    # 也无上游 [DONE] = 上游掐断，必须如实上报而非伪装成功。
+                    # saw_done 双源取或（行级 final_state 与帧级 tap 观察口径
+                    # 互补，方言变体不应触发假截断）
                     upstream_done = bool(
-                        (getattr(winner, 'final_state', None) or {}).get(
-                            'saw_done', tap.saw_done))
+                        (getattr(winner, 'final_state', None) or {}).get('saw_done')
+                        or tap.saw_done)
                     stream_ok = bool(tap.finish_reason or upstream_done)
                     truncated_stream = not stream_ok
                 finally:
@@ -237,10 +239,10 @@ class AdminChatView(AdminRequiredMixin, APIView):
                 yield ('data: ' + json.dumps({'error': {'message': f'所有线路均失败: {exc}', 'type': 'api_error', 'param': None, 'code': 'upstream_error'}}) + '\n\n')
                 yield 'data: [DONE]\n\n'
             except Exception as exc:
-                if sent_content or done_sent:
+                if tap.sent_content or tap.saw_done:
                     log.duration_ms = round((_time.monotonic() - started) * 1000, 1)
                     await _safe_save()
-                    if not done_sent:
+                    if not tap.saw_done:
                         yield 'data: [DONE]\n\n'
                     return
                 is_stall = isinstance(exc, TimeoutError)

@@ -224,10 +224,23 @@ def _build_upstream_body(body: dict, model_name: str, channel=None,
     - 不要用白名单过滤未知字段——未来的官方参数会因此被静默丢弃
     - model 始终用真实模型名覆盖
 
+    extra_body 语义：[OI] SDK 的契约是"这些键直接放请求顶层"——整体
+    剥掉会连带丢失非思考键（top_k / logit_bias / 供应商私有参数）。
+    这里按 SDK 语义平铺：键与顶层同名时客户端显式顶层值优先，思考族
+    键仍走归一化通道（平铺先做、归一化后覆盖）。
+
     `thinking_params` 可传入已计算的归一化结果复用（调用方要为日志再算
     一次时避免二次全量扫描）。
     """
     upstream = {k: v for k, v in body.items() if k not in _DROP_FOR_UPSTREAM}
+    # extra_body 平铺（SDK 契约）；思考族键平铺进去后仍会被随后的
+    # 归一化产物覆盖，不影响 thinking 通道语义
+    extra = body.get("extra_body")
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            if k in upstream or k in ("model",):
+                continue  # 顶层显式值 / model 优先，不回退覆盖
+            upstream[k] = v
     # 思考参数归一化后下发（按渠道隔离）
     upstream.update(thinking_params if thinking_params is not None
                     else thinking.build_upstream(body, model_name, channel))
@@ -652,10 +665,14 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                     # 静默截断检测：流结束了，但既没有 finish_reason 也没有上游
                     # [DONE] —— 上游把流掐了（长连接被网关/代理切断的典型形态）。
                     # 绝不能伪装成成功：未发内容走换线重试，已发内容显式报错。
-                    # final_state 缺失（测试 monkeypatch lines()）时退回信任 tap.saw_done。
+                    # saw_done 双源取或：final_state（iter_sse 的行级观察，要求
+                    # "data: [DONE]" 带空格）与 tap.saw_done（帧级观察，无空格
+                    # 变体也认）任一为真即视为上游完整收尾——方言变体不应触发
+                    # 假截断报错；final_state 缺失（测试 monkeypatch lines()）
+                    # 时退回 tap 观察。
                     upstream_done = bool(
-                        (getattr(w, "final_state", None) or {}).get(
-                            "saw_done", tap.saw_done))
+                        (getattr(w, "final_state", None) or {}).get("saw_done")
+                        or tap.saw_done)
                     if not (tap.finish_reason or upstream_done):
                         truncated = True
                         if not tap.sent_content:

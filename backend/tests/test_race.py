@@ -136,8 +136,9 @@ class StreamRaceTests(TestCase):
                 await asyncio.sleep(delay)
                 if not ok:
                     return None, {"name": route.name, "error": "boom"}
-                # cm, req_cm, resp, aiter, first_line
-                return (None, None, None, None, 'data: {"choices":[{"delta":{"content":"h"}}]}'), None
+                # cm, req_cm, resp, aiter, first_line, prelude
+                return (None, None, None, None,
+                        'data: {"choices":[{"delta":{"content":"h"}}]}', []), None
             except asyncio.CancelledError:
                 cancelled[idx] = True
                 raise

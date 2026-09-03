@@ -330,13 +330,26 @@ class StreamReasoningDecryptor:
 
     @staticmethod
     def _mk_chunk(base: dict, field: str, text: str) -> str:
-        """合成一条**最小**的推理 chunk——只携带解密后的思考文本。
+        """基于模板合成一条推理 chunk：写入解密后的思考文本。
 
-        刻意不克隆模板里的其它字段（content/tool_calls 等）：否则占位符 chunk
-        会重复携带正文，客户端把同一句话渲染两遍。顶层 id/model 之类保留无妨，
-        但最小化最稳妥——下游只需推理文本本身。
+        零丢失语义：模板（base）里的**非冲突字段**全部保留（顶层 id/model/
+        usage、choice 层 finish_reason、delta 层 reasoning_details/refusal
+        等伴生字段不蒸发）；仅 delta 里的 content/tool_calls 信号字段剔除
+        ——那是历史事故（占位符 chunk 重复携带正文导致双渲染）的根因，
+        且正文类字段从来不该出现在"纯思考冲刷"帧里。
         """
-        out = {"choices": [{"delta": {field: text}}]}
+        out = json.loads(json.dumps(base, ensure_ascii=False))  # 深拷贝
+        choices = out.get("choices") or [{}]
+        ch = choices[0] if isinstance(choices[0], dict) else {}
+        delta = ch.get("delta")
+        delta = dict(delta) if isinstance(delta, dict) else {}
+        # 剔除正文类信号：思考冲刷帧不得携带正文（防双渲染）
+        for signal in ("content", "tool_calls"):
+            delta.pop(signal, None)
+        delta[field] = text
+        ch["delta"] = delta
+        choices[0] = ch
+        out["choices"] = choices
         return "data: " + json.dumps(out, ensure_ascii=False) + "\n\n"
 
     # -- 主流程 -------------------------------------------------------------

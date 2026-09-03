@@ -42,24 +42,29 @@ _ANTHROPIC_TO_STOP["refusal"] = "content_filter"
 # 请求体：Anthropic Messages -> 内部 chat
 # ---------------------------------------------------------------------------
 
-def _blocks_to_content(blocks) -> tuple[str, list, list, list]:
-    """把 Anthropic content 块解析成 (text, images, tool_calls, tool_results)。
+def _blocks_to_content(blocks) -> tuple[str, list, list, list, list]:
+    """把 Anthropic content 块解析成 (text, images, tool_calls, tool_results,
+    thinking_parts)。
 
     - text 块 -> 普通文本
     - image 块 -> chat image_url 列表项（转 data URI）
     - tool_use 块（assistant）-> chat tool_calls
     - tool_result 块（user）-> 单条 tool 消息
+    - thinking / redacted_thinking 块 -> chat reasoning_content（多轮
+      extended thinking 回路要求历史思考块原样回传，剥离会破坏
+      Anthropic 系上游的会话续写语义）
     """
     text_parts: list[str] = []
     images: list[dict] = []
     tool_calls: list[dict] = []
     tool_results: list[dict] = []
+    thinking_parts: list[str] = []
     if isinstance(blocks, str):
         text_parts.append(blocks)
-        return "".join(text_parts), images, tool_calls, tool_results
+        return "".join(text_parts), images, tool_calls, tool_results, thinking_parts
     if not isinstance(blocks, list):
         text_parts.append(str(blocks))
-        return "".join(text_parts), images, tool_calls, tool_results
+        return "".join(text_parts), images, tool_calls, tool_results, thinking_parts
     for part in blocks:
         if not isinstance(part, dict):
             continue
@@ -76,6 +81,13 @@ def _blocks_to_content(blocks) -> tuple[str, list, list, list]:
             elif src.get("type") == "url":
                 images.append({"type": "image_url",
                                "image_url": {"url": str(src.get("url") or "")}})
+        elif ptype == "thinking":
+            # 零丢失：明文思考块 -> reasoning_content（上游模型可见）
+            thinking_parts.append(str(part.get("thinking") or ""))
+        elif ptype == "redacted_thinking":
+            # 加密思考块：原样以密文形态进入 reasoning_content——
+            # 上游依赖它做会话续写，剥掉 = 思考历史断裂
+            thinking_parts.append(str(part.get("data") or ""))
         elif ptype == "tool_use":
             tool_calls.append({
                 "id": str(part.get("id") or ""),
@@ -89,12 +101,18 @@ def _blocks_to_content(blocks) -> tuple[str, list, list, list]:
             tool_results.append({
                 "tool_call_id": str(part.get("tool_use_id") or ""),
                 "content": _tool_result_text(part.get("content")),
+                "_raw_blocks": part.get("content")
+                if isinstance(part.get("content"), list) else None,
             })
-    return "".join(text_parts), images, tool_calls, tool_results
+    return ("".join(text_parts), images, tool_calls, tool_results, thinking_parts)
 
 
 def _tool_result_text(content) -> str:
-    """tool_result.content 可为字符串或 {type: text} 块数组。"""
+    """tool_result.content 可为字符串或 {type: text} 块数组。
+
+    零丢失/防乱码：非 text 块（图片等）以规范 JSON 文本降级保留——
+    旧实现 str(p) 产出 Python dict repr（单引号伪 JSON）发给模型。
+    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -102,6 +120,8 @@ def _tool_result_text(content) -> str:
         for p in content:
             if isinstance(p, dict) and p.get("type") == "text":
                 parts.append(str(p.get("text") or ""))
+            elif isinstance(p, dict):
+                parts.append(json.dumps(p, ensure_ascii=False))
             else:
                 parts.append(str(p))
         return "\n".join(parts)
@@ -127,7 +147,9 @@ def _tools_to_chat(tools) -> list | None:
 def _tool_choice_to_chat(tc) -> Any:
     """Anthropic tool_choice -> chat tool_choice。
 
-    auto -> auto；any -> required；tool + name -> 指定函数。
+    auto -> auto；any -> required；none -> none（禁用工具是明确意图，
+    旧实现兜底成 auto 会反向违背客户端意图）；tool + name -> 指定函数。
+    disable_parallel_tool_use 为 chat 协议无对应结构，暂不携带。
     """
     if not isinstance(tc, dict):
         return tc
@@ -137,6 +159,8 @@ def _tool_choice_to_chat(tc) -> Any:
                 "function": {"name": str(tc.get("name") or "")}}
     if ttype == "any":
         return "required"
+    if ttype == "none":
+        return "none"
     return "auto"
 
 
@@ -194,14 +218,28 @@ def messages_to_chat_body(body: dict) -> dict:
             if not isinstance(msg, dict):
                 continue
             role = str(msg.get("role") or "user")
-            text, images, tool_calls, tool_results = _blocks_to_content(msg.get("content"))
+            text, images, tool_calls, tool_results, thinking_parts = \
+                _blocks_to_content(msg.get("content"))
+            # 零丢失：thinking/redacted_thinking 块并入 reasoning_content，
+            # extended thinking 多轮回路依赖历史思考块原样可达上游
+            if thinking_parts:
+                out["reasoning_content"] = (out.get("reasoning_content") or "") \
+                    + "".join(thinking_parts)
             if role == "user" and tool_results:
                 # 一条 user 消息可以同时带正文与 tool_result 块（Claude Code 常
-                # 见：先说明意图再回传工具结果）。正文必须先落成一条 user 消息，
-                # 否则会被整体丢弃、模型看不到用户的说明。
-                if text.strip():
-                    messages.append({"role": "user", "content": text})
+                # 见：先说明意图再回传工具结果）。正文与图片都必须先落成
+                # user 消息，否则会被整体丢弃、模型看不到用户的内容。
+                if text.strip() or images:
+                    user_content: Any = text
+                    if images:
+                        user_content = []
+                        if text:
+                            user_content.append({"type": "text", "text": text})
+                        user_content.extend(images)
+                    messages.append({"role": "user", "content": user_content})
                 for tr in tool_results:
+                    tr = dict(tr)
+                    tr.pop("_raw_blocks", None)  # 内部字段不下发
                     messages.append({"role": "tool", **tr})
                 continue
             content: Any = text
@@ -408,9 +446,14 @@ async def iter_chat_sse_as_anthropic(chat_iter: AsyncIterator[str]) -> AsyncIter
             if data.get("error"):
                 # 严格客户端（Claude Code 等）要求 error 事件也必须处在完整的消息
                 # 生命周期内：先 message_start、最后 message_stop。缺失 start 会让
-                # 客户端在未收到 message_start 的情况下收到 error 而直接抛错。
+                # 客户端在未收到 message_start 的情况下收到 error 而直接抛错；
+                # 已打开的内容块必须先闭合，否则 message_stop 压在未闭合块上。
                 async for _e in emit_start():
                     yield _e
+                for idx, btype in opened:
+                    async for _e in close_block(idx, btype):
+                        yield _e
+                opened.clear()
                 yield _sse("error", {"type": "error", "error": data["error"]})
                 yield _sse("message_stop", {"type": "message_stop"})
                 done_sent = True
@@ -427,6 +470,13 @@ async def iter_chat_sse_as_anthropic(chat_iter: AsyncIterator[str]) -> AsyncIter
                 yield _e
             delta = ch.get("delta") or {}
             finish = ch.get("finish_reason")
+
+            if stop_reason is not None and not finish:
+                # 终结守卫生效期：finish 帧已过、[DONE] 未到（usage 尾帧窗口）。
+                # 异常上游在此窗口续发增量帧——不再开新块/发 delta
+                #（delta-after-stop 非法），按零丢失原样透传给客户端。
+                yield "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
+                continue
 
             reasoning = delta.get("reasoning_content")
             if reasoning:
@@ -487,14 +537,16 @@ async def iter_chat_sse_as_anthropic(chat_iter: AsyncIterator[str]) -> AsyncIter
                             "content_block": {"type": "tool_use",
                                               "id": iid, "name": name, "input": {}}})
                     else:
-                        # 回到已有工具块：若中间开了 text/thinking，先关闭
-                        # （协议要求串行；Anthropic 不允许重开已关闭的块，
-                        # 后续 delta 直接对工具块索引发）
+                        # 回到已有工具块：若中间开了 text/thinking，先关闭。
+                        # 该工具块此前已被 stop 过（无法重开），所以**不再**
+                        # 把它放回 opened——否则 finish_message 会再次对同
+                        # 一 index 发 content_block_stop（重复 stop 协议违
+                        # 约）。后续 delta 继续对工具块索引发（已知取舍：
+                        # Anthropic 串行协议下的最不坏形态）。
                         if opened and opened[-1][0] != entry["idx"]:
                             async for _e in close_block(*opened[-1]):
                                 yield _e
                             opened.clear()
-                            opened.append((entry["idx"], "tool_use"))
                         if iid and not entry["id"]:
                             entry["id"] = iid
                         if name and not entry["name"]:
@@ -505,8 +557,9 @@ async def iter_chat_sse_as_anthropic(chat_iter: AsyncIterator[str]) -> AsyncIter
                             "type": "content_block_delta", "index": entry["idx"],
                             "delta": {"type": "input_json_delta", "partial_json": args}})
             if finish:
-                # 关闭当前所有块并记录 stop_reason；message_delta/message_stop
-                # 延迟到 [DONE] / 流结束——usage 尾帧在 finish 之后才到
+                # 终结守卫：首个 finish 帧才关块/记 stop_reason（重复 finish
+                # 帧忽略）；message_delta/message_stop 延迟到 [DONE] / 流结束
+                # ——usage 尾帧在 finish 之后才到
                 for idx, btype in opened:
                     async for _e in close_block(idx, btype):
                         yield _e

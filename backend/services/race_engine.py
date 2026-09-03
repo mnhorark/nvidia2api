@@ -398,6 +398,10 @@ async def _stream_first_valid(route: Route, body: dict):
                 error=f"{typ}: {err_detail}" if err_detail else typ,
                 http_status=resp.status_code)
         first_line: str | None = None
+        # 竞速 prelude：判胜首帧之前消费掉的所有非空行（usage 预告帧、
+        # 心跳注释、event: 行、上游自定义事件）。零丢失原则：这些字节
+        # 是上游真实发出的，胜者确定后必须按原序重放，不得蒸发。
+        prelude: list[str] = []
         ait = resp.aiter_lines()
         first_byte_timeout = float(
             sysconfig.get("stream_first_byte_timeout", route.key.channel) or 0)
@@ -428,9 +432,12 @@ async def _stream_first_valid(route: Route, body: dict):
                     if responses_api.parse_stream_event(line) is not None:
                         first_line = line
                         break
+                    prelude.append(line)
+                    continue
                 elif is_valid_stream_chunk(line) is not None:
                     first_line = line
                     break
+                prelude.append(line)
                 # 非内容 data 行分两类，不能一律判死线路：
                 # - 裸 `data: [DONE]`：上游立即结束且无内容 -> empty_stream（可换线重试）
                 # - 空 delta 心跳 / 纯 role 标记：线路还在，继续等真实内容
@@ -451,7 +458,7 @@ async def _stream_first_valid(route: Route, body: dict):
                         await cm.__aexit__(None, None, None)
                         return None, route_info(route, "failed", error="invalid_response",
                                                 http_status=200)
-                    # 其余（心跳等）继续读取下一行
+                    # 其余（心跳/usage 预告等）已入 prelude，继续读取下一行
         except StopAsyncIteration:
             pass
         if first_line is None:
@@ -461,7 +468,7 @@ async def _stream_first_valid(route: Route, body: dict):
             return None, route_info(route, "failed", error="empty_stream",
                                     http_status=200)
         await _mark_success(route)
-        return (cm, req_cm, resp, ait, first_line), None
+        return (cm, req_cm, resp, ait, first_line, prelude), None
     except asyncio.CancelledError:
         await cm.__aexit__(None, None, None)
         raise
@@ -528,7 +535,7 @@ async def race_stream_winner(routes: list[Route], body: dict):
                             continue
                         if ores is None:
                             continue
-                        _ocm, oreq, _oresp, _oait, _ofirst = ores
+                        _ocm, oreq, _oresp, _oait, _ofirst, _oprelude = ores
                         try:
                             await oreq.__aexit__(None, None, None)
                             await _ocm.__aexit__(None, None, None)
@@ -541,8 +548,9 @@ async def race_stream_winner(routes: list[Route], body: dict):
                         report.append(route_info(
                             tasks[p], "cancelled",
                             (_time.monotonic() - t0) * 1000, "winner decided"))
-                    cm, req_cm, resp, ait, first_line = res
-                    return winner_route, cm, req_cm, resp, ait, first_line, report
+                    cm, req_cm, resp, ait, first_line, prelude = res
+                    return (winner_route, cm, req_cm, resp, ait, first_line,
+                            prelude, report)
                 if fail_info:
                     report.append(fail_info)
                 n_failed += 1
@@ -580,7 +588,9 @@ async def iter_sse(first_line: str, aiter, include_first: bool = True,
     async for line in aiter:
         if not line.strip():
             continue
-        if line.strip() == "data: [DONE]":
+        # 终结帧兼容两种空格形态（"data: [DONE]" / "data:[DONE]"），
+        # 与 StreamTap 的帧级观察口径一致
+        if line.startswith("data:") and line[5:].strip() == "[DONE]":
             saw_done = True
         yield line + "\n\n"
     if state is not None:
@@ -598,10 +608,20 @@ class StreamWinner:
     # lines() 消费完毕后写入：上游是否真正发出了 [DONE]。
     # False = 上游静默断流（无 [DONE]），调用方须按截断处理而非成功。
     final_state: dict = None  # type: ignore[assignment]
+    # 竞速 prelude：判胜首帧之前上游已发出的行（usage 预告帧、心跳注释、
+    # 自定义事件）。lines() 开头按原序重放——零丢失原则。
+    prelude: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self):
         if self.final_state is None:
             self.final_state = {}
+        if self.prelude is None:
+            self.prelude = []
+
+    async def _replay_prelude(self) -> AsyncIterator[str]:
+        """重放竞速窗口期消费掉的 prelude 行。"""
+        for line in self.prelude:
+            yield line + "\n\n"
 
     async def lines(self) -> AsyncIterator[str]:
         # 兼容规整器总开关（渠道隔离，SystemSetting 配置，默认开启）：
@@ -616,40 +636,54 @@ class StreamWinner:
         ).strip().lower() != "off"
         # 工具调用流规整：放置于解密/协议转换之后、下发客户端之前——
         # 上游（muse/zen 等）可能发乱序 tool_calls（换 id + 全参重复），
-        # OpenAI SDK 按 index 累加参数会得到非法 JSON。
+        # [OI] SDK 按 index 累加参数会得到非法 JSON。
         tc_norm = ToolCallStreamNormalizer()
         if responses_api.is_responses_url(_route_url(self.route)):
             if not compat:
+                async for chunk in self._replay_prelude():
+                    yield chunk
                 async for chunk in responses_api.iter_responses_sse(
                         self.first_line, self.aiter, done_state=self.final_state):
                     yield chunk
                 return
             async for chunk in responses_api.iter_responses_sse(
-                    self.first_line, self.aiter, done_state=self.final_state):
+                    self.first_line, self.aiter, done_state=self.final_state,
+                    prelude=self.prelude):
                 # Responses 链路的 reasoning 已在 iter_responses_sse 内由 _reasoning_text 解密
                 # 额外的 SSE chunk 解密（处理 Kilo/OpenRouter 加密 reasoning）
                 for out in tc_norm.feed(decrypt_sse_chunk(chunk)):
                     yield out
         else:
             if not compat:
+                async for chunk in self._replay_prelude():
+                    yield chunk
                 async for chunk in iter_sse(self.first_line, self.aiter,
                                             state=self.final_state):
                     yield chunk
                 return
             decryptor = StreamReasoningDecryptor()
             try:
+                async for chunk in self._replay_prelude():
+                    for out in decryptor.feed(chunk):
+                        for fixed in tc_norm.feed(out):
+                            yield fixed
                 async for chunk in iter_sse(self.first_line, self.aiter,
                                             state=self.final_state):
                     # 有状态解密：跨 chunk 分片的 Fernet token 缓冲凑齐后一次解密；
-                    # 无法解密的密文输出占位符，不再把乱码怼给客户端。
+                    # 解不开的密文原样透传（零丢失）。
                     for out in decryptor.feed(chunk):
                         for fixed in tc_norm.feed(out):
                             yield fixed
             finally:
-                # 异常收尾（客户端断开/上游暴毙）也冲刷残留缓冲
-                for out in decryptor.finalize():
-                    for fixed in tc_norm.feed(out):
-                        yield fixed
+                # 异常收尾（上游暴毙）也冲刷残留缓冲。客户端断开时
+                # GeneratorExit 已进入本生成器，任何 yield 都会触发
+                # RuntimeError——静默跳过即可（客户端已不在，冲刷无处投递）。
+                try:
+                    for out in decryptor.finalize():
+                        for fixed in tc_norm.feed(out):
+                            yield fixed
+                except RuntimeError:
+                    pass  # GeneratorExit 期间不可再 yield
 
     async def close(self):
         try:
@@ -663,6 +697,7 @@ class StreamWinner:
 
 
 async def race_stream(routes: list[Route], body: dict) -> StreamWinner:
-    route, cm, req_cm, resp, ait, first_line, report = await race_stream_winner(routes, body)
-    return StreamWinner(route=route, cm=cm, req_cm=req_cm, aiter=ait, first_line=first_line,
-                        report=report)
+    route, cm, req_cm, resp, ait, first_line, prelude, report = \
+        await race_stream_winner(routes, body)
+    return StreamWinner(route=route, cm=cm, req_cm=req_cm, aiter=ait,
+                        first_line=first_line, report=report, prelude=prelude)
