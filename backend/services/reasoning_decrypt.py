@@ -146,12 +146,12 @@ def decrypt_chat_message(message: dict) -> bool:
                 if dec is not None:
                     message[key] = dec
                     changed = True
-                # gAAAA 但解不开 = 密钥不对，保持原样交给上层（可能仅作回传元数据）
+                # gAAAA 但解不开 = 密钥不对，保持原样（零丢失：客户端
+                # 可原样保存并回传上游做会话续写）
                 continue
-            if _looks_like_opaque_blob(val):
-                # 非 Fernet 形态的不透明密文：直接替换占位符，别把乱码怼给客户端
-                message[key] = ENCRYPTED_PLACEHOLDER
-                changed = True
+            # 非 Fernet 形态的不透明密文：**原样保留**（零丢失原则）。
+            # 旧实现替换占位符 = 静默丢弃上游字节；密文是否有展示价值
+            # 由客户端裁决（RikkaHub/OpenRouter 客户端均原样保存回传）。
         elif isinstance(val, dict):
             for nested_key in ("effort", "content", "text"):
                 nested_val = val.get(nested_key)
@@ -312,7 +312,11 @@ class StreamReasoningDecryptor:
     # -- 内部工具 -----------------------------------------------------------
 
     def _flush_reason(self, sent_len: int | None = None) -> str:
-        """把缓冲的分片拼起来尝试解密，返回要下发的文本。"""
+        """把缓冲的分片拼起来尝试解密，返回要下发的文本。
+
+        零丢失原则：解不开（密钥不对 / 非 Fernet）返回**原始密文**，
+        绝不替换占位符——旧实现这里静默丢弃了上游字节。
+        """
         blob = "".join(self._frags)
         self._frags = []
         if not blob:
@@ -320,10 +324,9 @@ class StreamReasoningDecryptor:
         dec = decrypt_token(blob)
         if dec is not None:
             return dec
-        # token 形态正确但密钥不对，或根本不是 Fernet：给占位符
-        logger.warning("reasoning buffer undecryptable (%d chars), placeholder emitted",
-                       len(blob))
-        return ENCRYPTED_PLACEHOLDER
+        logger.warning("reasoning buffer undecryptable (%d chars), "
+                       "passing through verbatim", len(blob))
+        return blob
 
     @staticmethod
     def _mk_chunk(base: dict, field: str, text: str) -> str:
@@ -388,10 +391,13 @@ class StreamReasoningDecryptor:
                 if len(blob) > self.MAX_BUFFER:
                     return [self._mk_chunk(data2, self._field, self._flush_reason())]
                 return []  # 还没凑齐，续等
-            # 该 chunk 带正文/结束信号：先冲刷缓冲为占位符，再放行正文。
-            # 注意：pre 里还带着这片的密文碎片，必须先剥掉再放行，
-            # 否则一条密文碎片会混着正文泄漏给客户端。
+            # 该 chunk 带正文/结束信号：把当前密文碎片并入缓冲后一并冲刷
+            # （零丢失：绝不能把本片的密文剥掉丢弃），再放行正文。
+            # 占位符模板必须**干净**（不含本 chunk 的 content/tool_calls）：
+            # 正文由 stripped 单独下发，否则占位符 chunk 里混带正文，客户端
+            # 会看到先正文后思考的乱序。
             if frag is not None:
+                self._frags.append(frag)
                 delta.pop(field, None)
             # 占位符模板必须**干净**（不含本 chunk 的 content/tool_calls）：
             # 正文由 stripped 单独下发，否则占位符 chunk 里混带正文，客户端
@@ -422,8 +428,8 @@ class StreamReasoningDecryptor:
                 return [rest]
             return []
         if _looks_like_opaque_blob(frag):
-            delta[field] = ENCRYPTED_PLACEHOLDER
-            return ["data: " + json.dumps(data2, ensure_ascii=False) + "\n\n"]
+            # 零丢失原则：不透明密文原样放行，不替换占位符
+            pass
         return [pre]
 
     def _emit_pending_then(self, tail: str, template: dict | None = None) -> list[str]:

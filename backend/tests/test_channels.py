@@ -1230,8 +1230,12 @@ class MuseReasoningDefaultSummaryTests(TestCase):
             "messages": [{"role": "user", "content": "hi"}]})
         self.assertNotIn("reasoning", out)
 
-    def test_done_event_blob_not_emitted(self):
-        """done 事件里的密文（非 Fernet）不得怼给客户端。"""
+    def test_done_event_blob_passes_through(self):
+        """零丢失契约：done 事件里的密文（非 Fernet）原样透传，不丢弃。
+
+        旧契约是静默丢弃（防乱码）；零丢失原则下密文原样下发，
+        客户端可保存回传上游做会话续写。
+        """
         from services.responses_api import _translate_event
         import json as _json
         blob = "Q-PaDg" + "X7" * 400
@@ -1240,7 +1244,8 @@ class MuseReasoningDefaultSummaryTests(TestCase):
             "item": {"type": "reasoning", "encrypted_content": blob,
                      "summary": []}}) + "\n\n"
         out = _translate_event(raw, {})
-        self.assertIsNone(out)
+        self.assertIsNotNone(out)
+        self.assertIn(blob, out)
 
     def test_done_event_no_duplicate_when_streamed(self):
         """summary 增量已流式下发过，done 不再重复整段。"""

@@ -324,3 +324,47 @@ class IterSsePassthroughTests(TestCase):
         chunks, state = asyncio.run(run())
         self.assertNotIn("data: [DONE]", "".join(chunks))
         self.assertIs(state["saw_done"], False)
+
+
+class ZeroLossContractTests(TestCase):
+    """零丢失契约：上游发出的任何字节都不允许被静默丢弃。
+
+    盘查过的历史丢弃点（2026-09 零丢失审查全部修复）：
+    - iter_sse: 不丢行、不伪造 [DONE]
+    - iter_responses_sse: 未知事件/注释行原样透传
+    - 密文思考：解得开给明文，解不开原样透传（绝不占位符/丢弃）
+    """
+
+    def test_unrecognized_response_event_passes_through(self):
+        """Responses 上游的未来新事件类型 / 自定义事件不丢失。"""
+
+        async def src():
+            yield 'data: {"type":"response.custom.future_event","x":1}\n\n'
+            yield 'data: {"type":"response.output_text.delta","delta":"hi"}\n\n'
+            yield 'data: [DONE]\n\n'
+
+        out = "".join(_collect(responses_api.iter_responses_sse(
+            'data: {"type":"response.created","response":{}}', src())))
+        # 未识别事件原样透传（保真字节），被识别事件照常翻译成 chat 格式
+        self.assertIn("response.custom.future_event", out)
+        self.assertIn('"content": "hi"', out)
+
+    def test_response_comment_line_passes_through(self):
+        """Responses 上游的 SSE 注释行（保活）不丢失。"""
+
+        async def src():
+            yield ": upstream-keepalive\n\n"
+            yield 'data: {"type":"response.output_text.delta","delta":"x"}\n\n'
+            yield 'data: [DONE]\n\n'
+
+        out = "".join(_collect(responses_api.iter_responses_sse("", src(),
+                                                                include_first=False)))
+        self.assertIn(": upstream-keepalive", out)
+
+    def test_undecryptable_ciphertext_never_dropped(self):
+        """解不开的思考密文：非流式 message 原样保留（不占位、不剥离）。"""
+        from services.reasoning_decrypt import decrypt_chat_message
+        blob = "43e3da0e" + "A" * 300   # 非 Fernet 不透明密文
+        msg = {"reasoning_content": blob, "content": "答"}
+        decrypt_chat_message(msg)
+        self.assertEqual(msg["reasoning_content"], blob)

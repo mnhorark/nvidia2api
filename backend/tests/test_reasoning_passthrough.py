@@ -403,15 +403,19 @@ class StreamReasoningDecryptorTests(TestCase):
         self.assertIn("完整思考内容 should not leak as ciphertext", text)
         self.assertNotIn("gAAAA", text)
 
-    def test_opaque_blob_replaced_with_placeholder(self):
-        from services.reasoning_decrypt import (
-            ENCRYPTED_PLACEHOLDER, StreamReasoningDecryptor)
+    def test_opaque_blob_passes_through_verbatim(self):
+        """零丢失契约：不透明密文原样透传，不再替换占位符。
+
+        旧契约是替换占位符（防乱码怼脸）；零丢失原则下客户端
+        （RikkaHub/OpenRouter）需要原密文做会话回传，展示裁决权在客户端。
+        """
+        from services.reasoning_decrypt import StreamReasoningDecryptor
         blob = "Q-PaDg" + "X7" * 600  # 无 gAAAA 前缀的长 base64url 串
         d = StreamReasoningDecryptor()
         out = d.feed(self._mk_chunk("reasoning_content", blob))
         self.assertEqual(len(out), 1)
-        self.assertIn(ENCRYPTED_PLACEHOLDER, out[0])
-        self.assertNotIn("Q-PaDg", out[0])
+        self.assertIn(blob, out[0])
+        self.assertNotIn("[思考内容已加密", out[0])
 
     def test_plaintext_reasoning_passes_through(self):
         from services.reasoning_decrypt import StreamReasoningDecryptor
@@ -421,8 +425,7 @@ class StreamReasoningDecryptorTests(TestCase):
         self.assertIn("正常的明文思考", out[0])
 
     def test_buffer_flushed_before_content(self):
-        from services.reasoning_decrypt import (
-            ENCRYPTED_PLACEHOLDER, StreamReasoningDecryptor)
+        from services.reasoning_decrypt import StreamReasoningDecryptor
         d = StreamReasoningDecryptor()
         # 先用错误密钥造不可解密但带 gAAAA 前缀的首片
         from cryptography.fernet import Fernet
@@ -431,28 +434,32 @@ class StreamReasoningDecryptorTests(TestCase):
         half = len(bad) // 2
         outs = d.feed(self._mk_chunk("reasoning_content", bad[:half]))
         self.assertEqual(outs, [])  # 缓冲中
-        # 正文到达：必须先冲刷缓冲（占位符），再放行正文
+        # 正文到达：必须先冲刷缓冲（解不开则原样透传整段密文），再放行正文
         outs = d.feed(self._mk_chunk("reasoning_content", bad[half:], content="正文"))
         text = "".join(outs)
-        self.assertIn(ENCRYPTED_PLACEHOLDER, text)
+        # 零丢失：不可解密的密文**原样**出现在冲刷 chunk 里（不是占位符）
+        self.assertIn(bad, text)
         self.assertIn("正文", text)
-        # 占位符 chunk 出现在正文 chunk 之前
-        self.assertLess(text.index(ENCRYPTED_PLACEHOLDER), text.index("正文"))
-        # 任何下发给客户端的 chunk 都不得携带密文碎片（gAAAA 前缀）
-        for c in outs:
-            self.assertNotIn("gAAAA", c)
+        self.assertNotIn("[思考内容已加密", text)
+        # 冲刷 chunk 出现在正文之前
+        self.assertLess(text.index(bad), text.index("正文"))
 
     def test_finalize_flushes_leftover_at_stream_end(self):
-        from services.reasoning_decrypt import (
-            ENCRYPTED_PLACEHOLDER, StreamReasoningDecryptor)
+        from services.reasoning_decrypt import StreamReasoningDecryptor
         from cryptography.fernet import Fernet
         bad = Fernet(Fernet.generate_key()).encrypt("x".encode()).decode()
         d = StreamReasoningDecryptor()
+        # 密文被切成两片流入（跨 chunk 分片场景）
         d.feed(self._mk_chunk("reasoning_content", bad[: len(bad) // 2]))
+        out = d.feed(self._mk_chunk("reasoning_content", bad[len(bad) // 2:]))
+        # 两片凑齐但解不开（密钥不对）：缓冲续等
+        self.assertEqual(out, [])
         out = d.feed("data: [DONE]\n\n")
         text = "".join(out)
-        self.assertIn(ENCRYPTED_PLACEHOLDER, text)
+        # 零丢失：凑齐后解不开 → 原样透传完整密文（不是占位符、不是半截）
+        self.assertIn(bad, text)
         self.assertIn("[DONE]", text)
+        self.assertNotIn("[思考内容已加密", text)
 
     def test_no_regression_for_kilo_nested_reasoning(self):
         from services.reasoning_decrypt import StreamReasoningDecryptor

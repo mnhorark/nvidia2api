@@ -345,12 +345,10 @@ def _reasoning_text(item: dict) -> str:
                 return dec
         except Exception:
             pass
-        # 上游自有封装的密文（非 Fernet / 密钥不在本端）：它仅供多轮回传，
-        # 没有展示价值，不再原样返回给客户端。
-        from services.reasoning_decrypt import _looks_like_opaque_blob
-        if _looks_like_opaque_blob(enc):
-            logger.debug("encrypted_content 不可解密（%d chars），跳过展示", len(enc))
-            return ""
+        # 零丢失原则：解不开（密钥不在本端 / 非 Fernet 自有封装）也
+        # **原样透传**——它仅供多轮回传（RikkaHub 的
+        # OpenAIReasoningMetadata 同样原样保存），丢弃会破坏上游会话
+        # 续写回路。展示价值交给客户端自行裁决。
         return enc
     return ""
 
@@ -819,15 +817,9 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
                             text = dec
                     except Exception:
                         pass
-                # 密文无法解密时（上游自有封装，如 zen/muse-spark 的
-                # 43e3da0e 头 blob，客户端不可能解开——RikkaHub/opencode 同样
-                # 只保存不解密）不再把乱码块怼给客户端，直接静默跳过；
-                # 明文 summary 已经在增量事件里给过了。
-                from services.reasoning_decrypt import _looks_like_opaque_blob
-                if _looks_like_opaque_blob(text):
-                    logger.debug("done 事件携带无法解密的思考密文（%d chars），已跳过展示",
-                                 len(text))
-                    return None
+                # 零丢失原则：解不开的思考密文原样透传，绝不静默丢弃——
+                # 客户端（RikkaHub/opencode）可原样保存并在下轮回传，
+                # 上游会话续写依赖它。
                 return json.dumps({"choices": [{"index": 0,
                                                 "delta": {"reasoning_content": text},
                                                 "finish_reason": None}]})
@@ -881,18 +873,26 @@ async def iter_responses_sse(first_line: str, aiter,
             return
         if translated:
             yield "data: " + translated + "\n\n"
+        else:
+            # 零丢失原则：首帧是未知/无关事件时原样透传，不静默丢弃
+            # （Responses 上游的 event: 行 / 自定义事件对客户端仍可能有意义）
+            yield first_line + "\n\n"
     saw_done = False
     async for line in aiter:
         if not line.strip():
             continue
-        translated = _translate_event(line, state)
-        if translated is None:
-            continue
-        if translated == "[DONE]":
+        if line.strip() == "data: [DONE]":
             saw_done = True
             yield "data: [DONE]\n\n"
-        else:
+            continue
+        translated = _translate_event(line, state)
+        if translated is not None:
             yield "data: " + translated + "\n\n"
+        else:
+            # 零丢失原则：未识别的 Responses 事件（未来新增类型 /
+            # response.custom.* / 注释行）原样透传。旧实现静默丢弃，
+            # Responses 上游自己的保活注释也会因此丢失。
+            yield line + "\n\n"
     if done_state is not None:
         done_state["saw_done"] = saw_done
 
