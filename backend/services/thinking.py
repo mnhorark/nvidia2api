@@ -110,6 +110,16 @@ class ThinkingCapability:
     # budget 意图（显式预算或 effort 档位换算）会同步写入
     # chat_template_kwargs[<budget_kwarg>]，与顶层字段双通道并存。
     budget_kwarg: str | None = None
+    # effort 与 budget 互斥（qwen3.8-flash 特有约束：reasoning_effort 与
+    # thinking_budget 同发整包 400）。True 时二者只发其一：预算意图
+    # 归一到 effort 档位下发，effort 意图不再换算注入模板变量。
+    effort_budget_exclusive: bool = False
+    # 模型专属 预算->档位 换算表（qwen3.8-flash 官方口径：
+    # 0-4096->low / 4097-16384->medium / 16385-262144->xhigh），
+    # 形如 ((上限, 档位), ...)，升序，首达即归档。设置后优先于
+    # 通用 budget_to_effort 换算（通用表是 Anthropic/CLAUDE 锚点，
+    # 与 qwen 官方换算完全不同）。
+    budget_effort_tiers: tuple[tuple[int, str], ...] = ()
 
 
 _THINKING_CAPABILITIES: list[tuple[str, ThinkingCapability]] = [
@@ -129,12 +139,30 @@ _THINKING_CAPABILITIES: list[tuple[str, ThinkingCapability]] = [
     ("glm", ThinkingCapability(
         toggle_keys=("enable_thinking",), effort_key="reasoning_effort",
         effort_values=("low", "high", "max"))),
-    ("qwen", ThinkingCapability(toggle_keys=("enable_thinking",))),
-    ("gemma", ThinkingCapability(toggle_keys=("enable_thinking",))),
+    ("qwen", ThinkingCapability(
+        toggle_keys=("enable_thinking",),
+        # qwen3.8-flash 实测词表（2026-09 线上 400 实证）：仅认
+        # xhigh/medium/low（服务端默认 xhigh）；high/max 经 _clamp_effort
+        # 归一到 xhigh，minimal 归到 low。通用档 high 不在词表，
+        # 原样下发会整包 400（req_68ec7675 案）。
+        # 注意 default_effort 保持 None：qwen 是开关驱动模型，客户端
+        # 只开 enable_thinking 时不发明档位（上游默认即 xhigh）。
+        effort_key="reasoning_effort",
+        effort_values=("low", "medium", "xhigh"),
+        # qwen3.8-flash 互斥约束：reasoning_effort 与 thinking_budget
+        # 不能同时下发（400），预算意图经官方换算表归到档位：
+        # 0-4096->low / 4097-16384->medium / 16385-262144->xhigh。
+        effort_budget_exclusive=True,
+        budget_effort_tiers=((4096, "low"), (16384, "medium"),
+                             (262144, "xhigh")),
+    )),
+    ("gemma", ThinkingCapability(toggle_keys=("enable_thinking",),
+                                 effort_key=None)),
     ("minimax", ThinkingCapability(
         toggle_keys=("thinking",), effort_key="reasoning_effort",
         effort_values=("low", "medium", "high"))),
-    ("step", ThinkingCapability(toggle_keys=("enable_thinking",))),
+    ("step", ThinkingCapability(toggle_keys=("enable_thinking",),
+                                effort_key=None)),
     ("doubao", ThinkingCapability(
         effort_key="reasoning_effort", effort_values=("minimal", "low", "medium", "high"),
         default_effort="medium")),
@@ -192,14 +220,22 @@ def effort_to_budget(effort: str | None) -> int | None:
     return None
 
 
-def budget_to_effort(budget: int | None) -> str | None:
-    """预算 token -> 最近档位（目标渠道只认档位形态时使用）。
+def budget_to_effort(budget: int | None, tiers=None) -> str | None:
+    """预算 token -> 档位（目标渠道只认档位形态时使用）。
 
-    用"离哪档最近"归档（而不是首个天花板 >= 预算）：预算 20000 离
-    high(16384) 比离 xhigh(32768) 近得多，向上归档会近似双倍预算。
+    `tiers` 为模型专属换算表时按"首个天花板 >= 预算"归档（区间语义，
+    如 qwen3.8-flash 官方口径 0-4096->low / 4097-16384->medium /
+    16385-262144->xhigh）；缺省用通用表并按"离哪档最近"归档（预算
+    20000 离 high(16384) 比离 xhigh(32768) 近得多，向上归档会近似
+    双倍预算）。
     """
     if budget is None or budget <= 0:
         return "off"
+    if tiers:
+        for ceiling, name in tiers:
+            if budget <= ceiling:
+                return name
+        return tiers[-1][1]
     tiers = _EFFORT_BUDGET_TIERS
     best_name, best_dist = tiers[-1][0], abs(budget - tiers[-1][1])
     for name, tokens in tiers:
@@ -588,22 +624,42 @@ def to_upstream(spec: ThinkingSpec, model_name: str = "", channel=None) -> dict:
 
     if cap.effort_key:
         effort = spec.effort
-        if effort is None and spec.enabled is True and spec.budget is None:
+        # 开关意图（只开了 enable_thinking/thinking，无档位无预算）是否
+        # 值得注入默认档位：仅对"档位驱动"的模型成立（default_effort
+        # 显式声明，或无开关通道的 always-on 模型）——注入默认档是它们
+        # 的"开启"表达；对开关驱动的模型（qwen/gemma/step，靠
+        # chat_template_kwargs 开关表达意图），客户端没要档位就不该
+        # 发明档位：qwen3.8-flash 词表特殊（xhigh/medium/low），注入的
+        # 默认档 high 不在词表直接整包 400（req_68ec7675 案），上游本
+        # 就以开关为准。
+        inject_default = (cap.default_effort is not None
+                          or not cap.toggle_keys)
+        if effort is None and spec.enabled is True and spec.budget is None \
+                and inject_default:
             effort = cap.default_effort or _default_effort(channel)
-        # 预算意图在"只认档位"的渠道上回落为最近档位（预算档位表反向翻译）
+        # 预算意图在"只认档位"的渠道上回落为最近档位（预算档位表反向翻译；
+        # 模型有专属换算表时用官方区间语义）
         if effort is None and spec.budget is not None and not cap.supports_budget:
-            effort = budget_to_effort(spec.budget)
+            effort = budget_to_effort(spec.budget, cap.budget_effort_tiers)
+        # effort/budget 互斥渠道（qwen3.8-flash）：预算意图整体归到档位
+        # 通道，避免两个互斥字段同时出现整包 400
+        if effort is None and spec.budget is not None \
+                and cap.effort_budget_exclusive:
+            effort = budget_to_effort(spec.budget, cap.budget_effort_tiers)
         if effort:
             eff = _clamp_effort(effort, cap.effort_values)
             if eff:
                 out[cap.effort_key] = eff
-    if spec.budget is not None and cap.supports_budget:
+    if spec.budget is not None and cap.supports_budget \
+            and not cap.effort_budget_exclusive:
         out["reasoning_budget"] = spec.budget
 
     # budget_kwarg 双通道：把预算意图（显式预算，或档位经换算表合成）
     # 同步写进 chat_template_kwargs——vLLM 系上游只认模板变量，
     # 顶层字段会被静默忽略（zen muse 实测）。
-    if cap.budget_kwarg:
+    # 互斥渠道例外：effort 档位已在顶层下发时**不再**注入模板变量，
+    # 否则 reasoning_effort + thinking_budget 同发（qwen3.8-flash 400）。
+    if cap.budget_kwarg and not cap.effort_budget_exclusive:
         tokens = spec.budget
         if tokens is None and spec.effort:
             tokens = effort_to_budget(spec.effort)

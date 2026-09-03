@@ -402,3 +402,53 @@ class R14_EffortVocabularyTests(TestCase):
             tok = effort_to_budget(eff)
             self.assertIsNotNone(tok, eff)
             self.assertEqual(budget_to_effort(tok), eff)
+
+
+class Qwen38FlashVocabularyTests(TestCase):
+    """qwen3.8-flash 官方档位约束回归（2026-09 线上 400 实证，
+    req_68ec7675 案）。
+
+    上游仅认 xhigh/medium/low（服务端默认 xhigh），且 reasoning_effort
+    与 thinking_budget 互斥。旧实现：qwen capability 无词表（沿用通用
+    low/medium/high/max），开关意图被注入默认档 high —— 不在词表，
+    全线路整包 400。
+    """
+
+    MODEL = "qwen/qwen3.8-flash"
+
+    def test_toggle_intent_does_not_invent_effort(self):
+        # 客户端只开 enable_thinking：不得发明档位（上游默认即 xhigh）
+        out = to_upstream(parse({"enable_thinking": True}), self.MODEL)
+        self.assertEqual(out, {"chat_template_kwargs": {"enable_thinking": True}})
+        out = to_upstream(parse({"enable_thinking": False}), self.MODEL)
+        self.assertEqual(out, {"chat_template_kwargs": {"enable_thinking": False}})
+
+    def test_effort_clamped_to_official_vocabulary(self):
+        # max/high → xhigh（官方兼容映射）；minimal → low；合法值原样
+        for src, want in [("max", "xhigh"), ("high", "xhigh"),
+                          ("xhigh", "xhigh"), ("medium", "medium"),
+                          ("low", "low"), ("minimal", "low")]:
+            out = to_upstream(parse({"reasoning_effort": src}), self.MODEL)
+            self.assertEqual(out.get("reasoning_effort"), want, src)
+            # 互斥：effort 通道下发时不得再带 thinking_budget
+            self.assertNotIn("thinking_budget",
+                             out.get("chat_template_kwargs", {}), src)
+
+    def test_budget_translates_via_official_tiers(self):
+        # 官方区间语义：0-4096->low / 4097-16384->medium / 16385-262144->xhigh
+        for budget, want in [(4096, "low"), (4097, "medium"),
+                             (16384, "medium"), (16385, "xhigh"),
+                             (262144, "xhigh"), (300000, "xhigh")]:
+            out = to_upstream(parse({"reasoning_budget": budget}), self.MODEL)
+            self.assertEqual(out.get("reasoning_effort"), want, budget)
+            self.assertNotIn("reasoning_budget", out, budget)
+
+    def test_older_qwen_models_keep_toggle_only(self):
+        # 老 qwen 模型（词表未知）：维持开关直传，不注入档位
+        out = to_upstream(parse({"enable_thinking": True}), "qwen/qwen3-235b-a22b")
+        self.assertEqual(out, {"chat_template_kwargs": {"enable_thinking": True}})
+
+    def test_effort_driven_models_keep_default_injection(self):
+        # 档位驱动模型（kimi-k3）开关意图仍注入默认档——不受本次修复影响
+        out = to_upstream(parse({"reasoning": True}), "moonshotai/kimi-k3")
+        self.assertEqual(out.get("reasoning_effort"), "max")
