@@ -58,19 +58,39 @@ _KWARG_BUDGET_KEYS = ("reasoning_budget", "thinking_budget")
 _TOP_SWITCH_KEYS = ("thinking", "enable_thinking")
 _TOP_BUDGET_KEYS = ("reasoning_budget", "thinking_budget")
 
-# 客户端写法 -> NVIDIA 档位
+# 客户端写法 -> 内部档位。
+# 内部档位对齐 OpenRouter reasoning.effort 的完整梯度（2026-09 文档）：
+#   none < minimal < low < medium < high < xhigh < max
+# （off 是"显式关闭"的语义标记，parse() 中折算为 enabled=False）
 _EFFORT_ALIASES = {
     "none": "off", "off": "off", "disable": "off", "disabled": "off",
     "false": "off", "0": "off",
-    "minimal": "low", "auto": "low", "low": "low",
+    "minimal": "minimal", "min": "minimal", "tiny": "minimal",
+    "auto": "low", "low": "low",
     "balanced": "medium", "default": "medium", "medium": "medium",
     "high": "high",
-    "max": "max", "maximum": "max", "ultra": "max", "xhigh": "max",
+    "xhigh": "xhigh", "x-high": "xhigh", "extra_high": "xhigh",
+    "extrahigh": "xhigh", "extra high": "xhigh",
+    "max": "max", "maximum": "max", "ultra": "max",
     # Claude 风格
     "low_effort": "low", "medium_effort": "medium", "high_effort": "high",
 }
 
-_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "max", "xhigh")
+# 档位强序（钳制/翻译用）：max 为最高档
+_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+# effort -> budget_tokens 档位表（Anthropic/Gemini/OpenRouter 风格预算翻译）。
+# 参考锚点：Anthropic budget_tokens 下限 1024（extended thinking 文档）、
+# Gemini thinkingBudget 24576 上限、Claude "think a lot" ~32k、64k 为
+# extended thinking 常见上限。目标渠道只认预算不认档位时使用。
+_EFFORT_BUDGET_TIERS: tuple[tuple[str, int], ...] = (
+    ("minimal", 1024),
+    ("low", 4096),
+    ("medium", 8192),
+    ("high", 16384),
+    ("xhigh", 32768),
+    ("max", 65536),
+)
 
 _TRUE = {"1", "true", "yes", "on", "enabled"}
 _FALSE = {"0", "false", "no", "off", "disabled", "none"}
@@ -85,6 +105,11 @@ class ThinkingCapability:
     always_on: bool = False
     thinking_type: bool = False
     default_effort: str | None = None
+    # 预算的 chat_template_kwargs 注入键（vLLM 系模型控制思考量的
+    # 标准通道是模板变量，如 Qwen3 的 thinking_budget）。设置后：
+    # budget 意图（显式预算或 effort 档位换算）会同步写入
+    # chat_template_kwargs[<budget_kwarg>]，与顶层字段双通道并存。
+    budget_kwarg: str | None = None
 
 
 _THINKING_CAPABILITIES: list[tuple[str, ThinkingCapability]] = [
@@ -116,8 +141,13 @@ _THINKING_CAPABILITIES: list[tuple[str, ThinkingCapability]] = [
     ("grok", ThinkingCapability(always_on=True)),
     ("muse-spark", ThinkingCapability(
         effort_key="reasoning_effort",
-        effort_values=("low", "medium", "high", "max"),
+        # 全档透传：zen 端点的档位支持是黑盒，静默改写不如让上游明确表态
+        # （400 可见可诊断，静默忽略无法察觉）
+        effort_values=("minimal", "low", "medium", "high", "xhigh", "max"),
         default_effort="high", supports_budget=True,
+        # vLLM 系：强度同步写模板变量 thinking_budget（数值通道），
+        # 双通道并存——zen 若忽略顶层 reasoning_effort，模板变量仍生效
+        budget_kwarg="thinking_budget",
     )),
 ]
 
@@ -139,6 +169,7 @@ def resolve_capability(model_name: str = "") -> ThinkingCapability:
 
 
 def _clamp_effort(effort: str, allowed: tuple[str, ...]) -> str | None:
+    """把档位钳制到目标模型支持集合的最近档（同距取更高档）。"""
     if not allowed:
         return None
     if effort in allowed:
@@ -151,6 +182,31 @@ def _clamp_effort(effort: str, allowed: tuple[str, ...]) -> str | None:
         return None
     nearest = min(idxs, key=lambda i: (abs(i - ei), -i))
     return _EFFORT_ORDER[nearest]
+
+
+def effort_to_budget(effort: str | None) -> int | None:
+    """档位 -> 预算 token（目标渠道只认预算形态时使用）。"""
+    for name, tokens in _EFFORT_BUDGET_TIERS:
+        if effort == name:
+            return tokens
+    return None
+
+
+def budget_to_effort(budget: int | None) -> str | None:
+    """预算 token -> 最近档位（目标渠道只认档位形态时使用）。
+
+    用"离哪档最近"归档（而不是首个天花板 >= 预算）：预算 20000 离
+    high(16384) 比离 xhigh(32768) 近得多，向上归档会近似双倍预算。
+    """
+    if budget is None or budget <= 0:
+        return "off"
+    tiers = _EFFORT_BUDGET_TIERS
+    best_name, best_dist = tiers[-1][0], abs(budget - tiers[-1][1])
+    for name, tokens in tiers:
+        d = abs(budget - tokens)
+        if d < best_dist:
+            best_name, best_dist = name, d
+    return best_name
 
 
 @dataclass
@@ -218,7 +274,8 @@ def _normalize_effort(value) -> str | None:
         n = int(value)
         if n <= 0:
             return "off"
-        return {1: "low", 2: "medium", 3: "high"}.get(n, "max")
+        # 数值档位：1/2/3 对应 low/medium/high，4 及以上进入 xhigh/max
+        return {1: "low", 2: "medium", 3: "high", 4: "xhigh"}.get(n, "max")
     if not isinstance(value, str):
         return None
     low = value.strip().lower()
@@ -429,18 +486,22 @@ def _get_host(channel=None) -> str:
 
 
 def _is_reasoning_gateway(host: str, model_name: str = "") -> bool:
-    """判断是否为需要特殊处理 reasoning 格式的网关
+    """判断是否为需要 reasoning 对象格式的网关（OpenRouter/Kilo 系）。
 
     RikkaHub 的实现：
     - openrouter.ai: reasoning: {effort: "none"/"low"/"medium"/"high"/"max"}
     - api.kilo.ai: 类似 openrouter
-    - muse-spark: 需要特殊处理
+
+    注意：muse-spark 曾被归入此分支（沿用 RikkaHub 注释"muse-spark 需要
+    特殊处理"），但实测（2026-09，用户对照：kimi-k3 同参透传生效、muse 不
+    生效）zen 端点对 reasoning 对象不响应——muse 已移出本分支，与 kimi
+    同构走 reasoning_effort 直传（muse capability: effort_key=reasoning_effort，
+    7 档词汇表经 _clamp_effort 适配）。
     """
-    if not host:
+    # host 与 model_name 双空才早退：渠道未知时仍可靠模型名识别网关
+    if not host and not model_name:
         return False
     if "openrouter.ai" in host or "kilo" in host or "api.kilo.ai" in host:
-        return True
-    if "muse-spark" in model_name.lower() or "contributor" in model_name.lower():
         return True
     return False
 
@@ -468,6 +529,9 @@ def to_upstream(spec: ThinkingSpec, model_name: str = "", channel=None) -> dict:
         enabled = None
 
     # 网关格式处理（RikkaHub 风格）
+    # OpenRouter reasoning.effort 完整梯度（2026-09 文档）：
+    #   none / minimal / low / medium / high / xhigh / max
+    _GATEWAY_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
     if _is_reasoning_gateway(host, model_name):
         # 优先使用原始 reasoning 对象
         if spec.raw_reasoning and isinstance(spec.raw_reasoning, dict):
@@ -480,7 +544,7 @@ def to_upstream(spec: ThinkingSpec, model_name: str = "", channel=None) -> dict:
             out["reasoning"] = {"effort": "none"}
         elif enabled is True:
             if spec.effort:
-                eff = _clamp_effort(spec.effort, ("low", "medium", "high", "max")) or spec.effort
+                eff = _clamp_effort(spec.effort, _GATEWAY_EFFORTS) or spec.effort
                 if spec.effort.lower() in ("off", "none"):
                     out["reasoning"] = {"effort": "none"}
                 else:
@@ -488,7 +552,7 @@ def to_upstream(spec: ThinkingSpec, model_name: str = "", channel=None) -> dict:
             else:
                 out["reasoning"] = {"enabled": True}
         elif spec.effort:
-            eff = _clamp_effort(spec.effort, ("low", "medium", "high", "max")) or spec.effort
+            eff = _clamp_effort(spec.effort, _GATEWAY_EFFORTS) or spec.effort
             out["reasoning"] = {"effort": eff}
         if "reasoning" in out:
             if spec.budget is not None and cap.supports_budget:
@@ -498,6 +562,20 @@ def to_upstream(spec: ThinkingSpec, model_name: str = "", channel=None) -> dict:
     if cap.thinking_type:
         if enabled is True:
             out["thinking"] = {"type": "enabled"}
+            # Claude 风格 thinking 对象接受 budget_tokens：
+            # - 客户端给了预算 → 原样带入
+            # - 只给了档位 → 按档位表翻译成预算下限（档位意图不丢失）。
+            #   预算是数值尺度，可直接表达 minimal——不做档位钳制，
+            #   否则 minimal 会被钳成 low 再翻译成 4096（翻倍）。
+            if spec.budget is not None:
+                out["thinking"]["budget_tokens"] = spec.budget
+            elif spec.effort:
+                tokens = effort_to_budget(spec.effort)
+                if tokens is None:
+                    eff = _clamp_effort(spec.effort, cap.effort_values)
+                    tokens = effort_to_budget(eff or spec.effort)
+                if tokens:
+                    out["thinking"]["budget_tokens"] = tokens
         elif enabled is False and not cap.always_on:
             out["thinking"] = {"type": "disabled"}
     elif not cap.always_on:
@@ -512,12 +590,26 @@ def to_upstream(spec: ThinkingSpec, model_name: str = "", channel=None) -> dict:
         effort = spec.effort
         if effort is None and spec.enabled is True and spec.budget is None:
             effort = cap.default_effort or _default_effort(channel)
+        # 预算意图在"只认档位"的渠道上回落为最近档位（预算档位表反向翻译）
+        if effort is None and spec.budget is not None and not cap.supports_budget:
+            effort = budget_to_effort(spec.budget)
         if effort:
             eff = _clamp_effort(effort, cap.effort_values)
             if eff:
                 out[cap.effort_key] = eff
     if spec.budget is not None and cap.supports_budget:
         out["reasoning_budget"] = spec.budget
+
+    # budget_kwarg 双通道：把预算意图（显式预算，或档位经换算表合成）
+    # 同步写进 chat_template_kwargs——vLLM 系上游只认模板变量，
+    # 顶层字段会被静默忽略（zen muse 实测）。
+    if cap.budget_kwarg:
+        tokens = spec.budget
+        if tokens is None and spec.effort:
+            tokens = effort_to_budget(spec.effort)
+        if tokens:
+            kwargs = out.setdefault("chat_template_kwargs", {})
+            kwargs[cap.budget_kwarg] = tokens
 
     return out
 

@@ -117,8 +117,9 @@ class AdminChatView(AdminRequiredMixin, APIView):
         - stream_idle_timeout：胜出后未产出真实内容的静默判死上限——
           连续 N 个探测周期无任何数据（含思考 token），判定线路死亡；
           思考模型会持续吐 reasoning token，正常"正在思考"不会被掐断；
-        - 已向客户端交付正文后断流：绝不发 error 事件（否则客户端 SSE 解析报
-          "error decoding response body"），干净收尾 [DONE]。
+        - 已向客户端交付正文后断流：发 error 事件明确告知"输出不完整"
+          （upstream_truncated/stream_truncated），绝不把半截回答伪装成
+          干净完成——agent/用户必须知道内容被截断才能整体重试。
         """
         import asyncio
         import json
@@ -181,6 +182,8 @@ class AdminChatView(AdminRequiredMixin, APIView):
                 completion_text: list[str] = []
                 stream_ok = False
                 done_sent = False
+                saw_finish_reason = False
+                truncated_stream = False
                 try:
                     async for chunk in _drain(winner, idle_timeout, heartbeat, max_duration):
                         if _chunk_has_content(chunk):
@@ -195,6 +198,8 @@ class AdminChatView(AdminRequiredMixin, APIView):
                                         usage = payload['usage']
                                     choices = payload.get('choices')
                                     if choices:
+                                        if choices[0].get('finish_reason'):
+                                            saw_finish_reason = True
                                         delta = choices[0].get('delta') or {}
                                         for key in ('content', 'reasoning_content', 'reasoning'):
                                             v = delta.get(key)
@@ -204,9 +209,19 @@ class AdminChatView(AdminRequiredMixin, APIView):
                         except Exception:
                             pass
                         yield chunk
-                    stream_ok = True
+                    # 静默截断检测（与 /v1 流式同语义）：流结束但既无 finish_reason
+                    # 也无上游 [DONE] = 上游掐断，必须如实上报而非伪装成功
+                    upstream_done = bool(
+                        (getattr(winner, 'final_state', None) or {}).get(
+                            'saw_done', done_sent))
+                    stream_ok = bool(saw_finish_reason or upstream_done)
+                    truncated_stream = not stream_ok
                 finally:
-                    log.status = "success"
+                    if truncated_stream:
+                        log.status = "failed"
+                        log.error_type = "upstream_truncated"
+                    else:
+                        log.status = "success"
                     total_ms = round((_time.monotonic() - started) * 1000, 1)
                     log.duration_ms = total_ms
                     if usage.get('prompt_tokens'):
@@ -227,6 +242,11 @@ class AdminChatView(AdminRequiredMixin, APIView):
                     await _safe_save()
                     if stream_ok:
                         yield ('data: ' + json.dumps({'summary': {'duration_ms': total_ms, 'first_token_ms': log.first_token_ms or duration, 'prompt_tokens': log.prompt_tokens, 'completion_tokens': log.completion_tokens, 'total_tokens': log.total_tokens, 'cached_tokens': log.cached_tokens}}) + '\n\n')
+                        yield 'data: [DONE]\n\n'
+                    elif truncated_stream:
+                        # 静默截断：显式告知前端"输出不完整"（前端已支持 error 事件），
+                        # 不再把半截回答伪装成正常完成
+                        yield ('data: ' + json.dumps({'error': {'message': '上游输出中断：流被提前关闭（未收到 finish_reason/[DONE]），已收到的内容不完整', 'type': 'api_error', 'param': None, 'code': 'upstream_truncated'}}) + '\n\n')
                         yield 'data: [DONE]\n\n'
             except (NoRouteAvailable, AllRoutesFailed) as exc:
                 log.status, log.http_status, log.error_type = ('failed', 502, 'all_routes_failed')

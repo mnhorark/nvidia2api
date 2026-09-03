@@ -23,6 +23,7 @@ from services.proxy_service import report_proxy_result
 from services.reasoning_decrypt import (
     StreamReasoningDecryptor, decrypt_sse_chunk,
 )
+from services.tool_stream import ToolCallStreamNormalizer
 
 logger = logging.getLogger("nvidia2api.race")
 
@@ -55,6 +56,15 @@ def route_info(route: Route, status: str, latency_ms: float = 0.0,
 
 class NoRouteAvailable(Exception):
     pass
+
+
+class UpstreamTruncated(Exception):
+    """上游流在未发出 finish_reason/[DONE] 的情况下静默结束（截断）。
+
+    典型场景：长文档生成到一半，上游网关/代理掐断长连接。旧行为是
+    伪造 [DONE] 伪装成功；现在如实上报，未交付内容时走换线重试，
+    已交付内容时向客户端显式报错。
+    """
 
 
 class AllRoutesFailed(Exception):
@@ -545,8 +555,15 @@ async def race_stream_winner(routes: list[Route], body: dict):
         [f"{f['name']}:{f['error']}" for f in failures], report=report)
 
 
-async def iter_sse(first_line: str, aiter, include_first: bool = True) -> AsyncIterator[str]:
-    """Yield SSE lines: the validating first chunk, then the remainder, then [DONE]."""
+async def iter_sse(first_line: str, aiter, include_first: bool = True,
+                   state: dict | None = None) -> AsyncIterator[str]:
+    """Yield SSE lines verbatim（含上游自己的 [DONE]，如有）。
+
+    **不再伪造结尾 [DONE]**：上游流结束却未发 [DONE] 属于"静默截断"——
+    继续伪造会把不完整响应伪装成正常完成，客户端（agent）把写了一半的
+    文档当成功收货且毫无报错。截断真相通过 `state["saw_done"]` 上报给
+    调用方，由其决定重试或向客户端报错。
+    """
     if include_first:
         yield first_line + "\n\n"
     saw_done = False
@@ -556,8 +573,8 @@ async def iter_sse(first_line: str, aiter, include_first: bool = True) -> AsyncI
         if line.strip() == "data: [DONE]":
             saw_done = True
         yield line + "\n\n"
-    if not saw_done:
-        yield "data: [DONE]\n\n"
+    if state is not None:
+        state["saw_done"] = saw_done
 
 
 @dataclass
@@ -568,25 +585,41 @@ class StreamWinner:
     aiter: Any
     first_line: str
     report: list[dict] = None  # type: ignore[assignment]
+    # lines() 消费完毕后写入：上游是否真正发出了 [DONE]。
+    # False = 上游静默断流（无 [DONE]），调用方须按截断处理而非成功。
+    final_state: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.final_state is None:
+            self.final_state = {}
 
     async def lines(self) -> AsyncIterator[str]:
+        # 工具调用流规整：放置于解密/协议转换之后、下发客户端之前——
+        # 上游（muse/zen 等）可能发乱序 tool_calls（换 id + 全参重复），
+        # OpenAI SDK 按 index 累加参数会得到非法 JSON。
+        tc_norm = ToolCallStreamNormalizer()
         if responses_api.is_responses_url(_route_url(self.route)):
-            async for chunk in responses_api.iter_responses_sse(self.first_line, self.aiter):
+            async for chunk in responses_api.iter_responses_sse(
+                    self.first_line, self.aiter, done_state=self.final_state):
                 # Responses 链路的 reasoning 已在 iter_responses_sse 内由 _reasoning_text 解密
                 # 额外的 SSE chunk 解密（处理 Kilo/OpenRouter 加密 reasoning）
-                yield decrypt_sse_chunk(chunk)
+                for out in tc_norm.feed(decrypt_sse_chunk(chunk)):
+                    yield out
         else:
             decryptor = StreamReasoningDecryptor()
             try:
-                async for chunk in iter_sse(self.first_line, self.aiter):
+                async for chunk in iter_sse(self.first_line, self.aiter,
+                                            state=self.final_state):
                     # 有状态解密：跨 chunk 分片的 Fernet token 缓冲凑齐后一次解密；
                     # 无法解密的密文输出占位符，不再把乱码怼给客户端。
                     for out in decryptor.feed(chunk):
-                        yield out
+                        for fixed in tc_norm.feed(out):
+                            yield fixed
             finally:
                 # 异常收尾（客户端断开/上游暴毙）也冲刷残留缓冲
                 for out in decryptor.finalize():
-                    yield out
+                    for fixed in tc_norm.feed(out):
+                        yield fixed
 
     async def close(self):
         try:

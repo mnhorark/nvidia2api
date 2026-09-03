@@ -257,7 +257,11 @@ def decrypt_sse_chunk(chunk: str) -> str:
         if normalize_reasoning_format(data):
             changed = True
         if changed:
-            return "data: " + json.dumps(data, ensure_ascii=False) + "\n"
+            # SSE 事件帧必须以空行（\n\n）结束：单 \n 会把本事件与下一个
+            # data: 行粘连成一个事件块，OpenAI SDK 的 SSE 解码器会把两段
+            # JSON 拼接后 json.loads 失败（工具调用流直接中断——
+            # "Tool call ended without a terminal event" 的直接来源）。
+            return "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
     except Exception:
         pass
     return chunk
@@ -330,7 +334,7 @@ class StreamReasoningDecryptor:
         但最小化最稳妥——下游只需推理文本本身。
         """
         out = {"choices": [{"delta": {field: text}}]}
-        return "data: " + json.dumps(out, ensure_ascii=False) + "\n"
+        return "data: " + json.dumps(out, ensure_ascii=False) + "\n\n"
 
     # -- 主流程 -------------------------------------------------------------
 
@@ -393,7 +397,7 @@ class StreamReasoningDecryptor:
             # 正文由 stripped 单独下发，否则占位符 chunk 里混带正文，客户端
             # 会看到先正文后思考的乱序。
             clean = {"choices": [{"delta": {}}]}
-            stripped = "data: " + json.dumps(data2, ensure_ascii=False) + "\n"
+            stripped = "data: " + json.dumps(data2, ensure_ascii=False) + "\n\n"
             return self._emit_pending_then(stripped, template=clean)
 
         if frag is None:
@@ -404,7 +408,7 @@ class StreamReasoningDecryptor:
             dec = decrypt_token(frag)
             if dec is not None:
                 delta[field] = dec
-                return ["data: " + json.dumps(data2, ensure_ascii=False) + "\n"]
+                return ["data: " + json.dumps(data2, ensure_ascii=False) + "\n\n"]
             # 前缀对但解不开：大概率是分片的首片，开始缓冲
             self._frags = [frag]
             self._field = field
@@ -412,14 +416,14 @@ class StreamReasoningDecryptor:
                 # 同 chunk 里已有正文：立刻冲刷，再把原 chunk（扣掉密文）放行
                 dec_text = self._flush_reason()
                 delta.pop(field, None)
-                rest = "data: " + json.dumps(data2, ensure_ascii=False) + "\n"
+                rest = "data: " + json.dumps(data2, ensure_ascii=False) + "\n\n"
                 if dec_text:
                     return [self._mk_chunk(data2, self._field, dec_text), rest]
                 return [rest]
             return []
         if _looks_like_opaque_blob(frag):
             delta[field] = ENCRYPTED_PLACEHOLDER
-            return ["data: " + json.dumps(data2, ensure_ascii=False) + "\n"]
+            return ["data: " + json.dumps(data2, ensure_ascii=False) + "\n\n"]
         return [pre]
 
     def _emit_pending_then(self, tail: str, template: dict | None = None) -> list[str]:

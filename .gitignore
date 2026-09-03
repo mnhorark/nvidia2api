@@ -21,3 +21,14 @@ dist/
 
 # 本地工具运行缓存（勿入库）
 .cache/
+
+# 临时诊断/探针脚本与会话内一次性实验文件（勿入库）
+_diag*.py
+diag.py
+diag[0-9]*.py
+diag_req.py
+_probe_*.py
+_reset_*.py
+_verify_*.py
+_keepalive_db.sqlite3
+.perf-test/

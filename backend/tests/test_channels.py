@@ -1258,3 +1258,50 @@ class MuseReasoningDefaultSummaryTests(TestCase):
             "item": {"type": "reasoning",
                      "summary": [{"type": "summary_text", "text": "thinking aloud..."}]}}) + "\n\n"
         self.assertIsNone(_translate_event(done, state))
+
+
+class ToolNameAliasTests(TestCase):
+    """超长工具名（上游 64 字符硬上限）的别名化与还原。"""
+
+    def test_long_tool_name_shortened_and_restored(self):
+        from services import tool_alias
+        long_name = "mcp__my_server__" + "x" * 60  # 77 chars
+        body = {
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function",
+                        "function": {"name": long_name,
+                                     "parameters": {"type": "object"}}}],
+        }
+        mapping = tool_alias.shorten_function_names(body)
+        self.assertTrue(mapping)
+        aliased = body["tools"][0]["function"]["name"]
+        self.assertNotEqual(aliased, long_name)
+        self.assertLessEqual(len(aliased), 64)
+        # 还原
+        payload = {"choices": [{"message": {"tool_calls": [
+            {"type": "function", "function": {"name": aliased}}]}}]}
+        tool_alias.restore_payload(payload, mapping)
+        self.assertEqual(payload["choices"][0]["message"]
+                         ["tool_calls"][0]["function"]["name"], long_name)
+
+    def test_short_names_untouched(self):
+        from services import tool_alias
+        body = {"model": "m", "messages": [],
+                "tools": [{"type": "function", "function": {"name": "normal_tool"}}]}
+        mapping = tool_alias.shorten_function_names(body)
+        self.assertEqual(mapping, {})
+        self.assertEqual(body["tools"][0]["function"]["name"], "normal_tool")
+
+    def test_stream_chunk_restore(self):
+        import json as _json
+        from services import tool_alias
+        mapping = {"fn_abc123": "mcp__srv__" + "y" * 50}
+        chunk = "data: " + _json.dumps({"choices": [{"delta": {"tool_calls": [
+            {"function": {"name": "fn_abc123"}}]}}]}) + "\n\n"
+        out = tool_alias.restore_stream_chunk(chunk, mapping)
+        self.assertIn("mcp__srv__", out)
+        self.assertNotIn("fn_abc123", out)
+        # 无命中时原样返回
+        other = "data: " + _json.dumps({"choices": [{"delta": {"content": "x"}}]}) + "\n\n"
+        self.assertEqual(tool_alias.restore_stream_chunk(other, mapping), other)

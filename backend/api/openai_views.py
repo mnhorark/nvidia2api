@@ -23,11 +23,11 @@ from django.views.decorators.csrf import csrf_exempt
 from apps.core.models import AIModel, Channel, RequestLog
 from services import (
     anthropic_api, api_key_service, channel_service, key_service, model_registry,
-    responses_api, sysconfig, thinking,
+    message_fixups, responses_api, sysconfig, thinking, tool_alias,
 )
 from services.load_balancer import build_routes
 from services.race_engine import (
-    AllRoutesFailed, NoRouteAvailable, race_chat, race_stream,
+    AllRoutesFailed, NoRouteAvailable, UpstreamTruncated, race_chat, race_stream,
 )
 from .auth import openai_error
 
@@ -340,6 +340,12 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
         model_name = model.model_name
         stream = bool(body.get("stream"))
         upstream_body = _build_upstream_body(body, model_name, channel)
+        # 跨轮重复 tool_call id 唯一化（zen/Anthropic 系强校验
+        # "每个 function_call 恰好一个 output"，跨轮同名 id 整包 400）
+        message_fixups.dedupe_tool_call_ids(upstream_body)
+        # 超长工具名（上游 >64 字符会 400）替换为确定性短别名，
+        # 映射表在响应返回客户端前还原（工具调用对客户端无感）
+        tool_alias_map = tool_alias.shorten_function_names(upstream_body)
         upstream_thinking = thinking.build_upstream(body, model_name, channel)
         try:
             _flat_for_log = thinking._flatten(body)
@@ -386,7 +392,8 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
             gen = _stream_response(routes, upstream_body, log_id_holder,
                                    user_key, channel, max_attempts,
                                    proxy_group=model.proxy_group_id,
-                                   endpoint=model.endpoint)
+                                   endpoint=model.endpoint,
+                                   tool_map=tool_alias_map or None)
             if protocol == "responses":
                 gen = responses_api.iter_chat_sse_as_responses(gen)
             elif protocol == "anthropic":
@@ -459,6 +466,9 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
             reservation=1,  # 扣除 claim_quota 预占的 1 token
         )
         payload = result.payload
+        # 还原超长工具名别名（入境时被缩短的名字在出口处恢复为原始长名）
+        if tool_alias_map:
+            tool_alias.restore_payload(payload, tool_alias_map)
         if protocol == "responses":
             payload = responses_api.chat_to_responses_payload(payload, echo_body or body)
         elif protocol == "anthropic":
@@ -595,8 +605,12 @@ def _chunk_has_any_signal(line: str) -> bool:
 
 async def _stream_response(routes, upstream_body, holder, user_key, channel,
                            max_attempts: int = 1, proxy_group: int | None = None,
-                           endpoint: str | None = None):
+                           endpoint: str | None = None,
+                           tool_map: dict | None = None):
     import asyncio
+
+    def _restore(chunk: str) -> str:
+        return tool_alias.restore_stream_chunk(chunk, tool_map) if tool_map else chunk
 
     winner = None
     sent_content = False
@@ -691,6 +705,8 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                 await run_db(log.save)
                 usage: dict = {}
                 completion_text: list[str] = []
+                saw_finish_reason = False
+                truncated = False
                 try:
                     async for chunk in _drain(w, idle_timeout, heartbeat,
                                       max_duration, content_idle_timeout):
@@ -706,6 +722,8 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                                         usage = payload["usage"]
                                     choices = payload.get("choices")
                                     if choices:
+                                        if choices[0].get("finish_reason"):
+                                            saw_finish_reason = True
                                         delta = choices[0].get("delta") or {}
                                         for key in ("content", "reasoning_content", "reasoning"):
                                             v = delta.get(key)
@@ -717,9 +735,25 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                                             completion_text.append(text)
                         except Exception:
                             pass
-                        yield chunk
+                        yield _restore(chunk)
+                    # 静默截断检测：流结束了，但既没有 finish_reason 也没有上游
+                    # [DONE] —— 上游把流掐了（长连接被网关/代理切断的典型形态）。
+                    # 绝不能伪装成成功：未发内容走换线重试，已发内容显式报错。
+                    # final_state 缺失（测试 monkeypatch lines()）时退回信任 done_sent。
+                    upstream_done = bool(
+                        (getattr(w, "final_state", None) or {}).get(
+                            "saw_done", done_sent))
+                    if not (saw_finish_reason or upstream_done):
+                        truncated = True
+                        if not sent_content:
+                            raise UpstreamTruncated(
+                                "upstream closed stream without finish_reason/[DONE]")
                 finally:
-                    log.status = "success"
+                    if truncated:
+                        log.status = "failed"
+                        log.error_type = "upstream_truncated"
+                    else:
+                        log.status = "success"
                     log.duration_ms = round((time.monotonic() - holder["started"]) * 1000, 1)
                     if usage.get("prompt_tokens"):
                         log.prompt_tokens = usage["prompt_tokens"]
@@ -738,6 +772,34 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                     log.total_tokens = (log.prompt_tokens or 0) + (log.completion_tokens or 0)
                     log.cached_tokens = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
                     await run_db(log.save)
+                if truncated:
+                    # 已交付部分内容，无法透明重试：向客户端显式报错（zcode 等
+                    # agent 由此得知回答不完整，可整体重试），并把线路记一次
+                    # 失败让调度器学会避开这种掐长连接的代理/Key。
+                    try:
+                        from services.proxy_service import report_proxy_result
+                        if w.route.proxy is not None:
+                            await run_db(report_proxy_result, w.route.proxy.id, False)
+                        key_id = getattr(w.route.key, "id", None)
+                        if key_id is not None:
+                            await run_db(key_service.report_failure,
+                                         key_id, "stream_truncated", 0)
+                    except Exception:
+                        pass
+                    yield "data: " + json.dumps({
+                        "error": {"message": "上游输出中断：流被提前关闭（未收到 "
+                                  "finish_reason/[DONE]），已收到的内容不完整，请重试",
+                                  "type": "api_error", "param": None,
+                                  "code": "upstream_truncated"}
+                    }) + "\n\n"
+                    if not done_sent:
+                        yield "data: [DONE]\n\n"
+                    await settle(False)
+                    return
+                if not done_sent:
+                    # 上游给出了 finish_reason 但漏发 [DONE]：内容已完整，
+                    # 补一个干净的收尾帧保证协议闭合
+                    yield "data: [DONE]\n\n"
                 await settle(True)
                 from services import channel_health
                 await run_db(channel_health.record, log.channel, True, 200)
@@ -784,10 +846,19 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                     logger.warning("stream truncated after content (req %s): %s",
                                    log.request_id, exc)
                     log.error_type = "stream_truncated"
+                    log.status = "failed"
                     await run_db(log.save)
+                    # 中途异常断流同样不能只发干净 [DONE]：客户端（agent）必须
+                    # 知道回答不完整，否则把半截文档当成功收货
+                    yield "data: " + json.dumps({
+                        "error": {"message": "上游输出中断：连接在生成过程中断开，"
+                                  "已收到的内容不完整，请重试",
+                                  "type": "api_error", "param": None,
+                                  "code": "stream_truncated"}
+                    }) + "\n\n"
                     if not done_sent:
                         yield "data: [DONE]\n\n"
-                    await settle(True)
+                    await settle(False)
                     return
                 if w is not None and w.route is not None:
                     try:
@@ -839,6 +910,17 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
             yield "data: " + json.dumps({
                 "error": {"message": "当前没有可用线路或所有线路均失败", "type": "api_error",
                            "param": None, "code": "no_available_route"}
+            }) + "\n\n"
+        elif isinstance(last_exc, UpstreamTruncated):
+            await _safe_finish(holder["log"], holder["started"], False, 502,
+                        "upstream_truncated", routes=all_reports or None)
+            await settle(False)
+            yield "data: " + json.dumps({
+                "error": {"message": "上游输出中断：所有线路的流均在完成前被上游关闭"
+                          "（未收到 finish_reason/[DONE]）。已开启重试时将自动换线，"
+                          "否则请重试请求",
+                          "type": "api_error", "param": None,
+                          "code": "upstream_truncated"}
             }) + "\n\n"
         else:
             report = getattr(last_exc, "report", None)

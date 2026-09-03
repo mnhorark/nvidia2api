@@ -83,9 +83,14 @@ class ParseTests(TestCase):
         self.assertEqual(out_med["reasoning_effort"], "high")
 
     def test_effort_aliases(self):
+        # 内部档位对齐 OpenRouter 完整梯度：
+        # none < minimal < low < medium < high < xhigh < max
+        # minimal/xhigh 是独立档位，不再折叠进 low/max（R14）
         cases = {
-            "xhigh": "max", "maximum": "max", "ultra": "max", "max": "max",
-            "minimal": "low", "auto": "low", "low": "low",
+            "xhigh": "xhigh", "extra_high": "xhigh",
+            "maximum": "max", "ultra": "max", "max": "max",
+            "minimal": "minimal", "min": "minimal",
+            "auto": "low", "low": "low",
             "balanced": "medium", "medium": "medium",
             "high": "high",
         }
@@ -303,3 +308,97 @@ class UpstreamWireTests(TransactionTestCase):
         })
         self.assertEqual(body.get("bogus_param"), 1)
         self.assertNotIn("chat_template_kwargs", body)
+
+
+class R14_EffortVocabularyTests(TestCase):
+    """R14：思考档位词汇表扩展（对齐 OpenRouter reasoning.effort 完整梯度）。
+
+    调研结论（2026-09，openrouter.ai/docs）：
+    - reasoning.effort 梯度: none / minimal / low / medium / high / xhigh / max
+    - 各模型声明自己的 supported_efforts（GLM-5.3: low/high/max 恒开启；
+      doubao 支持 minimal；Anthropic 经 output_config.effort 支持 xhigh/max）
+    - Anthropic 风格走 budget_tokens，Gemini 风格走数值预算——
+      档位与预算需要双向翻译，否则意图在转换中丢失
+    """
+
+    def test_numeric_effort_mapping_extended(self):
+        # 0=off 1=low 2=medium 3=high 4=xhigh 5+=max
+        from services.thinking import _normalize_effort
+        self.assertEqual(_normalize_effort(0), "off")
+        self.assertEqual(_normalize_effort(1), "low")
+        self.assertEqual(_normalize_effort(2), "medium")
+        self.assertEqual(_normalize_effort(3), "high")
+        self.assertEqual(_normalize_effort(4), "xhigh")
+        self.assertEqual(_normalize_effort(5), "max")
+        self.assertEqual(_normalize_effort(9), "max")
+
+    def test_minimal_xhigh_are_distinct_levels(self):
+        spec_min = parse({"reasoning_effort": "minimal"})
+        self.assertEqual(spec_min.effort, "minimal")
+        self.assertTrue(spec_min.enabled)
+        spec_xh = parse({"reasoning_effort": "xhigh"})
+        self.assertEqual(spec_xh.effort, "xhigh")
+
+    def test_clamp_order_and_tiebreak(self):
+        from services.thinking import _clamp_effort
+        # 修正后的强序: none<minimal<low<medium<high<xhigh<max
+        # kimi-k3 只认 low/high/max：minimal 就近下落 low，xhigh 同距取更高档 max
+        self.assertEqual(_clamp_effort("minimal", ("low", "high", "max")), "low")
+        self.assertEqual(_clamp_effort("xhigh", ("low", "high", "max")), "max")
+        self.assertEqual(_clamp_effort("minimal", ("low", "medium", "high")), "low")
+        self.assertEqual(_clamp_effort("xhigh", ("minimal", "low", "medium", "high")), "high")
+        # doubao 支持 minimal：原样保留
+        self.assertEqual(_clamp_effort("minimal", ("minimal", "low", "medium", "high")), "minimal")
+
+    def test_muse_effort_passthrough_direct(self):
+        """muse 已移出网关分支（zen 对 reasoning 对象不生效，实测 kimi-k3
+        同参直传生效）——muse 走普通路径 reasoning_effort 直传，且 cap
+        放开为全档：minimal/xhigh 不被折叠。"""
+        out = to_upstream(parse({"reasoning_effort": "minimal"}), "muse-spark-1.3-contributor-free")
+        self.assertEqual(out["reasoning_effort"], "minimal")
+        self.assertNotIn("reasoning", out)  # 不再发网关对象
+        out = to_upstream(parse({"reasoning_effort": "xhigh"}), "muse-spark-1.3-contributor-free")
+        self.assertEqual(out["reasoning_effort"], "xhigh")
+        out = to_upstream(parse({"reasoning_effort": "high"}), "muse-spark-1.3-contributor-free")
+        self.assertEqual(out["reasoning_effort"], "high")
+        # budget_kwarg 双通道：档位换算成 chat_template_kwargs.thinking_budget
+        self.assertEqual(out["chat_template_kwargs"]["thinking_budget"], 16384)
+
+    def test_true_gateway_still_uses_reasoning_object(self):
+        """真网关（openrouter host）仍走 reasoning 对象格式。"""
+        from apps.core.models import Channel
+        ch = Channel.objects.create(
+            name="or-test", slug="or-test",
+            base_url="https://openrouter.ai/api/v1")
+        out = to_upstream(parse({"reasoning_effort": "minimal"}),
+                          "some-model", ch)
+        self.assertEqual(out["reasoning"]["effort"], "minimal")
+
+    def test_effort_to_budget_synthesis_for_thinking_type(self):
+        # Claude 风格 thinking 对象：客户端给档位没给预算 → 按档位表合成预算
+        out = to_upstream(parse({"reasoning_effort": "high"}), "kimi-k2")
+        self.assertEqual(out["thinking"]["type"], "enabled")
+        self.assertEqual(out["thinking"]["budget_tokens"], 16384)
+        out = to_upstream(parse({"reasoning_effort": "minimal"}), "kimi-k2")
+        self.assertEqual(out["thinking"]["budget_tokens"], 1024)
+
+    def test_budget_passthrough_for_thinking_type(self):
+        # 客户端给了预算 → 原样进 thinking 对象，不覆盖
+        out = to_upstream(parse({"thinking": {"type": "enabled", "budget_tokens": 5000}}), "kimi-k2")
+        self.assertEqual(out["thinking"]["budget_tokens"], 5000)
+
+    def test_budget_to_effort_fallback_when_no_budget_support(self):
+        # 只认档位的渠道：预算意图回落为最近档位（不整段丢弃）
+        from services.thinking import budget_to_effort
+        self.assertEqual(budget_to_effort(500), "minimal")
+        self.assertEqual(budget_to_effort(4096), "low")
+        self.assertEqual(budget_to_effort(20000), "high")
+        self.assertEqual(budget_to_effort(999999), "max")
+        self.assertEqual(budget_to_effort(0), "off")
+
+    def test_budget_effort_roundtrip_sanity(self):
+        from services.thinking import budget_to_effort, effort_to_budget
+        for eff in ("minimal", "low", "medium", "high", "xhigh", "max"):
+            tok = effort_to_budget(eff)
+            self.assertIsNotNone(tok, eff)
+            self.assertEqual(budget_to_effort(tok), eff)

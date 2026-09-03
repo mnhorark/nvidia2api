@@ -850,12 +850,19 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
 
 
 async def iter_responses_sse(first_line: str, aiter,
-                             include_first: bool = True) -> AsyncIterator[str]:
-    """把 Responses 流式事件流转成 chat 格式的 SSE 行序列（含结尾 [DONE]）。"""
+                             include_first: bool = True,
+                             done_state: dict | None = None) -> AsyncIterator[str]:
+    """把 Responses 流式事件流转成 chat 格式的 SSE 行序列。
+
+    **不再伪造结尾 [DONE]**：上游未发 [DONE] 即结束 = 静默截断，
+    如实通过 `done_state["saw_done"]` 上报，由调用方决定重试/报错。
+    """
     state: dict = {"args_seen": set()}
     if include_first and first_line:
         translated = _translate_event(first_line, state)
         if translated == "[DONE]":
+            if done_state is not None:
+                done_state["saw_done"] = True
             yield "data: [DONE]\n\n"
             return
         if translated:
@@ -872,8 +879,8 @@ async def iter_responses_sse(first_line: str, aiter,
             yield "data: [DONE]\n\n"
         else:
             yield "data: " + translated + "\n\n"
-    if not saw_done:
-        yield "data: [DONE]\n\n"
+    if done_state is not None:
+        done_state["saw_done"] = saw_done
 
 
 # ---------------------------------------------------------------------------

@@ -292,7 +292,7 @@ class NormalizeReasoningFormatTests(TestCase):
         result = decrypt_sse_chunk(chunk)
         self.assertIn("reasoning_content", result)
         self.assertNotIn('"reasoning":', result)
-        self.assertEqual(result, 'data: {"choices": [{"delta": {"reasoning_content": "思考内容..."}}]}\n')
+        self.assertEqual(result, 'data: {"choices": [{"delta": {"reasoning_content": "思考内容..."}}]}\n\n')
 
     def test_normalize_sse_chunk_with_encrypted_reasoning(self):
         """加密的 reasoning 应该先解密再归一化"""

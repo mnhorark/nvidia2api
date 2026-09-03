@@ -18,6 +18,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from django.conf import settings
+
 logger = logging.getLogger("nvidia2api.offload")
 
 
@@ -31,7 +33,13 @@ def _in_transaction() -> bool:
 
 
 async def run_db(func, /, *args, **kwargs):
-    """执行同步 DB 调用：事务块内同线程直调，否则挪到线程池（不阻塞事件循环）。"""
-    if _in_transaction():
+    """执行同步 DB 调用：事务块内同线程直调，否则挪到线程池（不阻塞事件循环）。
+
+    测试模式（settings.TESTING）下永远同线程直调：Django TestCase 的事务
+    绑定在主线程连接上，而流式生成器可能被 asgiref 调度到 executor 线程——
+    那里的 thread-local 连接看不到原子块，`to_thread` 的写入会绕过测试事务
+    直接提交，向复用的测试库泄漏脏行（曾污染 Dashboard 聚合断言）。
+    """
+    if _in_transaction() or getattr(settings, "TESTING", False):
         return func(*args, **kwargs)
     return await asyncio.to_thread(func, *args, **kwargs)

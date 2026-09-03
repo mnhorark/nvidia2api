@@ -948,3 +948,570 @@ class R10_UpstreamErrorDetailTests(TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.http_status, 400)
         self.assertIn("DEGRADED", result.error_message)
+
+
+class R11_ReasoningSSEFrameTests(TestCase):
+    """R11：muse 全加密思考流在 agent（工具调用）下中断的根因守卫。
+
+    现象：zcode 等 agent 调 muse 时报 "Tool call ended without a terminal event"。
+    根因：reasoning_decrypt 的所有重序列化 SSE chunk 以单 \n 结尾，
+    而 SSE 事件必须以空行（\n\n）分帧——单 \n 会把本事件与下一个
+    data: 行粘连成一个块，OpenAI SDK 的 SSE 解码器解析失败/丢事件，
+    工具调用流（首包 id + 续包 arguments）被截断。
+    本类锁定：解密器产出的每一条 chunk 都必须是完整 \n\n 帧。
+    """
+
+    def test_decrypt_sse_chunk_frame_termination(self):
+        from services import reasoning_decrypt as rd
+
+        # reasoning -> reasoning_content 归一化路径（Kilo/OpenRouter 格式）
+        chunk = 'data: {"choices": [{"delta": {"reasoning": "plain text"}}]}\n\n'
+        out = rd.decrypt_sse_chunk(chunk)
+        self.assertTrue(out.endswith("\n\n"))
+        self.assertNotEqual(out, chunk)  # 确认走了重序列化分支
+        # 两个重序列化事件拼接后仍可逐帧解析
+        doubled = out + out
+        for ev in doubled.split("\n\n"):
+            if ev.strip():
+                json.loads(ev[len("data: "):].strip())
+
+    def test_decryptor_mk_chunk_frame_termination(self):
+        from services import reasoning_decrypt as rd
+
+        dec = rd.StreamReasoningDecryptor()
+        # 喂一个 gAAAA 首片（解不开 → 开始缓冲），再喂一个带正文的 chunk
+        # 触发"冲刷缓冲为占位符"路径
+        first = ('data: {"choices": [{"delta": {"reasoning_content": '
+                 '"gAAAA1234567890"}}]}\n\n')
+        outs = dec.feed(first)
+        self.assertEqual(outs, [])  # 缓冲中
+        second = ('data: {"choices": [{"delta": {"content": "hi", '
+                  '"reasoning_content": "gAAAAabcdefghij"}}]}\n\n')
+        outs = dec.feed(second)
+        self.assertTrue(outs)
+        for c in outs:
+            self.assertTrue(c.endswith("\n\n"), f"chunk 帧尾损坏: {c!r}")
+            if c.startswith("data:"):
+                json.loads(c[5:].strip())
+
+    def test_finalized_decrypted_token_keeps_frame(self):
+        """完整 token 单片解密成功的 chunk 也必须是 \n\n 帧。"""
+        from cryptography.fernet import Fernet
+        import hashlib, base64
+        from unittest.mock import patch
+        from services import reasoning_decrypt as rd
+
+        key = "test-reasoning-key"
+        f = Fernet(base64.urlsafe_b64encode(
+            hashlib.sha256(key.encode()).digest()))
+        token = f.encrypt(b"secret reasoning").decode()
+        chunk = ('data: {"choices": [{"delta": {"reasoning_content": "'
+                 + token + '"}}]}\n\n')
+        with patch.object(rd.settings, "REASONING_DECRYPT_KEY", key):
+            rd.clear_cache()
+            out = rd.decrypt_sse_chunk(chunk)
+        self.assertIn("secret reasoning", out)
+        self.assertTrue(out.endswith("\n\n"))
+
+
+class R12_ToolCallStreamNormalTests(TestCase):
+    """R12：上游乱序 tool_calls（换 id + 全参重复）实证守卫。
+
+    现场真值（muse-spark-1.3 经 zen 网关，实测抓包）：
+      帧A: id="call_X", name="bash",  args=""
+      帧B: id="fc_X",   name=null,   args="<完整JSON>"     ← id 漂移
+      帧C: id="call_X", name="bash",  args="<完整JSON>"    ← 整段重述
+    OpenAI SDK 按 index 累加 arguments：A+B+C 拼出非法 JSON，
+    客户端回落空对象 → "required parameter missing" 连环炸。
+    """
+
+    @staticmethod
+    def _tc(idx, _id=None, name=None, args=None):
+        fn = {}
+        if name != "__skip__":
+            fn["name"] = name
+        if args is not None:
+            fn["arguments"] = args
+        e = {"index": idx, "function": fn}
+        if _id:
+            e["id"] = _id
+            e["type"] = "function"
+        return e
+
+    @staticmethod
+    def _chunk(tool_calls):
+        return "data: " + json.dumps(
+            {"choices": [{"delta": {"tool_calls": tool_calls}}]},
+            ensure_ascii=False) + "\n\n"
+
+    def test_shuffled_three_frame_stream_normalizes(self):
+        from services.tool_stream import ToolCallStreamNormalizer
+
+        full_args = json.dumps({"command": "ls -la"})
+        norm = ToolCallStreamNormalizer()
+        wire = []
+        frames = [
+            self._chunk([self._tc(0, "call_123", "bash", "")]),      # 帧A
+            self._chunk([self._tc(0, "fc_456", None, full_args)]),   # 帧B id 漂移
+            self._chunk([self._tc(0, "call_123", "bash", full_args)]) # 帧C 重述
+        ]
+        for ch in frames:
+            for out in norm.feed(ch):
+                wire.append(out)
+                # 空调试：任何帧都必须是合法 \n\n 帧
+                self.assertTrue(out.endswith("\n\n"))
+
+        # 客户端视角：按 index 累积
+        acc = {"id": None, "name": None, "args": ""}
+        for c in wire:
+            data = json.loads(c[5:].strip())
+            for tc in data["choices"][0]["delta"]["tool_calls"]:
+                if tc.get("id"):
+                    acc["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    acc["name"] = fn["name"]
+                if fn.get("arguments"):
+                    acc["args"] += fn["arguments"]
+
+        self.assertEqual(acc["name"], "bash")
+        self.assertEqual(acc["args"], full_args)  # 合法 JSON，恰好一份
+        self.assertEqual(json.loads(acc["args"]), {"command": "ls -la"})
+
+    def test_standard_incremental_stream_untouched(self):
+        """标准增量流不能被规整器误伤。"""
+        from services.tool_stream import ToolCallStreamNormalizer
+
+        norm = ToolCallStreamNormalizer()
+        frames = [
+            self._chunk([self._tc(0, "call_1", "bash", "")]),
+            self._chunk([self._tc(0, args='{"cmd')]),
+            self._chunk([self._tc(0, args='": "x"}')]),
+        ]
+        wire = [out for ch in frames for out in norm.feed(ch)]
+        self.assertEqual(len(wire), 3)  # 一条不少
+        acc = ""
+        for c in wire:
+            data = json.loads(c[5:].strip())
+            for tc in data["choices"][0]["delta"]["tool_calls"]:
+                acc += (tc.get("function") or {}).get("arguments", "")
+        self.assertEqual(acc, '{"cmd": "x"}')
+
+    def test_arguments_restatement_emits_only_delta(self):
+        """整段重述但比上次变长：只发差量。"""
+        from services.tool_stream import ToolCallStreamNormalizer
+
+        norm = ToolCallStreamNormalizer()
+        frames = [
+            self._chunk([self._tc(0, "call_1", "bash", '{"a')]),  # 首帧带参数
+            self._chunk([self._tc(0, args='{"a": 1}')]),          # 重述+变长
+        ]
+        wire = [out for ch in frames for out in norm.feed(ch)]
+        acc = ""
+        for c in wire:
+            data = json.loads(c[5:].strip())
+            for tc in data["choices"][0]["delta"]["tool_calls"]:
+                acc += (tc.get("function") or {}).get("arguments", "")
+        self.assertEqual(acc, '{"a": 1}')
+
+    def test_redundant_chunk_fully_dropped(self):
+        """完全冗余帧应整条丢弃，不下发。"""
+        from services.tool_stream import ToolCallStreamNormalizer
+
+        norm = ToolCallStreamNormalizer()
+        norm.feed(self._chunk([self._tc(0, "call_1", "bash", '{"x": 1}')]))
+        outs = norm.feed(self._chunk([self._tc(0, "call_1", "bash", '{"x": 1}')]))
+        self.assertEqual(outs, [])
+
+
+class R12_StreamWinnerLinesWiringTests(TestCase):
+    """R12 补充：验证规整器真的被接进了 StreamWinner.lines() 管线。"""
+
+    def test_lines_normalizes_shuffled_tool_calls(self):
+        import asyncio
+        from services.load_balancer import Route
+        from services.race_engine import StreamWinner
+
+        full = json.dumps({"cmd": "pwd"})
+
+        async def fake_aiter():
+            lines = [
+                'data: {"choices": [{"delta": {"role": "assistant"}}]}',
+                ('data: {"choices": [{"delta": {"tool_calls": [{"index": 0,'
+                 ' "id": "call_A", "type": "function", "function":'
+                 ' {"name": "bash", "arguments": ""}}]}}]}'),
+                ('data: {"choices": [{"delta": {"tool_calls": [{"index": 0,'
+                 ' "id": "fc_B", "type": "function", "function":'
+                 ' {"name": null, "arguments": ' + json.dumps(full) + '}}]}}]}'),
+                ('data: {"choices": [{"delta": {"tool_calls": [{"index": 0,'
+                 ' "id": "call_A", "type": "function", "function":'
+                 ' {"name": "bash", "arguments": ' + json.dumps(full) + '}}]}}]}'),
+                'data: {"choices": [{"finish_reason": "tool_calls", "delta": {}}]}',
+                'data: [DONE]',
+            ]
+            for line in lines:
+                yield line
+
+        key = ChannelKey.objects.create(
+            channel=None, name="k", api_key="sk-x", rpm_limit=100)
+        route = Route(kind="direct", key=key)
+        w = StreamWinner(route=route, cm=None, req_cm=None,
+                         aiter=fake_aiter(), first_line="")
+
+        async def collect():
+            return [c async for c in w.lines()]
+
+        wire = asyncio.run(collect())
+        acc = ""
+        seen_ids = set()
+        for c in wire:
+            if not c.startswith("data:") or "[DONE]" in c:
+                continue
+            data = json.loads(c[5:].strip())
+            for tc in (data["choices"][0].get("delta") or {}).get("tool_calls") or []:
+                if tc.get("id"):
+                    seen_ids.add(tc["id"])
+                acc += (tc.get("function") or {}).get("arguments", "")
+        self.assertEqual(seen_ids, {"call_A"})
+        self.assertEqual(acc, full)
+
+
+
+@pytest.mark.django_db
+class R12_SilentTruncationTests(IsolatedAsyncioTestCase):
+    """R12：上游静默断流（无 finish_reason/[DONE]）必须如实上报，不得伪装成功。
+
+    线上事故（2026-09-03 req_7491db0e...）：kimi-k3 大文档生成 418s 后上游掐断
+    长连接，旧 iter_sse 伪造 [DONE] + finally 无条件 status="success"，客户端
+    （zcode）收到干净流结尾、finishReason="other"、无任何报错——半截文档被当
+    成功收货。本类锁定修复后的语义：
+    1. iter_sse 不再伪造 [DONE]，saw_done 如实上报
+    2. 已交付内容后截断 → 客户端收到 error 事件 + [DONE]，日志 failed/upstream_truncated
+    3. 未交付内容即截断 → UpstreamTruncated 走换线重试，耗尽后报 upstream_truncated
+    4. 有 finish_reason 但缺 [DONE] → 内容完整，补发 [DONE]，不误报
+    """
+
+    async def asyncSetUp(self):
+        import uuid
+        slug = f"r12-{uuid.uuid4().hex[:8]}"
+        self._r12_slug = slug
+        self.ch = Channel.objects.create(name=slug, slug=slug,
+                                         base_url="https://up.example",
+                                         enabled=True, is_default=True)
+        self.user = api_key_service.create_key("r12-user")[0]
+
+    @staticmethod
+    def _mk_winner(ch, lines_fn):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from services.race_engine import StreamWinner
+
+        route = MagicMock()
+        route.kind = "direct"
+        route.key.name = "k0"
+        route.key.id = 4242
+        route.key.channel = ch
+        route.proxy = None
+        w = StreamWinner(route=route, cm=MagicMock(), req_cm=MagicMock(),
+                         aiter=None, first_line="data: x\n\n")
+        w.report = [{"name": "direct:k0", "status": "winner"}]
+        w.lines = lines_fn
+        w.close = AsyncMock()
+        return w
+
+    async def test_iter_sse_does_not_fake_done(self):
+        from services.race_engine import iter_sse
+
+        async def upstream():
+            yield 'data: {"choices":[{"delta":{"content":"x"}}]}\n\n'
+            # EOF：上游没发 [DONE]
+        state: dict = {}
+        out = [c async for c in iter_sse("", upstream(), include_first=False,
+                                         state=state)]
+        self.assertIs(state["saw_done"], False)
+        self.assertNotIn("data: [DONE]", "".join(out))
+
+    async def test_iter_sse_passes_real_done_through(self):
+        from services.race_engine import iter_sse
+
+        async def upstream():
+            yield 'data: {"choices":[{"delta":{"content":"x"}}]}\n\n'
+            yield "data: [DONE]\n\n"
+        state: dict = {}
+        out = [c async for c in iter_sse("", upstream(), include_first=False,
+                                         state=state)]
+        self.assertIs(state["saw_done"], True)
+        self.assertIn("data: [DONE]", "".join(out))
+
+    async def test_truncated_after_content_surfaces_error(self):
+        from unittest.mock import AsyncMock
+
+        import time as _time
+
+        async def lines(self=None):
+            yield 'data: {"choices":[{"delta":{"content":"partial doc"}}]}\n\n'
+            # 上游静默断流：无 finish_reason、无 [DONE]
+        w = self._mk_winner(self.ch, lines)
+        log = RequestLog.objects.create(
+            channel=self.ch, request_id="r12-t1", user_api_key=self.user,
+            model="m", routes_count=1, is_stream=True)
+        holder = {"log": log, "started": _time.monotonic()}
+        with patch("api.openai_views.race_stream", new=AsyncMock(return_value=w)):
+            gen = openai_views._stream_response(
+                [w.route], {}, holder, self.user, self.ch, 1)
+            chunks = [c async for c in gen]
+        text = "".join(chunks)
+        self.assertIn("upstream_truncated", text,
+                      "截断后必须给客户端显式 error 事件")
+        self.assertTrue(text.rstrip().endswith("data: [DONE]"),
+                        "error 之后仍要以 [DONE] 收尾")
+        log.refresh_from_db()
+        self.assertEqual(log.status, "failed")
+        self.assertEqual(log.error_type, "upstream_truncated")
+
+    async def test_truncated_before_content_fails_loudly(self):
+        from unittest.mock import AsyncMock
+
+        import time as _time
+
+        async def lines(self=None):
+            yield 'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+            # 无正文、无 finish_reason、无 [DONE] → 截断；max_attempts=1 无线可换
+        w = self._mk_winner(self.ch, lines)
+        log = RequestLog.objects.create(
+            channel=self.ch, request_id="r12-t2", user_api_key=self.user,
+            model="m", routes_count=1, is_stream=True)
+        holder = {"log": log, "started": _time.monotonic()}
+        with patch("api.openai_views.race_stream", new=AsyncMock(return_value=w)):
+            gen = openai_views._stream_response(
+                [w.route], {}, holder, self.user, self.ch, 1)
+            chunks = [c async for c in gen]
+        text = "".join(chunks)
+        self.assertIn("upstream_truncated", text)
+        self.assertIn("data: [DONE]", text)
+        log.refresh_from_db()
+        self.assertEqual(log.status, "failed")
+        self.assertEqual(log.error_type, "upstream_truncated")
+
+    async def test_finish_reason_without_done_is_still_complete(self):
+        from unittest.mock import AsyncMock
+
+        import time as _time
+
+        async def lines(self=None):
+            yield ('data: {"choices":[{"delta":{"content":"doc"},'
+                   '"finish_reason":null}]}\n\n')
+            yield ('data: {"choices":[{"delta":{},'
+                   '"finish_reason":"stop"}]}\n\n')
+            # 上游漏发 [DONE]，但 finish_reason 已到 = 内容完整
+        w = self._mk_winner(self.ch, lines)
+        log = RequestLog.objects.create(
+            channel=self.ch, request_id="r12-t3", user_api_key=self.user,
+            model="m", routes_count=1, is_stream=True)
+        holder = {"log": log, "started": _time.monotonic()}
+        with patch("api.openai_views.race_stream", new=AsyncMock(return_value=w)):
+            gen = openai_views._stream_response(
+                [w.route], {}, holder, self.user, self.ch, 1)
+            chunks = [c async for c in gen]
+        text = "".join(chunks)
+        self.assertNotIn("upstream_truncated", text,
+                         "有 finish_reason 的流是完整的，不得误报截断")
+        self.assertTrue(text.rstrip().endswith("data: [DONE]"),
+                        "平台应补发 [DONE] 保证协议闭合")
+        log.refresh_from_db()
+        self.assertEqual(log.status, "success")
+
+
+class R13_ToolStreamResearchBackedTests(TestCase):
+    """R13：调研背书的流规整守卫（vLLM issue / AdalFlow / new-api 对照）。"""
+
+    @staticmethod
+    def _chunk(tool_calls, **extra):
+        body = {"choices": [{"delta": {"tool_calls": tool_calls}}]}
+        body["choices"][0].update(extra)
+        return "data: " + json.dumps(body, ensure_ascii=False) + "\n\n"
+
+    @staticmethod
+    def _acc(wire):
+        """客户端视角：按 (choice, tool index) 累积。"""
+        ids, names, args = set(), "", ""
+        for c in wire:
+            for ln in c.split("\n"):
+                if not ln.startswith("data:") or "[DONE]" in ln:
+                    continue
+                data = json.loads(ln[5:].strip())
+                for ch in data.get("choices") or []:
+                    for tc in (ch.get("delta") or {}).get("tool_calls") or []:
+                        if tc.get("id"):
+                            ids.add(tc["id"])
+                        fn = tc.get("function") or {}
+                        names += fn.get("name", "")
+                        args += fn.get("arguments", "")
+        return ids, names, args
+
+    def test_fragmented_name_appends(self):
+        """vLLM GLM / AdalFlow 实证：name 会被分片发送（"get_weath"+"er"）。"""
+        from services.tool_stream import ToolCallStreamNormalizer
+
+        norm = ToolCallStreamNormalizer()
+        frames = [
+            self._chunk([{"index": 0, "id": "c1", "type": "function",
+                          "function": {"name": "get_weath", "arguments": ""}}]),
+            self._chunk([{"index": 0, "function": {"name": "er"}}]),
+        ]
+        wire = [o for f in frames for o in norm.feed(f)]
+        ids, names, _ = self._acc(wire)
+        self.assertEqual(ids, {"c1"})
+        self.assertEqual(names, "get_weather")  # 追加而非丢弃
+
+    def test_terminal_args_split_from_finish(self):
+        """vLLM #44098：末段参数与 finish_reason 同帧会被严格客户端丢弃。
+        规整器应拆成参数帧 + finish 帧两帧。"""
+        from services.tool_stream import ToolCallStreamNormalizer
+
+        norm = ToolCallStreamNormalizer()
+        norm.feed(self._chunk([{"index": 0, "id": "c1", "type": "function",
+                                "function": {"name": "bash", "arguments": '{"x'}}]))
+        outs = norm.feed(self._chunk(
+            [{"index": 0, "function": {"arguments": ': 1}'}}],
+            finish_reason="tool_calls"))
+        self.assertEqual(len(outs), 2, "应拆成参数帧与 finish 帧")
+        d1 = json.loads(outs[0][5:].strip())["choices"][0]
+        self.assertIn("tool_calls", d1["delta"])
+        self.assertIsNone(d1.get("finish_reason"))
+        d2 = json.loads(outs[1][5:].strip())["choices"][0]
+        self.assertEqual(d2["finish_reason"], "tool_calls")
+        self.assertEqual(d2["delta"], {})
+
+    def test_same_index_two_entries_in_one_chunk(self):
+        """openai-python #3203 / vLLM 投机解码：一个 chunk 带两个同 index 条目。
+        官方 SDK 累积器有 bug；规整器按序合并不应丢参。"""
+        from services.tool_stream import ToolCallStreamNormalizer
+
+        norm = ToolCallStreamNormalizer()
+        chunk = self._chunk([
+            {"index": 0, "id": "call_abc", "type": "function",
+             "function": {"name": "get_weather", "arguments": '{"city"'}},
+            {"index": 0, "function": {"arguments": ':"London"}'}},
+        ])
+        wire = norm.feed(chunk)
+        ids, names, args = self._acc(wire)
+        self.assertEqual(ids, {"call_abc"})
+        self.assertEqual(names, "get_weather")
+        self.assertEqual(json.loads(args), {"city": "London"})
+
+    def test_content_containing_tool_calls_word_passes_verbatim(self):
+        """正文里出现字面量 "tool_calls" 不能被误改写（透传纯度）。"""
+        from services.tool_stream import ToolCallStreamNormalizer
+
+        norm = ToolCallStreamNormalizer()
+        chunk = ('data: {"choices": [{"delta": {"content": '
+                 '"看这个字段 tool_calls 的用法"}}]}\n\n')
+        self.assertEqual(norm.feed(chunk), [chunk])  # 原样返回，一字不动
+
+
+class R15_DedupeToolCallIdsTests(TestCase):
+    """R15：跨轮重复 tool_call id 唯一化（zen Console 强校验 400 实证守卫）。
+
+    线上报错：Duplicate function_call_output for call_id 'Bash:0'.
+    Each function_call must have exactly one matching function_call_output (400)
+    根因：zcode 以"工具名:本轮序号"作 id，多轮后历史里同名 id 重复；
+    zen 的 Anthropic 系后端强校验每个 call 恰好一个 output。
+    """
+
+    @staticmethod
+    def _multi_round_body():
+        return {"messages": [
+            {"role": "user", "content": "run ls"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "Bash:0", "type": "function",
+                 "function": {"name": "Bash", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "Bash:0", "content": "a.txt"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "Bash:0", "type": "function",
+                 "function": {"name": "Bash", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "Bash:0", "content": "b.txt"},
+            {"role": "assistant", "content": "done"},
+        ]}
+
+    def test_duplicate_ids_rewritten_and_paired(self):
+        from services.message_fixups import dedupe_tool_call_ids
+
+        body = self._multi_round_body()
+        n = dedupe_tool_call_ids(body)
+        self.assertGreaterEqual(n, 2)  # 第二轮 call id + 其 tool output
+        msgs = body["messages"]
+        # 第一轮保持原样
+        self.assertEqual(msgs[1]["tool_calls"][0]["id"], "Bash:0")
+        self.assertEqual(msgs[2]["tool_call_id"], "Bash:0")
+        # 第二轮 call 与 output 同步重写且一致
+        second_call = msgs[3]["tool_calls"][0]["id"]
+        self.assertEqual(second_call, "Bash:0__dup2")
+        self.assertEqual(msgs[4]["tool_call_id"], "Bash:0__dup2")
+        # 全历史无重复
+        ids = [tc["id"] for m in msgs if m.get("tool_calls")
+               for tc in m["tool_calls"]]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_no_duplicates_passes_untouched(self):
+        from services.message_fixups import dedupe_tool_call_ids
+
+        body = {"messages": [
+            {"role": "assistant", "tool_calls": [
+                {"id": "call_abc", "type": "function",
+                 "function": {"name": "f", "arguments": ""}}]},
+            {"role": "tool", "tool_call_id": "call_abc", "content": "x"},
+        ]}
+        n = dedupe_tool_call_ids(body)
+        self.assertEqual(n, 0)
+        self.assertEqual(body["messages"][0]["tool_calls"][0]["id"], "call_abc")
+
+    def test_three_rounds_get_incrementing_suffixes(self):
+        from services.message_fixups import dedupe_tool_call_ids
+
+        body = {"messages": [
+            {"role": "assistant", "tool_calls": [
+                {"id": "R:0", "type": "function",
+                 "function": {"name": "Read", "arguments": ""}}]},
+            {"role": "tool", "tool_call_id": "R:0", "content": "1"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "R:0", "type": "function",
+                 "function": {"name": "Read", "arguments": ""}}]},
+            {"role": "tool", "tool_call_id": "R:0", "content": "2"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "R:0", "type": "function",
+                 "function": {"name": "Read", "arguments": ""}}]},
+            {"role": "tool", "tool_call_id": "R:0", "content": "3"},
+        ]}
+        dedupe_tool_call_ids(body)
+        ids = [m["tool_calls"][0]["id"] for m in body["messages"]
+               if m.get("tool_calls")]
+        outs = [m["tool_call_id"] for m in body["messages"] if m.get("role") == "tool"]
+        self.assertEqual(ids, ["R:0", "R:0__dup2", "R:0__dup3"])
+        self.assertEqual(outs, ["R:0", "R:0__dup2", "R:0__dup3"])
+
+    def test_parallel_calls_same_round_pairing(self):
+        """同一轮多个不同 id 的并行调用：各自的 output 配对不受影响。"""
+        from services.message_fixups import dedupe_tool_call_ids
+
+        body = {"messages": [
+            {"role": "assistant", "tool_calls": [
+                {"id": "Bash:0", "type": "function",
+                 "function": {"name": "Bash", "arguments": ""}},
+                {"id": "Read:1", "type": "function",
+                 "function": {"name": "Read", "arguments": ""}}]},
+            {"role": "tool", "tool_call_id": "Bash:0", "content": "out"},
+            {"role": "tool", "tool_call_id": "Read:1", "content": "file"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "Bash:0", "type": "function",
+                 "function": {"name": "Bash", "arguments": ""}},
+                {"id": "Read:1", "type": "function",
+                 "function": {"name": "Read", "arguments": ""}}]},
+            {"role": "tool", "tool_call_id": "Bash:0", "content": "out2"},
+            {"role": "tool", "tool_call_id": "Read:1", "content": "file2"},
+        ]}
+        dedupe_tool_call_ids(body)
+        round2 = {tc["id"] for tc in body["messages"][3]["tool_calls"]}
+        self.assertEqual(round2, {"Bash:0__dup2", "Read:1__dup2"})
+        outs2 = [m["tool_call_id"] for m in body["messages"][4:6]]
+        self.assertEqual(outs2, ["Bash:0__dup2", "Read:1__dup2"])

@@ -125,7 +125,7 @@ RUNTIME_PARAMS: dict[str, tuple[str, object, str, str]] = {
                               "不支持思考的模型名子串，逗号分隔，命中则剥离", "thinking"),
     "default_thinking_effort": ("str", "high",
                                 "未指定档位时的默认思考强度"
-                                "（off/low/medium/high/max）", "thinking"),
+                                "（off/minimal/low/medium/high/xhigh/max）", "thinking"),
 }
 
 # 兼容旧库里已经写入的 key
