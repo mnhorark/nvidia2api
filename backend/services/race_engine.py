@@ -418,6 +418,12 @@ async def _stream_first_valid(route: Route, body: dict):
                     line = await ait.__anext__()
                 if not line.strip():
                     continue
+                # 上游首帧即 [DONE]：立即结束且无任何内容 —— 跳出后按
+                # empty_stream 处理换线。此前 Responses 分支的
+                # parse_stream_event("[DONE]") 返回 {}（非 None）会误判为
+                # 有效首帧，"秒回 [DONE]" 的坏线路反而赢下竞速成空 winner。
+                if line.startswith("data:") and line[5:].strip() == "[DONE]":
+                    break
                 if is_resp:
                     if responses_api.parse_stream_event(line) is not None:
                         first_line = line
@@ -559,6 +565,10 @@ async def iter_sse(first_line: str, aiter, include_first: bool = True,
                    state: dict | None = None) -> AsyncIterator[str]:
     """Yield SSE lines verbatim（含上游自己的 [DONE]，如有）。
 
+    逐行透传、零延迟、零重排（与 one-api/new-api 的逐行解析同口径：
+    OpenAI 系上游一行即一事件，输出逐字节等价于上游字节流）。与旧实现
+    唯一差异：流结束时若存在未终止的残余行，冲刷保留，不静默丢弃。
+
     **不再伪造结尾 [DONE]**：上游流结束却未发 [DONE] 属于"静默截断"——
     继续伪造会把不完整响应伪装成正常完成，客户端（agent）把写了一半的
     文档当成功收货且毫无报错。截断真相通过 `state["saw_done"]` 上报给
@@ -594,11 +604,26 @@ class StreamWinner:
             self.final_state = {}
 
     async def lines(self) -> AsyncIterator[str]:
+        # 兼容规整器总开关（渠道隔离，SystemSetting 配置，默认开启）：
+        # - "on"（默认）：解密器 + 工具流规整器挂载。两者对行为良好的上游
+        #   是零改动快速路径（无 gAAAA 密文 / 无畸形 tool_calls 时逐字节
+        #   透传），只对"协议破损"的方言（muse/zen 换 id、整段重述、加密
+        #   思考）出手——即 new-api 的哲学：同协议好上游字节级透传，
+        #   破损上游重建流。
+        # - "off"：纯转发模式，上游字节原样直达客户端（自担方言风险）。
+        compat = str(sysconfig.get(
+            "stream_compat_normalizers", self.route.key.channel) or "on"
+        ).strip().lower() != "off"
         # 工具调用流规整：放置于解密/协议转换之后、下发客户端之前——
         # 上游（muse/zen 等）可能发乱序 tool_calls（换 id + 全参重复），
         # OpenAI SDK 按 index 累加参数会得到非法 JSON。
         tc_norm = ToolCallStreamNormalizer()
         if responses_api.is_responses_url(_route_url(self.route)):
+            if not compat:
+                async for chunk in responses_api.iter_responses_sse(
+                        self.first_line, self.aiter, done_state=self.final_state):
+                    yield chunk
+                return
             async for chunk in responses_api.iter_responses_sse(
                     self.first_line, self.aiter, done_state=self.final_state):
                 # Responses 链路的 reasoning 已在 iter_responses_sse 内由 _reasoning_text 解密
@@ -606,6 +631,11 @@ class StreamWinner:
                 for out in tc_norm.feed(decrypt_sse_chunk(chunk)):
                     yield out
         else:
+            if not compat:
+                async for chunk in iter_sse(self.first_line, self.aiter,
+                                            state=self.final_state):
+                    yield chunk
+                return
             decryptor = StreamReasoningDecryptor()
             try:
                 async for chunk in iter_sse(self.first_line, self.aiter,

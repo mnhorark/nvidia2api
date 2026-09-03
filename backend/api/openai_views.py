@@ -29,6 +29,7 @@ from services.load_balancer import build_routes
 from services.race_engine import (
     AllRoutesFailed, NoRouteAvailable, UpstreamTruncated, race_chat, race_stream,
 )
+from services.stream_pipeline import StreamTap
 from .auth import openai_error
 
 logger = logging.getLogger("nvidia2api.openai")
@@ -195,60 +196,41 @@ def _not_found_error(name: str, channel_slug: str | None):
     return openai_error(msg, "model_not_found", 404, "invalid_request_error")
 
 
-# 协议转换的内部控制字段——绝不透传给上游
-_INTERNAL_ONLY = frozenset({"channel"})
 # 显式不透传给上游的字段（避免 400 或语义错误）
-# - thinking 族由 thinking.build_upstream 按目标 host 归一化后透传
-_DROP_FOR_UPSTREAM = frozenset({
+# 单一事实来源：思考族字段清单由 thinking.THINKING_PARAM_KEYS 派生——
+# 这批字段的"归一化产物"由 thinking.build_upstream 回填，客户端发来的
+# 原始形态（SDK 展开残留如 extra_body / reasoning_effort_value）必须拦下，
+# 否则大部分 OpenAI 兼容上游会整包 400。
+# 旧实现手工维护了第二份清单且漏掉 extra_body / reasoning_effort_value，
+# 已修复为派生。
+_DROP_FOR_UPSTREAM = thinking.THINKING_PARAM_KEYS | frozenset({
     "channel",
-    "thinking",
-    "enable_thinking",
-    "reasoning",
-    "reasoning_content",
-    "reasoning_budget",
-    "reasoning_effort",
-    "reasoning_effort_override",
-    "reasoning_enabled",
-    "reasoning_config",
-    "reasoning_level",
-    "reasoning_mode",
-    "reasoning_type",
-    "reasoning_detail",
-    "reasoning_details",
-    "thinking_budget",
-    "thinking_config",
-    "thinking_enabled",
-    "thinking_level",
-    "thinking_mode",
-    "thinking_type",
-    "enable_thinking",
+    # thinking.THINKING_KEY_PATTERNS 里的长尾形态（不在 PARAM_KEYS 里，
+    # 但同样不允许原始透传——build_upstream 已按需归一化回填）
     "enabled_thinking",
     "is_thinking",
-    "chat_template_kwargs",
-    "clear_thinking",
-    "grok_thinking",
-    "thinking_beta",
-    "betas",
-    "openai",
-    "anthropic",
+    "thinking_mode",
+    "thinking_type",
 })
 
 
-def _build_upstream_body(body: dict, model_name: str, channel=None) -> dict:
+def _build_upstream_body(body: dict, model_name: str, channel=None,
+                         thinking_params: dict | None = None) -> dict:
     """通用参数透传 + 思考强度参数归一化下发。
 
     无损原则（对标 one-api / new-api / RikkaHub）：
-    - 除 _DROP_FOR_UPSTREAM 的思考族字段外，全部忠实透传
+    - 除 _DROP_FOR_UPSTREAM 外**全部忠实透传，含显式 null**——
+      null 在 JSON 语义里是"显式未设置"，与缺省不同，剥掉属于改写请求；
     - 不要用白名单过滤未知字段——未来的官方参数会因此被静默丢弃
     - model 始终用真实模型名覆盖
+
+    `thinking_params` 可传入已计算的归一化结果复用（调用方要为日志再算
+    一次时避免二次全量扫描）。
     """
-    # 透传所有非思考族参数（thinking 族由 build_upstream 归一化后透传）
-    upstream = {
-        k: v for k, v in body.items()
-        if k not in _DROP_FOR_UPSTREAM and v is not None
-    }
+    upstream = {k: v for k, v in body.items() if k not in _DROP_FOR_UPSTREAM}
     # 思考参数归一化后下发（按渠道隔离）
-    upstream.update(thinking.build_upstream(body, model_name, channel))
+    upstream.update(thinking_params if thinking_params is not None
+                    else thinking.build_upstream(body, model_name, channel))
     # 上游必须用真实模型名（别名不透传）
     upstream["model"] = model_name
     # 流式 usage 选项
@@ -339,14 +321,16 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
 
         model_name = model.model_name
         stream = bool(body.get("stream"))
-        upstream_body = _build_upstream_body(body, model_name, channel)
+        # 思考参数归一化只算一次：同一份结果既合入上游请求体、又记审计日志
+        upstream_thinking = thinking.build_upstream(body, model_name, channel)
+        upstream_body = _build_upstream_body(body, model_name, channel,
+                                             thinking_params=upstream_thinking)
         # 跨轮重复 tool_call id 唯一化（zen/Anthropic 系强校验
         # "每个 function_call 恰好一个 output"，跨轮同名 id 整包 400）
         message_fixups.dedupe_tool_call_ids(upstream_body)
         # 超长工具名（上游 >64 字符会 400）替换为确定性短别名，
         # 映射表在响应返回客户端前还原（工具调用对客户端无感）
         tool_alias_map = tool_alias.shorten_function_names(upstream_body)
-        upstream_thinking = thinking.build_upstream(body, model_name, channel)
         try:
             _flat_for_log = thinking._flatten(body)
         except Exception:
@@ -411,6 +395,21 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
             if not attempt_routes:
                 last_exc = NoRouteAvailable()
                 continue
+            if attempt > 0:
+                # 重试换线同样要过上游并发闸门（旧实现只在首次预留，
+                # 重试时按陈旧额度跑满新线路，闸门被绕过）。
+                _release_upstream(upstream_reserved)
+                upstream_reserved = _reserve_upstream(len(attempt_routes))
+                if upstream_reserved < len(attempt_routes):
+                    # 被裁线路的 Key 已在 build_routes 内领取 RPM 名额，
+                    # 整条丢弃前必须退回。
+                    for dropped in attempt_routes[upstream_reserved:]:
+                        if dropped.claimed and getattr(dropped.key, "id", None):
+                            key_service.release_rpm_slot(dropped.key.id)
+                    attempt_routes = attempt_routes[:upstream_reserved]
+                if not attempt_routes:
+                    last_exc = NoRouteAvailable()
+                    continue
             try:
                 result = race_chat(attempt_routes, upstream_body)
                 break
@@ -538,69 +537,10 @@ def anthropic_count_tokens(request, channel_slug: str | None = None):
     return JsonResponse({"input_tokens": anthropic_api.count_tokens(body)})
 
 
-_CONTENT_DELTA_KEYS = ("content", "tool_calls")
-
-
-def _chunk_has_content(line: str) -> bool:
-    if not line.startswith("data:"):
-        return False
-    payload = line[5:].strip()
-    if payload == "[DONE]":
-        return True
-    try:
-        data = json.loads(payload)
-    except Exception:
-        return False
-    if not isinstance(data, dict):
-        return False
-    if data.get("usage"):
-        return True
-    choices = data.get("choices")
-    if not choices or not isinstance(choices, list):
-        return False
-    first = choices[0]
-    if not isinstance(first, dict):
-        return False
-    if first.get("finish_reason"):
-        return True
-    delta = first.get("delta")
-    if isinstance(delta, dict):
-        for key in _CONTENT_DELTA_KEYS:
-            if delta.get(key):
-                return True
-    return False
-
-
-def _chunk_has_any_signal(line: str) -> bool:
-    if not line.startswith("data:"):
-        return False
-    payload = line[5:].strip()
-    if payload == "[DONE]":
-        return True
-    try:
-        data = json.loads(payload)
-    except Exception:
-        return False
-    if not isinstance(data, dict):
-        return False
-    if data.get("usage"):
-        return True
-    choices = data.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return False
-    first = choices[0]
-    if not isinstance(first, dict):
-        return False
-    if first.get("finish_reason"):
-        return True
-    if isinstance(first.get("text"), str) and first["text"]:
-        return True
-    delta = first.get("delta")
-    if isinstance(delta, dict):
-        for key in ("content", "reasoning_content", "reasoning", "tool_calls"):
-            if delta.get(key):
-                return True
-    return False
+# 转发路径的 chunk 观察统一走 StreamTap（单次解析、零改写）：
+# 旧实现在这里有两份逐行差两行的 JSON 探测器（_chunk_has_content /
+# _chunk_has_any_signal），加记账循环每 chunk 最多 3 次 json.loads，
+# 且"已交付内容"的语义在两处口径不一。见 services/stream_pipeline.py。
 
 
 async def _stream_response(routes, upstream_body, holder, user_key, channel,
@@ -613,8 +553,6 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
         return tool_alias.restore_stream_chunk(chunk, tool_map) if tool_map else chunk
 
     winner = None
-    sent_content = False
-    done_sent = False
     last_exc: Exception | None = None
     idle_timeout = float(sysconfig.get("stream_idle_timeout", channel) or 0)
     heartbeat = float(sysconfig.get("stream_heartbeat_interval", channel) or 0)
@@ -675,6 +613,7 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                     await asyncio.sleep(backoff)
                 continue
             w = None
+            tap = StreamTap()  # 整条尝试共用一个观察器（race 失败时为空态）
             try:
                 w = await race_stream(rs, upstream_body)
                 if reserved > 1:
@@ -703,52 +642,28 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                 except Exception:
                     pass
                 await run_db(log.save)
-                usage: dict = {}
-                completion_text: list[str] = []
-                saw_finish_reason = False
+                # 单点观察：_drain 内每 chunk 只解析一次，这里只读累积态
                 truncated = False
                 try:
                     async for chunk in _drain(w, idle_timeout, heartbeat,
-                                      max_duration, content_idle_timeout):
-                        if _chunk_has_content(chunk):
-                            sent_content = True
-                        if chunk.strip() == "data: [DONE]":
-                            done_sent = True
-                        try:
-                            if chunk.startswith("data:"):
-                                payload = json.loads(chunk[5:].strip())
-                                if isinstance(payload, dict):
-                                    if payload.get("usage"):
-                                        usage = payload["usage"]
-                                    choices = payload.get("choices")
-                                    if choices:
-                                        if choices[0].get("finish_reason"):
-                                            saw_finish_reason = True
-                                        delta = choices[0].get("delta") or {}
-                                        for key in ("content", "reasoning_content", "reasoning"):
-                                            v = delta.get(key)
-                                            if isinstance(v, str) and v:
-                                                completion_text.append(v)
-                                                break
-                                        text = choices[0].get("text")
-                                        if isinstance(text, str) and text:
-                                            completion_text.append(text)
-                        except Exception:
-                            pass
+                                      max_duration, content_idle_timeout,
+                                      tap=tap):
                         yield _restore(chunk)
                     # 静默截断检测：流结束了，但既没有 finish_reason 也没有上游
                     # [DONE] —— 上游把流掐了（长连接被网关/代理切断的典型形态）。
                     # 绝不能伪装成成功：未发内容走换线重试，已发内容显式报错。
-                    # final_state 缺失（测试 monkeypatch lines()）时退回信任 done_sent。
+                    # final_state 缺失（测试 monkeypatch lines()）时退回信任 tap.saw_done。
                     upstream_done = bool(
                         (getattr(w, "final_state", None) or {}).get(
-                            "saw_done", done_sent))
-                    if not (saw_finish_reason or upstream_done):
+                            "saw_done", tap.saw_done))
+                    if not (tap.finish_reason or upstream_done):
                         truncated = True
-                        if not sent_content:
+                        if not tap.sent_content:
                             raise UpstreamTruncated(
                                 "upstream closed stream without finish_reason/[DONE]")
                 finally:
+                    usage = dict(tap.usage)
+                    completion_text = tap.completion_parts
                     if truncated:
                         log.status = "failed"
                         log.error_type = "upstream_truncated"
@@ -792,11 +707,11 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                                   "type": "api_error", "param": None,
                                   "code": "upstream_truncated"}
                     }) + "\n\n"
-                    if not done_sent:
+                    if not tap.saw_done:
                         yield "data: [DONE]\n\n"
                     await settle(False)
                     return
-                if not done_sent:
+                if not tap.saw_done:
                     # 上游给出了 finish_reason 但漏发 [DONE]：内容已完整，
                     # 补一个干净的收尾帧保证协议闭合
                     yield "data: [DONE]\n\n"
@@ -827,7 +742,7 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                 if attempt + 1 < max_attempts and backoff > 0:
                     await asyncio.sleep(backoff)
             except Exception as exc:
-                if sent_content or done_sent:
+                if tap.sent_content or tap.saw_done:
                     # 线路中途死亡（含已出部分内容后断流）：竞速时该 Key 已被
                     # _mark_success 记为成功，但中途死亡是真实故障。补记一次失败
                     # （不标 invalid，仅累计 failure_count + 冷却），否则"先吐
@@ -856,7 +771,7 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                                   "type": "api_error", "param": None,
                                   "code": "stream_truncated"}
                     }) + "\n\n"
-                    if not done_sent:
+                    if not tap.saw_done:
                         yield "data: [DONE]\n\n"
                     await settle(False)
                     return
@@ -965,9 +880,21 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
 
 async def _drain(winner, idle_timeout: float = 0,
                  heartbeat: float = 0, max_duration: float = 0,
-                 content_idle_timeout: float = 0):
+                 content_idle_timeout: float = 0,
+                 tap: "StreamTap | None" = None):
+    """转发泵：从 winner 读上游 chunk 原样下发给客户端。
+
+    透传纯度：本函数不改写任何字节；超时窗口内只注入 `: keep-alive`
+    SSE 注释行（对 OpenAI/Anthropic/Responses 客户端均不可见）。
+    每个真实 chunk 恰好解析一次（tap.feed），供超时档位切换与调用方
+    记账共享——旧实现同一 chunk 在这里探测一次、调用方再解析两次。
+    调用方不传 tap 时内部自建（超时档位切换仍正常）。
+    """
     import asyncio
     import time as _time
+
+    if tap is None:
+        tap = StreamTap()
 
     ait = winner.lines()
     started = _time.monotonic()
@@ -1006,7 +933,10 @@ async def _drain(winner, idle_timeout: float = 0,
                 if chunk is None:
                     break
                 last_data = _time.monotonic()
-                if not seen_signal and _chunk_has_any_signal(chunk):
+                info = tap.feed(chunk) if tap is not None else None
+                if not seen_signal and info is not None and (
+                        info.has_payload or info.has_reasoning
+                        or info.has_usage or info.has_finish or info.saw_done):
                     seen_signal = True
                 yield chunk
                 continue
@@ -1021,7 +951,10 @@ async def _drain(winner, idle_timeout: float = 0,
                 if chunk is None:
                     break
                 last_data = _time.monotonic()
-                if not seen_signal and _chunk_has_any_signal(chunk):
+                info = tap.feed(chunk) if tap is not None else None
+                if not seen_signal and info is not None and (
+                        info.has_payload or info.has_reasoning
+                        or info.has_usage or info.has_finish or info.saw_done):
                     seen_signal = True
                 yield chunk
             else:
@@ -1038,7 +971,10 @@ async def _drain(winner, idle_timeout: float = 0,
                             f"{round(elapsed, 1)}s (> content_idle_timeout "
                             f"{content_idle_timeout}s)")
                 if heartbeat and heartbeat > 0:
-                    yield ": keep-alive\n\n"
+                    heartbeat_frame = ": keep-alive\n\n"
+                    if tap is not None:
+                        tap.feed(heartbeat_frame)  # 注释行：不产生信号
+                    yield heartbeat_frame
     finally:
         if read_task is not None and not read_task.done():
             read_task.cancel()

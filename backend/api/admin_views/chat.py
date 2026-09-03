@@ -128,7 +128,8 @@ class AdminChatView(AdminRequiredMixin, APIView):
         from services import sysconfig
         from services.load_balancer import build_routes
         from services.race_engine import AllRoutesFailed, NoRouteAvailable, race_stream
-        from ..openai_views import _chunk_has_content, _drain
+        from services.stream_pipeline import StreamTap
+        from ..openai_views import _drain
         routes = build_routes(channel, proxy_group=proxy_group, endpoint=endpoint)
         request_id = ks.new_request_id()
         log = RequestLog.objects.create(channel=channel, request_id=request_id, model=model, routes_count=len(routes), is_stream=True, client_thinking=client_thinking or {}, upstream_thinking=upstream_thinking or {})
@@ -143,6 +144,8 @@ class AdminChatView(AdminRequiredMixin, APIView):
         idle_timeout = float(sysconfig.get('stream_idle_timeout', channel) or 0)
         heartbeat = float(sysconfig.get('stream_heartbeat_interval', channel) or 0)
         max_duration = float(sysconfig.get('stream_max_duration', channel) or 0)
+        # 内容出现后的静默判死（与 /v1 流式同参）：思考模型长停顿/掐流兜底
+        content_idle_timeout = float(sysconfig.get('stream_content_idle_timeout', channel) or 0)
 
         async def gen():
             from services.loop_offload import run_db
@@ -156,7 +159,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
                     logger.exception("admin stream log save failed (req %s)", request_id)
 
             winner = None
-            sent_content = False
+            tap = StreamTap()  # 整条尝试共用一个观察器（race 失败时为空态）
             try:
                 winner = await race_stream(routes, body)
                 log.winner_route_type = winner.route.kind
@@ -178,45 +181,23 @@ class AdminChatView(AdminRequiredMixin, APIView):
                 await _safe_save()
                 duration = log.first_token_ms
                 yield ('data: ' + json.dumps({'meta': {'request_id': request_id, 'channel': channel.slug, 'route_type': winner.route.kind, 'key_name': winner.route.key.name, 'proxy_name': winner.route.proxy.name if winner.route.proxy else '', 'first_chunk_ms': duration, 'routes': winner.report or []}}) + '\n\n')
-                usage: dict = {}
-                completion_text: list[str] = []
+                # 单点观察（与 /v1 流式同一 StreamTap 管线）：_drain 每 chunk
+                # 解析一次，这里只读累积态
                 stream_ok = False
-                done_sent = False
-                saw_finish_reason = False
                 truncated_stream = False
                 try:
-                    async for chunk in _drain(winner, idle_timeout, heartbeat, max_duration):
-                        if _chunk_has_content(chunk):
-                            sent_content = True
-                        if chunk.strip() == 'data: [DONE]':
-                            done_sent = True
-                        try:
-                            if chunk.startswith('data:'):
-                                payload = json.loads(chunk[5:].strip())
-                                if isinstance(payload, dict):
-                                    if payload.get('usage'):
-                                        usage = payload['usage']
-                                    choices = payload.get('choices')
-                                    if choices:
-                                        if choices[0].get('finish_reason'):
-                                            saw_finish_reason = True
-                                        delta = choices[0].get('delta') or {}
-                                        for key in ('content', 'reasoning_content', 'reasoning'):
-                                            v = delta.get(key)
-                                            if isinstance(v, str) and v:
-                                                completion_text.append(v)
-                                                break
-                        except Exception:
-                            pass
+                    async for chunk in _drain(winner, idle_timeout, heartbeat, max_duration,
+                                              content_idle_timeout, tap=tap):
                         yield chunk
                     # 静默截断检测（与 /v1 流式同语义）：流结束但既无 finish_reason
                     # 也无上游 [DONE] = 上游掐断，必须如实上报而非伪装成功
                     upstream_done = bool(
                         (getattr(winner, 'final_state', None) or {}).get(
-                            'saw_done', done_sent))
-                    stream_ok = bool(saw_finish_reason or upstream_done)
+                            'saw_done', tap.saw_done))
+                    stream_ok = bool(tap.finish_reason or upstream_done)
                     truncated_stream = not stream_ok
                 finally:
+                    usage = dict(tap.usage)
                     if truncated_stream:
                         log.status = "failed"
                         log.error_type = "upstream_truncated"
@@ -233,9 +214,9 @@ class AdminChatView(AdminRequiredMixin, APIView):
                         log.prompt_tokens = tokenizer.estimate_messages_tokens(body.get('messages'))
                     if usage.get('completion_tokens'):
                         log.completion_tokens = usage['completion_tokens']
-                    elif ''.join(completion_text).strip():
+                    elif tap.completion_text.strip():
                         from services import tokenizer
-                        log.completion_tokens = tokenizer.estimate_tokens(''.join(completion_text))
+                        log.completion_tokens = tokenizer.estimate_tokens(tap.completion_text)
                     log.total_tokens = (log.prompt_tokens or 0) + (log.completion_tokens or 0)
                     details = usage.get('prompt_tokens_details') or {}
                     log.cached_tokens = details.get('cached_tokens', 0) or 0

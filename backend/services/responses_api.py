@@ -510,9 +510,13 @@ def responses_to_chat_body(rb: dict) -> dict:
 
     无损原则：同名透传 + 结构性映射（input->messages、max_output_tokens->
     max_tokens、instructions->system、reasoning.effort->reasoning_effort、
-    tools/text 包装），responses 独有且 chat 无法表达的字段
-    （previous_response_id/truncation/include 等）不携带以避免 400，
-    其余未知顶层字段一律保留。
+    tools/text 包装），其余未知顶层字段一律保留（forward-compat）。
+
+    例外——Responses 会话态字段必须剔除（docstring 声明与实现曾互相矛盾，
+    旧实现的"保留未知字段"循环把这些字段原样漏进 chat 上游）：
+    - previous_response_id：服务端会话存储引用，本平台无状态代理不实现
+      （每轮全量重放 input），带着它只会造成 400 或静默错误语义；
+    - truncation / include：Responses 独有参数，chat 协议无法表达。
     """
     out: dict[str, Any] = {}
     for key in _RESPONSES_COMMON | _CHAT_ONLY:
@@ -523,7 +527,13 @@ def responses_to_chat_body(rb: dict) -> dict:
         "tools", "tool_choice", "reasoning", "max_output_tokens",
         "instructions", "input", "text",
     })
+    # Responses 会话态/独有字段：进入 chat 上游前剔除（见 docstring）
+    _RESPONSES_SESSION_ONLY = frozenset({
+        "previous_response_id", "truncation", "include",
+    })
     for key, val in rb.items():
+        if key in _RESPONSES_SESSION_ONLY:
+            continue
         if key not in _RESPONSES_COMMON and key not in _CHAT_ONLY \
                 and key not in _RESPONSES_STRUCTURAL and val is not None:
             out[key] = val
@@ -597,7 +607,11 @@ def _input_item_to_message(item):
                     parts.append({"type": "image_url", "image_url": img})
             content = parts
         return {"role": role, "content": content}
-    return {"role": "user", "content": str(item)}
+    # 未知 input 条目类型（item_reference / 未来新增）：以规范 JSON 文本
+    # 降级为 user 内容。旧实现 str(item) 会产出 Python dict repr（单引号
+    # 伪 JSON），模型侧完全不可解析。
+    return {"role": "user",
+            "content": json.dumps(item, ensure_ascii=False)}
 
 
 def chat_to_responses_payload(chat: dict, echo: dict | None = None) -> dict:
@@ -897,26 +911,68 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
     忠实补全 Responses 生命周期：created/in_progress、各 output_item 的
     added/done（reasoning / message / function_call）、增量 delta 事件，
     最后 completed + [DONE]。异步生成器以保持真正的逐块流式。
+
+    传输层审查修复（2026-09）：
+    - **工具槽位按 tc.index 跟踪**：OpenAI 规范流里 id 只出现在首帧，后续
+      参数增量帧 id 为空串。旧实现 `if iid:` 才累积/下发参数 → 所有后续
+      增量被静默丢弃，客户端拿到 arguments 为空的 function_call。
+    - **usage 时序**：usage 在独立空 choices 尾帧且位于 finish 帧之后；
+      response.completed 延迟到 [DONE]/流尾才发，usage 不再恒为 {}。
+    - output_index 按条目宣告顺序递增（旧实现恒为 0）。
     """
     emitted_created = False
     done_sent = False
+    error_seen = False
     usage: dict = {}
     reasoning_acc = ""
     content_acc = ""
-    tool_args: dict[str, str] = {}
-    tool_names: dict[str, str] = {}
-    # 已宣告过的条目 id（用于 output_item.added 去重）
-    announced: set[str] = set()
+    # 工具槽位注册表：slot_key -> {item_id, name, args, output_index}
+    tool_slots: dict = {}
+    # 已宣告过的条目 id（用于 output_item.added 去重）及其 output_index
+    announced: set = set()
+    output_indices: dict = {}
+    next_output_index = 0
     message_item_id = "msg_0"
+    # 终结延迟态：finish 帧记录 (rid, model, finish)，response.completed
+    # 等到 [DONE]/流尾再发——usage 尾帧在 finish 之后才到
+    pending_finish: tuple | None = None
 
     async def announce(item: dict) -> AsyncIterator[str]:
+        nonlocal next_output_index
         iid = item.get("id")
         if iid in announced:
             return
         announced.add(iid)
+        output_indices[iid] = next_output_index
         yield _sse_event("response.output_item.added",
                          {"type": "response.output_item.added",
-                          "output_index": 0, "item": item})
+                          "output_index": next_output_index, "item": item})
+        next_output_index += 1
+
+    def _completed_event(rid: str, model: str, finish: str) -> str:
+        if finish == "stop" or finish == "tool_calls":
+            status = "completed"
+        else:
+            status = "incomplete"
+        completed: dict = {
+            "type": "response.completed",
+            "response": {"id": rid, "object": "response",
+                         "status": status, "model": model,
+                         # chat 键名 -> Responses 键名（input/output_tokens）
+                         "usage": _usage_to_responses(usage)},
+        }
+        if finish in _FINISH_TO_RESPONSES:
+            completed["response"]["incomplete_details"] = {
+                "reason": _FINISH_TO_RESPONSES[finish]}
+        return _sse_event("response.completed", completed)
+
+    async def emit_terminator(rid: str, model: str, finish) -> AsyncIterator[str]:
+        """流尾收尾：completed（finish 已见且无 error）+ [DONE]。"""
+        nonlocal done_sent
+        if finish and not error_seen:
+            yield _completed_event(rid, model, str(finish))
+        yield "data: [DONE]\n\n"
+        done_sent = True
 
     try:
         async for chunk in chat_iter:
@@ -928,7 +984,11 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
                 continue
             payload = chunk[5:].strip().rstrip("\n")
             if payload == "[DONE]":
-                if not done_sent:
+                if pending_finish:
+                    rid, model, finish = pending_finish
+                    async for _e in emit_terminator(rid, model, finish):
+                        yield _e
+                else:
                     yield "data: [DONE]\n\n"
                     done_sent = True
                 return
@@ -939,9 +999,13 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
             if not isinstance(data, dict):
                 continue
             if data.get("error"):
+                error_seen = True
                 yield _sse_event("response.failed",
                                  {"type": "response.failed", "error": data["error"]})
                 continue
+            # usage 捕获先于 choices 判空：usage 常在独立空 choices 尾帧
+            if data.get("usage"):
+                usage = data["usage"]
             choices = data.get("choices") or []
             if not choices:
                 continue
@@ -967,7 +1031,8 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
                                            "status": "in_progress", "summary": []}):
                     yield _ev
                 yield _sse_event("response.reasoning_summary_text.delta", {
-                    "type": "response.reasoning_summary_text.delta", "output_index": 0,
+                    "type": "response.reasoning_summary_text.delta",
+                    "output_index": output_indices.get("rs_0", 0),
                     "delta": str(reasoning),
                 })
             content = delta.get("content")
@@ -978,74 +1043,97 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
                                            "content": []}):
                     yield _ev
                 yield _sse_event("response.output_text.delta", {
-                    "type": "response.output_text.delta", "output_index": 0,
+                    "type": "response.output_text.delta",
+                    "output_index": output_indices.get(message_item_id, 0),
                     "delta": str(content),
                 })
             tool_calls = delta.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tc in tool_calls:
-                    iid = str(tc.get("id") or "")
+                    if not isinstance(tc, dict):
+                        continue
                     fn = tc.get("function") or {}
-                    if iid and iid not in announced:
-                        async for _ev in announce({"id": iid, "type": "function_call",
-                                                   "status": "in_progress", "call_id": iid,
-                                                   "name": str(fn.get("name") or ""),
-                                                   "arguments": ""}):
-                            yield _ev
-                    if iid:
-                        if fn.get("name"):
-                            tool_names[iid] = str(fn["name"])
-                        args = str(fn.get("arguments") or "")
-                        tool_args[iid] = tool_args.get(iid, "") + args
+                    iid = str(tc.get("id") or "")
+                    name = str(fn.get("name") or "")
+                    args = str(fn.get("arguments") or "")
+                    # 槽位键：OpenAI 规范流按 index 累积（后续帧 id 为空串）；
+                    # 无 index 的方言帧按 id 精确匹配兜底
+                    slot = tc.get("index")
+                    if isinstance(slot, int) and slot >= 0:
+                        key = ("slot", slot)
+                    elif iid:
+                        key = ("id", iid)
+                    else:
+                        key = None
+                    entry = tool_slots.get(key) if key is not None else None
+                    if entry is None and key is None and tool_slots:
+                        # 无 index 无 id：归并到最近槽（防御性）
+                        entry = list(tool_slots.values())[-1]
+                    if entry is None:
+                        item_id = iid or f"fc_{len(tool_slots)}"
+                        entry = {"item_id": item_id, "name": name,
+                                 "args": "", "output_index": None}
+                        if key is not None:
+                            tool_slots[key] = entry
+                    else:
+                        if name and not entry["name"]:
+                            entry["name"] = name
+                    if entry["output_index"] is None:
+                        # 该槽位首帧：宣告 function_call 条目
+                        entry["output_index"] = next_output_index
+                        next_output_index += 1
+                        announced.add(entry["item_id"])
+                        output_indices[entry["item_id"]] = entry["output_index"]
+                        yield _sse_event("response.output_item.added", {
+                            "type": "response.output_item.added",
+                            "output_index": entry["output_index"],
+                            "item": {"id": entry["item_id"], "type": "function_call",
+                                     "status": "in_progress",
+                                     "call_id": entry["item_id"],
+                                     "name": entry["name"], "arguments": ""}})
+                    if args:
+                        entry["args"] += args
                         yield _sse_event("response.function_call_arguments.delta", {
                             "type": "response.function_call_arguments.delta",
-                            "output_index": 0, "item_id": iid,
+                            "output_index": entry["output_index"],
+                            "item_id": entry["item_id"],
                             "delta": args,
                         })
-            if data.get("usage"):
-                usage = data["usage"]
             finish = ch.get("finish_reason")
             if finish:
+                # 结束各 output_item（内容已定）；response.completed 延迟到
+                # [DONE]/流尾——usage 尾帧在 finish 之后才到
                 if "rs_0" in announced:
                     yield _sse_event("response.output_item.done", {
-                        "type": "response.output_item.done", "output_index": 0,
+                        "type": "response.output_item.done",
+                        "output_index": output_indices.get("rs_0", 0),
                         "item": {"id": "rs_0", "type": "reasoning",
                                  "status": "completed", "summary": []},
                     })
                 if message_item_id in announced:
                     yield _sse_event("response.output_text.done", {
-                        "type": "response.output_text.done", "output_index": 0,
+                        "type": "response.output_text.done",
+                        "output_index": output_indices.get(message_item_id, 0),
                         "text": content_acc, "item_id": message_item_id,
                     })
                     yield _sse_event("response.output_item.done", {
-                        "type": "response.output_item.done", "output_index": 0,
+                        "type": "response.output_item.done",
+                        "output_index": output_indices.get(message_item_id, 0),
                         "item": {"id": message_item_id, "type": "message",
                                  "role": "assistant", "status": "completed",
                                  "content": [{"type": "output_text", "text": content_acc}]},
                     })
-                for iid in announced:
-                    if iid not in ("rs_0", message_item_id):
-                        yield _sse_event("response.output_item.done", {
-                            "type": "response.output_item.done", "output_index": 0,
-                            "item": {"id": iid, "type": "function_call",
-                                     "status": "completed", "call_id": iid,
-                                     "name": tool_names.get(iid, ""),
-                                     "arguments": tool_args.get(iid, "")},
-                        })
-                if finish == "stop" or finish == "tool_calls":
-                    status = "completed"
-                else:
-                    status = "incomplete"
-                completed: dict = {
-                    "type": "response.completed",
-                    "response": {"id": rid, "object": "response",
-                                 "status": status, "model": data.get("model") or "",
-                                 "usage": usage},
-                }
-                if finish in _FINISH_TO_RESPONSES:
-                    completed["response"]["incomplete_details"] = {
-                        "reason": _FINISH_TO_RESPONSES[finish]}
-                yield _sse_event("response.completed", completed)
+                for entry in tool_slots.values():
+                    yield _sse_event("response.output_item.done", {
+                        "type": "response.output_item.done",
+                        "output_index": entry["output_index"],
+                        "item": {"id": entry["item_id"], "type": "function_call",
+                                 "status": "completed",
+                                 "call_id": entry["item_id"],
+                                 "name": entry["name"],
+                                 "arguments": entry["args"]},
+                    })
+                pending_finish = (rid, data.get("model") or "", str(finish))
     finally:
         # 客户端断开 / 外层 aclose 时，内层 chat 生成器（_stream_response）必须
         # 被显式关闭——否则其 finally（含并发闸门 _bump_active(-1)）要等 GC 触发，
@@ -1055,4 +1143,10 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
         except Exception:  # noqa: BLE001
             pass
     if not done_sent:
-        yield "data: [DONE]\n\n"
+        # 上游流关闭却未见 [DONE]：补终结（completed 仅在 finish 已见时发）
+        if pending_finish:
+            rid, model, finish = pending_finish
+            async for _e in emit_terminator(rid, model, finish):
+                yield _e
+        else:
+            yield "data: [DONE]\n\n"

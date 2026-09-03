@@ -126,6 +126,10 @@ RUNTIME_PARAMS: dict[str, tuple[str, object, str, str]] = {
     "default_thinking_effort": ("str", "high",
                                 "未指定档位时的默认思考强度"
                                 "（off/minimal/low/medium/high/xhigh/max）", "thinking"),
+    "stream_compat_normalizers": ("str", "on",
+                                  "流式兼容规整器总开关（on=加密思考解密+工具流"
+                                  "规整，对行为良好的上游零改动快速路径；"
+                                  "off=纯字节转发，自担方言流风险）", "stream"),
 }
 
 # 兼容旧库里已经写入的 key
