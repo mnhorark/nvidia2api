@@ -684,24 +684,6 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                     if truncated:
                         log.status = "failed"
                         log.error_type = "upstream_truncated"
-                    elif tap.saw_error:
-                        # 上游流内 error 帧（流已建立、上游在数据流里报错，
-                        # 如 muse 超上下文窗口）：字节已如实透传给客户端，
-                        # 但记账必须如实——status=failed + 上游错误详情入
-                        # routes 明细，渠道健康同步入账（下方 record）。
-                        log.status = "failed"
-                        log.error_type = "upstream_stream_error"
-                        log.http_status = 200
-                        err = dict(tap.error_detail or {})
-                        log.routes = (log.routes or []) + [{
-                            "name": getattr(w.route, "name", ""),
-                            "kind": getattr(w.route, "kind", ""),
-                            "key_name": getattr(w.route.key, "name", ""),
-                            "status": "failed",
-                            "error": "stream_error: " + json.dumps(
-                                err, ensure_ascii=False)[:512],
-                            "http_status": 200,
-                        }]
                     else:
                         log.status = "success"
                     log.duration_ms = round((time.monotonic() - holder["started"]) * 1000, 1)
@@ -750,17 +732,6 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                     # 上游给出了 finish_reason 但漏发 [DONE]：内容已完整，
                     # 补一个干净的收尾帧保证协议闭合
                     yield "data: [DONE]\n\n"
-                if tap.saw_error:
-                    # 上游流内报错：错误帧已零丢失透传给客户端（其报错
-                    # 文案就是上游原文），记账按失败走——settle(False) +
-                    # 渠道健康入账失败。上游语义性错误（如上下文窗口超限）
-                    # 不触发 Key/代理失败计数——那是模型/请求本身的问题，
-                    # 不是线路质量问题。
-                    await settle(False)
-                    from services import channel_health as _ch
-                    await run_db(_ch.record, log.channel, False, 200,
-                                 "upstream_stream_error")
-                    return
                 await settle(True)
                 from services import channel_health
                 await run_db(channel_health.record, log.channel, True, 200)

@@ -326,29 +326,6 @@ class IterSsePassthroughTests(TestCase):
         self.assertIs(state["saw_done"], False)
 
 
-class InlineErrorAccountingTests(TestCase):
-    """上游流内 error 帧（muse 超窗口等）：透传零丢失 + 记账如实。"""
-
-    def test_tap_captures_inline_error(self):
-        from services.stream_pipeline import StreamTap
-        tap = StreamTap()
-        info = tap.feed('data: {"error":{"message":"context window '
-                        'exceeded","code":400}}\n\n')
-        self.assertTrue(info.has_error)
-        self.assertTrue(tap.saw_error)
-        self.assertEqual(tap.error_detail["message"], "context window exceeded")
-
-    def test_plain_error_frame_not_a_truncation_signal(self):
-        """error 帧 + [DONE]：不得误判静默截断（流已如实收尾）。"""
-        from services.stream_pipeline import StreamTap
-        tap = StreamTap()
-        tap.feed('data: {"error":{"message":"boom"}}\n\n')
-        tap.feed("data: [DONE]\n\n")
-        # error 也应锁定重试闸门（已交付内容）
-        self.assertTrue(tap.sent_content)
-        self.assertTrue(tap.saw_done)
-
-
 class ZeroLossContractTests(TestCase):
     """零丢失契约：上游发出的任何字节都不允许被静默丢弃。
 

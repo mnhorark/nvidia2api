@@ -50,9 +50,6 @@ class TapInfo:
     has_usage: bool = False
     # finish_reason 出现（记录到 self.finish_reason）
     has_finish: bool = False
-    # 上游流内 error 帧（流已正常建立、上游在数据流里报错——
-    # 典型：muse 超上下文窗口、内容过滤。透传不变，仅记账）
-    has_error: bool = False
 
 
 @dataclass
@@ -77,9 +74,6 @@ class StreamTap:
     sent_signal: bool = False
     # 累积：上游是否发过显式 [DONE]（截断检测的另一半依据）
     saw_done: bool = False
-    # 累积：上游流内 error 帧（透传不变，仅记账；捕获首条错误详情）
-    saw_error: bool = False
-    error_detail: dict = field(default_factory=dict)
     # 最近一次 feed 的快照（_drain 与消费方按 yield 顺序共享）
     last: TapInfo = field(default_factory=TapInfo)
 
@@ -132,16 +126,6 @@ class StreamTap:
             return info
         info.is_data = True
         info.has_signal = True
-        # 上游流内 error 帧：零丢失透传不变，仅记账（流式请求的日志
-        # 由此判定 failed，不再伪装成功；渠道健康同步入账）
-        if data.get("error"):
-            info.has_error = True
-            self.sent_signal = True
-            if not self.saw_error:
-                self.saw_error = True
-                err = data["error"]
-                self.error_detail = err if isinstance(err, dict) else {
-                    "message": str(err)}
         if data.get("usage"):
             info.has_usage = True
             self.usage = data["usage"]

@@ -77,10 +77,7 @@ def join_url(base: str, path: str) -> str:
 
 class AuthScheme(models.TextChoices):
     BEARER = "bearer", "Bearer Token"
-    # 枚举值是渠道认证方式的**数据标识**（历史迁移与库内数据均为此值，
-    # 不可变更），非任何凭据本体；字面量拆分拼接只为消除静态扫描器
-    # 对 "api_key" 子串的凭据误报，运行期求值结果与原值完全一致。
-    X_API_KEY = "x_" + "api_key", "X-API-Key Header"
+    X_API_KEY = "x_api_key", "X-API-Key Header"
     NONE = "none", "无鉴权"
 
 
