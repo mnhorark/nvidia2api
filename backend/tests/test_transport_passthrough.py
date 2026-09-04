@@ -391,3 +391,135 @@ class ZeroLossContractTests(TestCase):
         msg = {"reasoning_content": blob, "content": "答"}
         decrypt_chat_message(msg)
         self.assertEqual(msg["reasoning_content"], blob)
+
+
+class ChatExitProtocolMetaLineTests(TestCase):
+    """chat 出口的 SSE 元行过滤（req_df22e4f muse 案回归）。
+
+    zen muse 上游每帧携带 `event: response.*` 元行。零丢失透传重构把
+    未识别行原样下发后，元行与翻译后的 chat chunk 混流，客户端按
+    chat 逐帧解析即崩（ZCode TerminalStreamChunkError / context_exceeded
+    误报——完整 Responses 载荷被当正文注入对话上下文）。
+    """
+
+    def test_event_lines_never_reach_chat_exit(self):
+        """主循环里的 event: 元行被过滤，data 翻译与注释照常。"""
+
+        async def src():
+            yield 'event: response.created\n\n'
+            yield 'data: {"type":"response.created","response":{}}\n\n'
+            yield 'event: response.output_text.delta\n\n'
+            yield 'data: {"type":"response.output_text.delta","delta":"hi"}\n\n'
+            yield ': ping\n\n'
+            yield 'data: [DONE]\n\n'
+
+        out = "".join(_collect(responses_api.iter_responses_sse(
+            'event: response.created\n\ndata: {"type":"response.created","response":{}}\n\n',
+            src())))
+        self.assertNotIn("event:", out)
+        self.assertIn('"content": "hi"', out)
+        self.assertIn(": ping", out)
+        self.assertIn("[DONE]", out)
+
+    def test_meta_lines_filtered_in_prelude(self):
+        """竞速 prelude 重放同样过滤元行（无 chat 内容的 data 帧保留）。"""
+
+        async def src():
+            yield 'data: [DONE]\n\n'
+
+        out = "".join(_collect(responses_api.iter_responses_sse(
+            "", src(), include_first=False,
+            prelude=['event: response.created\n\n',
+                     'data: {"type":"response.in_progress","sequence_number":1}\n\n'])))
+        self.assertNotIn("event:", out)
+        self.assertNotIn("in_progress", out)
+
+    def test_id_retry_lines_filtered(self):
+        """id:/retry: 元行同样不允许到达 chat 出口。"""
+
+        async def src():
+            yield 'id: 42\n\n'
+            yield 'retry: 3000\n\n'
+            yield 'data: {"type":"response.output_text.delta","delta":"x"}\n\n'
+            yield 'data: [DONE]\n\n'
+
+        out = "".join(_collect(responses_api.iter_responses_sse(
+            "", src(), include_first=False)))
+        self.assertNotIn("id:", out)
+        self.assertNotIn("retry:", out)
+        self.assertIn('"content": "x"', out)
+
+
+class ChatExitUntranslatedResponseEventTests(TestCase):
+    """第二层过滤：未翻译的 Responses 协议 data 帧不出 chat 出口。
+
+    _translate_event 对已识别但 chat 无对应帧的事件（in_progress /
+    output_item.added 非 function_call / content_part.* / output_item.done
+    的 message 条目）返回 None，零丢失透传会把整包 Response 对象漏进
+    chat 流——客户端解析即崩，大段载荷被注入对话上下文（req_df22e4f 案
+    第二轮 76k 输入的直接来源）。协议内事件（response.*）滤除；
+    协议外自定义事件照旧透传（零丢失契约不破）。
+    """
+
+    def test_recognized_contentless_events_filtered(self):
+        """in_progress / content_part / message done 全族不出口。"""
+
+        async def src():
+            yield 'data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"r1"}}\n\n'
+            yield 'data: {"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}\n\n'
+            yield 'data: {"type":"response.content_part.added","part":{"type":"output_text","text":""}}\n\n'
+            yield 'data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"FULL"}]}}\n\n'
+            yield 'data: {"type":"response.output_text.delta","delta":"hi"}\n\n'
+            yield 'data: [DONE]\n\n'
+
+        out = "".join(_collect(responses_api.iter_responses_sse(
+            "", src(), include_first=False)))
+        self.assertNotIn("response.in_progress", out)
+        self.assertNotIn("output_item.added", out)
+        self.assertNotIn("content_part.added", out)
+        self.assertNotIn('"FULL"', out)          # message done 载荷不入流
+        self.assertIn('"content": "hi"', out)    # 翻译帧照常
+
+    def test_ping_data_frame_filtered(self):
+        """ping data 帧（muse 保活）属协议噪声，不出 chat 出口。"""
+
+        async def src():
+            yield 'data: {"type":"ping","cost":"0"}\n\n'
+            yield 'data: {"type":"response.output_text.delta","delta":"x"}\n\n'
+            yield 'data: [DONE]\n\n'
+
+        out = "".join(_collect(responses_api.iter_responses_sse(
+            "", src(), include_first=False)))
+        self.assertNotIn('"ping"', out)
+        self.assertIn('"content": "x"', out)
+
+    def test_truly_custom_event_still_passes_through(self):
+        """协议外自定义事件照旧透传（零丢失契约不收缩）。"""
+
+        async def src():
+            yield 'data: {"type":"upstream.custom.metric","v":1}\n\n'
+            yield 'data: {"type":"response.output_text.delta","delta":"x"}\n\n'
+            yield 'data: [DONE]\n\n'
+
+        out = "".join(_collect(responses_api.iter_responses_sse(
+            "", src(), include_first=False)))
+        self.assertIn("upstream.custom.metric", out)
+        self.assertIn('"content": "x"', out)
+
+    def test_prelude_untranslated_events_filtered(self):
+        """竞速 prelude 里的协议内事件同样滤除，正文帧从 role 标记起步。"""
+
+        async def src():
+            yield 'data: [DONE]\n\n'
+
+        out = "".join(_collect(responses_api.iter_responses_sse(
+            "", src(), include_first=False,
+            prelude=[
+                'event: response.created\n\n',
+                'data: {"type":"response.created","response":{}}\n\n',
+                'data: {"type":"response.in_progress","sequence_number":1}\n\n',
+            ])))
+        self.assertNotIn("event:", out)
+        self.assertNotIn("in_progress", out)
+        # prelude 不经翻译器：协议 data 帧整帧截留，正文从首帧翻译起步
+        self.assertIn("data: [DONE]", out)

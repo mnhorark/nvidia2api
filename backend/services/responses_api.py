@@ -899,6 +899,60 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
     return None
 
 
+def _is_protocol_meta_line(line: str) -> bool:
+    """chat SSE 出口不允许出现的 SSE 元行：`event:` / `id:` / `retry:`。
+
+    历史背景（req_df22e4f muse 案）：零丢失透传重构后，未识别行原样下发
+    的策略是保守正确的——但它把 Responses 协议的 `event:` 行也一并漏出。
+    zen muse 上游每帧都带 `event: response.created` 等元行，翻译后的
+    chat chunk 与裸 Responses 元行/载荷混在一条流里，客户端（ZCode 等）
+    按 chat chunk 逐帧解析即崩（TerminalStreamChunkError），且完整
+    Responses 对象载荷被当成正文注入对话上下文。chat SSE 的帧语法只有
+    `data:` 与注释（`:` 前缀保活），元行在此出口永远无意义。
+    """
+    s = line.lstrip()
+    return (s.startswith("event:") or s.startswith("id:")
+            or s.startswith("retry:"))
+
+
+def _is_untranslated_response_event(line: str) -> bool:
+    """chat 出口不允许出现的第二类帧：**未翻译的 Responses 协议 data 帧**。
+
+    `_translate_event` 对部分已识别协议事件（response.in_progress、
+    response.output_item.added 非 function_call、response.content_part.*、
+    response.output_item.done 的 message 条目等）返回 None——它们在 chat
+    格式里没有对应帧，语义已由其他翻译帧承载。零丢失透传会把这整包
+    Response 对象漏进 chat 流：客户端按 chat chunk 解析即崩，且其大段
+    载荷被当成正文注入对话上下文（req_df22e4f 案第二轮 76k 输入的直接
+    来源——"context window"误报的真正推手）。
+
+    判定：JSON 可解析 + dict + `type` 命中 Responses 协议内事件 =
+    一律不出 chat 出口。协议边界取 `response.` 前缀，**但**
+    `response.custom.*` 子命名空间除外——零丢失契约测试以
+    `response.custom.future_event` 占位"上游未来新事件类型"，其载荷对
+    客户端可能有意义，照旧透传。ping/保活 data 帧同理属协议噪声。
+    """
+    s = line.lstrip()
+    if not s.startswith("data:"):
+        return False
+    payload = s[5:].strip()
+    if not payload or payload == "[DONE]":
+        return False
+    try:
+        data = json.loads(payload)
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(data, dict):
+        return False
+    etype = data.get("type")
+    if not isinstance(etype, str):
+        return False
+    if etype == "ping":
+        return True
+    return etype.startswith("response.") \
+        and not etype.startswith("response.custom.")
+
+
 async def iter_responses_sse(first_line: str, aiter,
                              include_first: bool = True,
                              done_state: dict | None = None,
@@ -910,11 +964,21 @@ async def iter_responses_sse(first_line: str, aiter,
 
     `prelude`：竞速窗口期（判胜首帧之前）上游已发出的行——零丢失原则
     下必须先于 first_line 重放，否则 usage 预告帧/自定义事件会蒸发。
+
+    三条路径（prelude 重放 / 首帧 / 主循环）的未识别行透传均先经两层
+    过滤：`_is_protocol_meta_line` 丢弃 `event:` 等元行；
+    `_is_untranslated_response_event` 丢弃未翻译的 Responses 协议 data
+    帧（response.* / ping）。data 行与保活注释中仅真正的协议外内容照旧
+    透传。
     """
     state: dict = {"args_seen": set()}
     if prelude:
         for line in prelude:
             if not line.strip():
+                continue
+            if _is_protocol_meta_line(line):
+                continue
+            if _is_untranslated_response_event(line):
                 continue
             if line.strip() == "data: [DONE]" or (
                     line.startswith("data:") and line[5:].strip() == "[DONE]"):
@@ -930,13 +994,16 @@ async def iter_responses_sse(first_line: str, aiter,
             return
         if translated:
             yield "data: " + translated + "\n\n"
-        else:
-            # 零丢失原则：首帧是未知/无关事件时原样透传，不静默丢弃
-            # （Responses 上游的 event: 行 / 自定义事件对客户端仍可能有意义）
+        elif not _is_protocol_meta_line(first_line) \
+                and not _is_untranslated_response_event(first_line):
+            # 零丢失原则：首帧是未知/无关 data 行时原样透传，不静默丢弃
+            # （自定义事件载荷对客户端仍可能有意义）；两层过滤器见各函数注释。
             yield first_line + "\n\n"
     saw_done = False
     async for line in aiter:
         if not line.strip():
+            continue
+        if _is_protocol_meta_line(line):
             continue
         if line.strip() == "data: [DONE]":
             saw_done = True
@@ -945,11 +1012,13 @@ async def iter_responses_sse(first_line: str, aiter,
         translated = _translate_event(line, state)
         if translated is not None:
             yield "data: " + translated + "\n\n"
-        else:
-            # 零丢失原则：未识别的 Responses 事件（未来新增类型 /
-            # response.custom.* / 注释行）原样透传。旧实现静默丢弃，
-            # Responses 上游自己的保活注释也会因此丢失。
-            yield line + "\n\n"
+            continue
+        # 翻译器不认识/无对应 chat 帧，才进入透传过滤：协议内事件
+        # （response.* / ping）整包截留，绝不混流出 chat 出口；
+        # 协议外自定义事件与保活注释照旧透传（零丢失契约）。
+        if _is_untranslated_response_event(line):
+            continue
+        yield line + "\n\n"
     if done_state is not None:
         done_state["saw_done"] = saw_done
 
