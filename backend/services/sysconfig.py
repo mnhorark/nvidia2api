@@ -127,11 +127,9 @@ RUNTIME_PARAMS: dict[str, tuple[str, object, str, str]] = {
                                 "未指定档位时的默认思考强度"
                                 "（off/minimal/low/medium/high/xhigh/max）", "thinking"),
     "stream_reasoning_decrypt": ("bool", False,
-                                 "尝试解密流内加密思考（gAAAA Fernet 密文）。"
-                                 "默认关：密文原样透传——上游自有密钥加密时"
-                                 "本端无钥可解，透传才能保住多轮回传续写；"
-                                 "仅当上游用本端已知密钥（REASONING_DECRYPT_KEY"
-                                 "/ENCRYPTION_KEY）加密时才需要开", "stream"),
+                                 "尝试解密流内加密思考（gAAAA）；默认关="
+                                 "密文原样透传，仅上游用本端密钥加密时开",
+                                 "stream"),
 }
 
 # 兼容旧库里已经写入的 key
