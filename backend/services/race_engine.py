@@ -213,25 +213,31 @@ async def _do_request(route: Route, body: dict,
                 return RaceResult(ok=False, route=route, http_status=resp.status_code,
                                   error_type="invalid_json", latency_ms=_elapsed())
             if is_resp:
-                data = responses_api.responses_payload_to_chat(data)
-            # muse-spark 等上游的 reasoning_content 可能是 Fernet 密文（gAAAA…），
-            # 参考 RikkaHub 的 encrypted_content 逻辑，有密钥时尝试解密后再展示/计分
-            # 同时处理 Kilo/OpenRouter 网关返回的加密 reasoning 内容
-            try:
-                msg = (data.get("choices") or [{}])[0].get("message") if isinstance(data, dict) else None
-                if isinstance(msg, dict):
-                    from services.reasoning_decrypt import decrypt_chat_message as _dec_msg
-                    _dec_msg(msg)
-                    # 额外处理：Kilo/OpenRouter 网关可能在 message 的其他字段里塞了加密思考内容
-                    for _key in ("reasoning", "thinking"):
-                        _val = msg.get(_key)
-                        if isinstance(_val, str) and _val.startswith("gAAAA"):
-                            from services.reasoning_decrypt import decrypt_token as _dec_tok
-                            _dec_val = _dec_tok(_val)
-                            if _dec_val is not None:
-                                msg[_key] = _dec_val
-            except Exception:
-                pass
+                # 非流式 Responses 链路的思考解密同样受 stream_reasoning_decrypt
+                # 控制（默认关：密文原样透传保住多轮回传）
+                data = responses_api.responses_payload_to_chat(
+                    data, decrypt_reasoning=bool(sysconfig.get(
+                        "stream_reasoning_decrypt", route.key.channel)))
+            if sysconfig.get("stream_reasoning_decrypt", route.key.channel):
+                # muse-spark 等上游的 reasoning_content 可能是 Fernet 密文（gAAAA…），
+                # 参考 RikkaHub 的 encrypted_content 逻辑，有密钥时尝试解密后再展示/计分
+                # 同时处理 Kilo/OpenRouter 网关返回的加密 reasoning 内容
+                # （chat 格式路径；解密失败静默保留密文，零丢失）
+                try:
+                    msg = (data.get("choices") or [{}])[0].get("message") if isinstance(data, dict) else None
+                    if isinstance(msg, dict):
+                        from services.reasoning_decrypt import decrypt_chat_message as _dec_msg
+                        _dec_msg(msg)
+                        # 额外处理：Kilo/OpenRouter 网关可能在 message 的其他字段里塞了加密思考内容
+                        for _key in ("reasoning", "thinking"):
+                            _val = msg.get(_key)
+                            if isinstance(_val, str) and _val.startswith("gAAAA"):
+                                from services.reasoning_decrypt import decrypt_token as _dec_tok
+                                _dec_val = _dec_tok(_val)
+                                if _dec_val is not None:
+                                    msg[_key] = _dec_val
+                except Exception:
+                    pass
             if not is_valid_response(resp.status_code, data):
                 typ = _classify_status(resp.status_code, data)
                 await _mark_failure(route, typ, resp.status_code)
@@ -327,6 +333,49 @@ async def _mark_failure(route: Route, error_type: str, http_status: int):
         await run_db(report_proxy_result, route.proxy.id, False)
 
 
+async def _classify_content_rejection(routes: list[Route], body: dict,
+                                      report: list[dict]) -> bool:
+    """全线路 400 失败时的最小探针：区分"内容被拒"与"上游不可用"。
+
+    背景（req_2c34411b / req_32382 案）：上游（b.ai）内容审核拒绝含显性
+    内容的请求时返回**无信息量的通用 400 包装**（openai_error /
+    bad_response_status_code），竞速四条线路全灭后网关只能报"上游暂时
+    不可用"，误导排查数小时——实际是永久性内容拒绝，重试毫无意义。
+
+    判定：全线路失败均为 http_400 时，用同一通道发一条最小无害请求
+    （"hi"）：
+    - 探针 200  -> 上游健康，拒绝的是**请求内容** -> True
+    - 探针 400  -> 上游连无害请求都拒 -> 上游/模型侧问题 -> False
+    - 429/401/网络异常 -> 无法定论 -> False（保守回落通用报错）
+
+    只挑直连线路发探针（避免代理层干扰）；直连不存在或其端点为
+    Responses API（需协议转换）时放弃分类。
+    """
+    failed = [r for r in report if r.get("status") == "failed"]
+    if not failed or any(r.get("http_status") != 400 for r in failed):
+        return False
+    cand = [r for r in routes if r.key is not None and r.proxy is None]
+    if not cand:
+        return False
+    try:
+        if responses_api.is_responses_url(_route_url(cand[0])):
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    probe_body = {"model": body.get("model"),
+                  "messages": [{"role": "user", "content": "hi"}]}
+    try:
+        async with httpx.AsyncClient(**_client_kwargs(cand[0], False)) as client:
+            resp = await client.post(
+                _route_url(cand[0]), json=probe_body,
+                headers=_route_headers(cand[0]),
+                timeout=httpx.Timeout(connect=10.0, read=15.0, write=15.0,
+                                      pool=15.0))
+    except Exception:  # noqa: BLE001
+        return False
+    return resp.status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # racing
 # ---------------------------------------------------------------------------
@@ -383,7 +432,10 @@ async def _race(routes: list[Route], body: dict) -> RaceResult:
                 if not t.done():
                     t.cancel()
             await asyncio.gather(*tasks.keys(), return_exceptions=True)
-    raise AllRoutesFailed(errors, report)
+    exc = AllRoutesFailed(errors, report)
+    if await _classify_content_rejection(routes, body, report):
+        exc.content_rejected = True
+    raise exc
 
 
 async def _stream_first_valid(route: Route, body: dict):
@@ -396,7 +448,27 @@ async def _stream_first_valid(route: Route, body: dict):
         is_resp = responses_api.is_responses_url(url)
         body_to_send = responses_api.chat_to_responses_body(body) if is_resp else body
         req_cm = client.stream("POST", url, json=body_to_send, headers=headers)
-        resp = await req_cm.__aenter__()
+        # 竞速窗口 = 响应头 + 首行：上游"建连后不吐响应头"的挂起形态
+        # （半开代理/中转、被静默吞包）在 httpx read=None 下会让裸 await
+        # __aenter__ 无限等待——此前 first_byte_timeout 只包首行，
+        # header 等待完全裸奔（实测静默上游 400s+ 不判死，拖死整条竞速）。
+        first_byte_timeout = float(
+            sysconfig.get("stream_first_byte_timeout", route.key.channel) or 0)
+        try:
+            if first_byte_timeout and first_byte_timeout > 0:
+                resp = await asyncio.wait_for(req_cm.__aenter__(),
+                                              timeout=first_byte_timeout)
+            else:
+                resp = await req_cm.__aenter__()
+        except asyncio.TimeoutError:
+            # header 阶段超时：stream cm 未完成进入，只需关闭 client，
+            # 不得触碰 req_cm.__aexit__（未进入即无需退出）
+            await _mark_failure(route, "first_byte_timeout", 0)
+            try:
+                await cm.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+            return None, route_info(route, "failed", error="first_byte_timeout")
         if resp.status_code != 200:
             typ = _classify_status(resp.status_code, {})
             await _mark_failure(route, typ, resp.status_code)
@@ -424,8 +496,6 @@ async def _stream_first_valid(route: Route, body: dict):
         # 是上游真实发出的，胜者确定后必须按原序重放，不得蒸发。
         prelude: list[str] = []
         ait = resp.aiter_lines()
-        first_byte_timeout = float(
-            sysconfig.get("stream_first_byte_timeout", route.key.channel) or 0)
         try:
             while True:
                 if first_byte_timeout and first_byte_timeout > 0:
@@ -586,8 +656,11 @@ async def race_stream_winner(routes: list[Route], body: dict):
         if leftover:
             await asyncio.gather(*leftover, return_exceptions=True)
     failures = [r for r in report if r.get("status") == "failed"] or report
-    raise AllRoutesFailed(
+    exc = AllRoutesFailed(
         [f"{f['name']}:{f['error']}" for f in failures], report=report)
+    if await _classify_content_rejection(routes, body, report):
+        exc.content_rejected = True
+    raise exc
 
 
 async def iter_sse(first_line: str, aiter, include_first: bool = True,
@@ -645,66 +718,62 @@ class StreamWinner:
             yield line + "\n\n"
 
     async def lines(self) -> AsyncIterator[str]:
-        # 兼容规整器总开关（渠道隔离，SystemSetting 配置，默认开启）：
-        # - "on"（默认）：解密器 + 工具流规整器挂载。两者对行为良好的上游
-        #   是零改动快速路径（无 gAAAA 密文 / 无畸形 tool_calls 时逐字节
-        #   透传），只对"协议破损"的方言（muse/zen 换 id、整段重述、加密
-        #   思考）出手——即 new-api 的哲学：同协议好上游字节级透传，
-        #   破损上游重建流。
-        # - "off"：纯转发模式，上游字节原样直达客户端（自担方言风险）。
-        compat = str(sysconfig.get(
-            "stream_compat_normalizers", self.route.key.channel) or "on"
-        ).strip().lower() != "off"
-        # 工具调用流规整：放置于解密/协议转换之后、下发客户端之前——
-        # 上游（muse/zen 等）可能发乱序 tool_calls（换 id + 全参重复），
-        # [OI] SDK 按 index 累加参数会得到非法 JSON。
+        # 流式出口两件套（2026-09 拆分）：
+        # - 工具流规整器：**恒挂**（无开关）。上游（muse/zen 等）可能发
+        #   乱序 tool_calls（换 id + 全参重复），[OI] SDK 按 index 累加
+        #   参数会得到非法 JSON——这是协议修复，不是可选项；对行为良好
+        #   的上游逐字节透传，无副作用。
+        # - 思考解密器：独立开关 stream_reasoning_decrypt，**默认关**。
+        #   解密仅对"上游用本端已知密钥加密"的场景有意义；上游自有密钥
+        #   （muse/zen 等）本端无钥可解，尝试只会空转——默认关省掉每次
+        #   chunk 的候选密钥试探，密文原样透传保住多轮回传续写。
+        decrypt_on = bool(sysconfig.get(
+            "stream_reasoning_decrypt", self.route.key.channel))
+        decryptor = StreamReasoningDecryptor() if decrypt_on else None
         tc_norm = ToolCallStreamNormalizer()
+
+        def _pump(chunk: str):
+            """单 chunk 处理链：解密（可选）→ 工具规整（恒挂）→ 若干输出。"""
+            if decryptor is not None:
+                # 有状态解密：跨 chunk 分片的 Fernet token 缓冲凑齐后
+                # 一次解密；解不开的密文原样透传（零丢失）。
+                return decryptor.feed(chunk)
+            return [chunk]
+
         if responses_api.is_responses_url(_route_url(self.route)):
-            if not compat:
-                async for chunk in self._replay_prelude():
-                    yield chunk
-                async for chunk in responses_api.iter_responses_sse(
-                        self.first_line, self.aiter, done_state=self.final_state):
-                    yield chunk
-                return
             async for chunk in responses_api.iter_responses_sse(
                     self.first_line, self.aiter, done_state=self.final_state,
-                    prelude=self.prelude):
-                # Responses 链路的 reasoning 已在 iter_responses_sse 内由 _reasoning_text 解密
-                # 额外的 SSE chunk 解密（处理 Kilo/OpenRouter 加密 reasoning）
-                for out in tc_norm.feed(decrypt_sse_chunk(chunk)):
+                    prelude=self.prelude,
+                    decrypt_reasoning=decrypt_on):
+                # Responses 链路的 reasoning 解密在 iter_responses_sse 内
+                # 由 decrypt_reasoning 旗标控制；此处 decrypt_sse_chunk 只
+                # 兜 Kilo/OpenRouter 式整帧加密 reasoning（同样受开关控制）。
+                if decrypt_on:
+                    chunk = decrypt_sse_chunk(chunk)
+                for out in tc_norm.feed(chunk):
                     yield out
         else:
-            if not compat:
-                async for chunk in self._replay_prelude():
-                    yield chunk
-                async for chunk in iter_sse(self.first_line, self.aiter,
-                                            state=self.final_state):
-                    yield chunk
-                return
-            decryptor = StreamReasoningDecryptor()
             try:
                 async for chunk in self._replay_prelude():
-                    for out in decryptor.feed(chunk):
+                    for out in _pump(chunk):
                         for fixed in tc_norm.feed(out):
                             yield fixed
                 async for chunk in iter_sse(self.first_line, self.aiter,
                                             state=self.final_state):
-                    # 有状态解密：跨 chunk 分片的 Fernet token 缓冲凑齐后一次解密；
-                    # 解不开的密文原样透传（零丢失）。
-                    for out in decryptor.feed(chunk):
+                    for out in _pump(chunk):
                         for fixed in tc_norm.feed(out):
                             yield fixed
             finally:
                 # 异常收尾（上游暴毙）也冲刷残留缓冲。客户端断开时
                 # GeneratorExit 已进入本生成器，任何 yield 都会触发
                 # RuntimeError——静默跳过即可（客户端已不在，冲刷无处投递）。
-                try:
-                    for out in decryptor.finalize():
-                        for fixed in tc_norm.feed(out):
-                            yield fixed
-                except RuntimeError:
-                    pass  # GeneratorExit 期间不可再 yield
+                if decryptor is not None:
+                    try:
+                        for out in decryptor.finalize():
+                            for fixed in tc_norm.feed(out):
+                                yield fixed
+                    except RuntimeError:
+                        pass  # GeneratorExit 期间不可再 yield
 
     async def close(self):
         try:

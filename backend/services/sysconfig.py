@@ -126,20 +126,24 @@ RUNTIME_PARAMS: dict[str, tuple[str, object, str, str]] = {
     "default_thinking_effort": ("str", "high",
                                 "未指定档位时的默认思考强度"
                                 "（off/minimal/low/medium/high/xhigh/max）", "thinking"),
-    "stream_compat_normalizers": ("str", "on",
-                                  "流式兼容规整器总开关：on=加密思考解密+工具流"
-                                  "规整（对行为良好的上游零改动快速路径）；"
-                                  "off=纯字节转发（自担方言流风险）。"
-                                  "注意：仅字面 off（大小写不敏感）为关，"
-                                  "其它任意值（含 false/0）均视为开", "stream"),
+    "stream_reasoning_decrypt": ("bool", False,
+                                 "尝试解密流内加密思考（gAAAA Fernet 密文）。"
+                                 "默认关：密文原样透传——上游自有密钥加密时"
+                                 "本端无钥可解，透传才能保住多轮回传续写；"
+                                 "仅当上游用本端已知密钥（REASONING_DECRYPT_KEY"
+                                 "/ENCRYPTION_KEY）加密时才需要开", "stream"),
 }
 
 # 兼容旧库里已经写入的 key
 # first_content_timeout(旧) 语义是"胜出后等待首个正文/内容超时"——已并入
 # stream_idle_timeout（胜出后未产出真实内容的静默判死，默认 120s）。
+# stream_compat_normalizers(旧) 是"解密+工具流规整"总开关，已拆分：
+# 工具流规整恒开（无需开关），解密独立为 stream_reasoning_decrypt。
+# 旧值 on/off 与新 bool 语义对齐（_cast 按 on=true / 其它=false）。
 LEGACY_KEY_ALIASES = {
     "default_nvidia_rpm": "default_upstream_rpm",
     "first_content_timeout": "stream_idle_timeout",
+    "stream_compat_normalizers": "stream_reasoning_decrypt",
 }
 
 # 平台级参数：语义上是全局的（进程内并发闸门等），不随渠道隔离。

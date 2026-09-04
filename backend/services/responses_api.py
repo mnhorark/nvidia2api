@@ -324,27 +324,29 @@ def _reasoning_summary_text(item: dict) -> str:
     return "".join(parts)
 
 
-def _reasoning_text(item: dict) -> str:
-    """提取推理条目的可透传内容：优先明文摘要，无明文时尝试解密密文。
+def _reasoning_text(item: dict, decrypt_reasoning: bool = False) -> str:
+    """提取推理条目的可透传内容：优先明文摘要，无明文时按开关尝试解密密文。
 
     参考 RikkaHub 的 Responses 协议处理：
     - summary 为明文摘要（summary_text 数组），可直接展示
-    - encrypted_content 为 Fernet 密文（gAAAA…），RikkaHub 保存为
-      OpenAIReasoningMetadata 原样回传；本端有密钥时尝试还原（muse-spark-1.2
-      常见：仅给密文不给明文 summary），失败则保留密文占位，不抛异常。
+    - encrypted_content 为 Fernet 密文（gAAAA…）。**默认不解密**：上游
+      自有密钥加密时本端无钥可解，解密只会空转；密文原样透传（RikkaHub
+      保存为 OpenAIReasoningMetadata 原样回传），供多轮续写。仅当
+      stream_reasoning_decrypt 开启（上游用本端已知密钥加密）才尝试还原。
     """
     text = _reasoning_summary_text(item)
     if text:
         return text
     enc = item.get("encrypted_content")
     if isinstance(enc, str) and enc:
-        try:
-            from services.reasoning_decrypt import decrypt_token
-            dec = decrypt_token(enc)
-            if dec is not None:
-                return dec
-        except Exception:
-            pass
+        if decrypt_reasoning:
+            try:
+                from services.reasoning_decrypt import decrypt_token
+                dec = decrypt_token(enc)
+                if dec is not None:
+                    return dec
+            except Exception:
+                pass
         # 零丢失原则：解不开（密钥不在本端 / 非 Fernet 自有封装）也
         # **原样透传**——它仅供多轮回传（RikkaHub 的
         # OpenAIReasoningMetadata 同样原样保存），丢弃会破坏上游会话
@@ -431,7 +433,7 @@ def _message_with_tool_calls_to_items(msg: dict) -> list[dict]:
 # 非流式响应：responses -> chat
 # ---------------------------------------------------------------------------
 
-def responses_payload_to_chat(payload: dict) -> dict:
+def responses_payload_to_chat(payload: dict, decrypt_reasoning: bool = False) -> dict:
     """把 Responses API 的非流式响应转成 chat.completion 结构。
 
     忠实映射：
@@ -453,9 +455,9 @@ def responses_payload_to_chat(payload: dict) -> dict:
         if item.get("type") == "message":
             text += _content_to_text(item.get("content"))
         elif item.get("type") == "reasoning":
-            # 参考 RikkaHub 的 parseResponseOutput：
-            # 优先使用 summary 明文，无明文时尝试解密 encrypted_content
-            reasoning += _reasoning_text(item)
+            # 参考 RikkaHub 的 parseResponseOutput：优先 summary 明文；
+            # 密文按 decrypt_reasoning 开关决定是否尝试解密（默认原样透传）
+            reasoning += _reasoning_text(item, decrypt_reasoning)
         elif item.get("type") == "function_call":
             tool_calls.append({
                 "id": str(item.get("call_id") or ""),
@@ -775,7 +777,8 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
     if etype == "response.reasoning_summary_text.delta":
         delta_text = str(data.get("delta") or "")
         state["reasoning_summary_streamed"] = True
-        if delta_text.startswith("gAAAA"):
+        if delta_text.startswith("gAAAA") and state.get("decrypt_reasoning"):
+            # 默认不解密（stream_reasoning_decrypt=False）：密文原样透传
             try:
                 from services.reasoning_decrypt import decrypt_token
                 dec = decrypt_token(delta_text)
@@ -850,9 +853,9 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
             # 因此：只要之前见过 summary 增量，done 一律不再补发。
             if state.get("reasoning_summary_streamed"):
                 return None
-            text = _reasoning_text(item)
+            text = _reasoning_text(item, bool(state.get("decrypt_reasoning")))
             if text:
-                if text.startswith("gAAAA"):
+                if text.startswith("gAAAA") and state.get("decrypt_reasoning"):
                     try:
                         from services.reasoning_decrypt import decrypt_token
                         dec = decrypt_token(text)
@@ -956,7 +959,8 @@ def _is_untranslated_response_event(line: str) -> bool:
 async def iter_responses_sse(first_line: str, aiter,
                              include_first: bool = True,
                              done_state: dict | None = None,
-                             prelude: list[str] | None = None) -> AsyncIterator[str]:
+                             prelude: list[str] | None = None,
+                             decrypt_reasoning: bool = False) -> AsyncIterator[str]:
     """把 Responses 流式事件流转成 chat 格式的 SSE 行序列。
 
     **不再伪造结尾 [DONE]**：上游未发 [DONE] 即结束 = 静默截断，
@@ -965,13 +969,17 @@ async def iter_responses_sse(first_line: str, aiter,
     `prelude`：竞速窗口期（判胜首帧之前）上游已发出的行——零丢失原则
     下必须先于 first_line 重放，否则 usage 预告帧/自定义事件会蒸发。
 
+    `decrypt_reasoning`：流内思考密文（gAAAA Fernet）是否尝试解密。
+    默认 False——密文原样透传，仅当 stream_reasoning_decrypt 开启时
+    由调用方（race_engine）传入 True。
+
     三条路径（prelude 重放 / 首帧 / 主循环）的未识别行透传均先经两层
     过滤：`_is_protocol_meta_line` 丢弃 `event:` 等元行；
     `_is_untranslated_response_event` 丢弃未翻译的 Responses 协议 data
     帧（response.* / ping）。data 行与保活注释中仅真正的协议外内容照旧
     透传。
     """
-    state: dict = {"args_seen": set()}
+    state: dict = {"args_seen": set(), "decrypt_reasoning": decrypt_reasoning}
     if prelude:
         for line in prelude:
             if not line.strip():

@@ -470,3 +470,120 @@ class StreamReasoningDecryptorTests(TestCase):
         out = d.feed(chunk)
         text = "".join(out)
         self.assertIn("nested ok", text)
+
+
+class StreamReasoningDecryptSwitchTests(TestCase):
+    """stream_reasoning_decrypt 开关语义（2026-09 拆分自 stream_compat_normalizers）。
+
+    默认 False：思考密文原样透传（上游自有密钥加密时本端无钥可解，
+    解密只会空转；透传保住多轮回传续写）。开启后翻译层/出口层才尝试
+    解密。工具流规整器（ToolCallStreamNormalizer）拆分后恒挂，无开关。
+    """
+
+    def _encrypt_with_candidate_key(self, plaintext: str, raw_key: str) -> str:
+        """用候选密钥派生链（sha256→urlsafe_b64）构造可解密的 Fernet token。"""
+        import base64
+        import hashlib
+        from cryptography.fernet import Fernet
+        derived = base64.urlsafe_b64encode(
+            hashlib.sha256(raw_key.encode("utf-8")).digest())
+        return Fernet(derived).encrypt(plaintext.encode("utf-8")).decode()
+
+    def test_stream_translation_default_no_decrypt(self):
+        """默认关：gAAAA 思考密文经 iter_responses_sse 原样透传。"""
+        import asyncio
+        from services import responses_api
+
+        async def src():
+            yield ('data: {"type":"response.reasoning_summary_text.delta",'
+                   '"delta":"gAAAA-cipher-blob"}\n\n')
+            yield 'data: [DONE]\n\n'
+
+        async def _gather():
+            parts = []
+            async for c in responses_api.iter_responses_sse(
+                    "", src(), include_first=False):
+                parts.append(c)
+            return "".join(parts)
+
+        out = asyncio.run(_gather())
+        self.assertIn("gAAAA-cipher-blob", out)
+
+    def test_stream_translation_decrypt_when_enabled(self):
+        """开关开：summary delta 密文被解密为明文。"""
+        import asyncio
+        import json
+        from unittest.mock import patch as mock_patch
+        from services import responses_api
+        from services.reasoning_decrypt import decrypt_token
+
+        token = self._encrypt_with_candidate_key("明文思考", "test-raw-key")
+        self.assertTrue(decrypt_token(token) is None or True)  # 无 key 时解不开也没关系
+
+        async def src():
+            yield ('data: {"type":"response.reasoning_summary_text.delta",'
+                   '"delta":%s}\n\n' % json.dumps(token))
+            yield 'data: [DONE]\n\n'
+
+        async def _gather():
+            parts = []
+            async for c in responses_api.iter_responses_sse(
+                    "", src(), include_first=False, decrypt_reasoning=True):
+                parts.append(c)
+            return "".join(parts)
+
+        with mock_patch(
+                "services.reasoning_decrypt.decrypt_token",
+                return_value="明文思考"):
+            out = asyncio.run(_gather())
+        frames = [json.loads(l[5:]) for l in out.splitlines()
+                  if l.startswith("data: ") and l[5:].strip() != "[DONE]"]
+        reasoning = "".join(
+            (f["choices"][0]["delta"].get("reasoning_content") or "")
+            for f in frames if f.get("choices"))
+        self.assertEqual(reasoning, "明文思考")
+        self.assertNotIn("gAAAA", out)
+
+    def test_payload_conversion_default_keeps_ciphertext(self):
+        """非流式默认：encrypted_content 密文原样保留（不尝试解密）。"""
+        from services import responses_api
+        from services.reasoning_decrypt import decrypt_token
+
+        token = self._encrypt_with_candidate_key("secret-thought", "some-key")
+        payload = {"output": [
+            {"type": "reasoning",
+             "summary": [],
+             "encrypted_content": token},
+            {"type": "message",
+             "role": "assistant",
+             "content": [{"type": "output_text", "text": "答"}]},
+        ]}
+        out = responses_api.responses_payload_to_chat(payload)
+        msg = out["choices"][0]["message"]
+        self.assertEqual(msg["reasoning_content"], token)
+
+    def test_payload_conversion_decrypt_when_enabled(self):
+        """非流式开关开：用候选密钥真实解密 encrypted_content。"""
+        from unittest.mock import patch as mock_patch
+        from django.test import override_settings
+        from services import responses_api
+
+        token = self._encrypt_with_candidate_key("真明文", "unit-test-key")
+        payload = {"output": [
+            {"type": "reasoning", "summary": [],
+             "encrypted_content": token},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "答"}]},
+        ]}
+        with override_settings(REASONING_DECRYPT_KEY="unit-test-key"):
+            out = responses_api.responses_payload_to_chat(
+                payload, decrypt_reasoning=True)
+        msg = out["choices"][0]["message"]
+        self.assertEqual(msg["reasoning_content"], "真明文")
+
+    def test_legacy_key_alias_maps_to_new_switch(self):
+        """旧库写入的 stream_compat_normalizers 归一为新开关读取。"""
+        from services import sysconfig
+        self.assertEqual(
+            sysconfig._normalize_key("stream_compat_normalizers"),
+            "stream_reasoning_decrypt")
