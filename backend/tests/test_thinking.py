@@ -384,7 +384,11 @@ class R14_EffortVocabularyTests(TestCase):
         # 2026-09 收紧：档位意图不再经换算表合成 thinking_budget——
         # 凭空注入 32K 预算挤占模型上下文窗口（zcode muse 案），且是
         # 客户端未表达的意图。预算双通道仅在客户端显式给预算时生效。
-        self.assertNotIn("chat_template_kwargs", out)
+        self.assertNotIn("thinking_budget", out.get("chat_template_kwargs", {}))
+        # 双盲对照（2026-09-04 流内 openai_error 案）：zen muse 的模板
+        # 开关是思考功能必需载体，纯档位意图也注入（toggle_for_effort）
+        self.assertEqual(out["chat_template_kwargs"],
+                         {"thinking": True, "enable_thinking": True})
 
     def test_true_gateway_still_uses_reasoning_object(self):
         """真网关（openrouter host）仍走 reasoning 对象格式。"""

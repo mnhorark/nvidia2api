@@ -125,6 +125,11 @@ class ThinkingCapability:
     # 通道已完整表达"开启"意图的模型需要。普通开关模型保持旧行为：
     # 开关 + 默认档双发（档位是它们的强度表达）。
     suppress_toggle_default: bool = False
+    # 模板开关是思考功能的必需载体（zen muse 专用，2026-09-04 双盲
+    # 对照实证）：纯档位意图（reasoning_effort 无任何模板参数）时 zen
+    # 在流内报 openai_error；带模板开关即正常。True 时纯档位意图也
+    # 注入 toggle_keys（非"发明意图"——是实测的后端接线要求）。
+    toggle_for_effort: bool = False
 
 
 _THINKING_CAPABILITIES: list[tuple[str, ThinkingCapability]] = [
@@ -179,9 +184,15 @@ _THINKING_CAPABILITIES: list[tuple[str, ThinkingCapability]] = [
         # （400 可见可诊断，静默忽略无法察觉）
         effort_values=("minimal", "low", "medium", "high", "xhigh", "max"),
         default_effort="high", supports_budget=True,
-        # vLLM 系：强度同步写模板变量 thinking_budget（数值通道），
-        # 双通道并存——zen 若忽略顶层 reasoning_effort，模板变量仍生效
-        budget_kwarg="thinking_budget",
+        # zen muse 实测（2026-09-04 双盲对照）：chat_template_kwargs
+        # 是 zen muse 思考功能的**必需载体**——只发
+        # reasoning_effort（无模板参数）时 zen 在流内报 openai_error；
+        # 带上模板开关即正常。因此 muse 走开关通道注入（9d26650 的
+        # "档位不合成开关"对 muse 不适用），但**预算合成保持删除**
+        # （thinking_budget 是真正的发明意图：32K 预算挤占窗口且
+        # 客户端未表达）。
+        toggle_keys=("thinking", "enable_thinking"),
+        toggle_for_effort=True,
     )),
 ]
 
@@ -639,15 +650,20 @@ def to_upstream(spec: ThinkingSpec, model_name: str = "", channel=None) -> dict:
         # 开关注入的边界：区分"传递客户端意图"与"发明客户端意图"。
         # - off（enabled=False）：**必须**注入 toggle=false——deepseek/
         #   muse 等默认开启思考的模型，不发 false 关不掉；
-        # - on：仅当客户端**显式**发过开关注入（spec.explicit_toggle）。
-        #   推断出的 True（从档位/预算合成）不注入——档位已是开启表达，
-        #   旧行为对 "reasoning_effort: xhigh" 凭空合成
-        #   thinking:true+enable_thinking:true 属发明意图（严格上游
-        #   400 风险面，语义与档位重复），并曾连带合成
-        #   thinking_budget=32768 挤占窗口（zcode muse 案）。
+        # - on：注入条件 = 客户端**显式**发过开关键（spec.explicit_toggle），
+        #   **或** capability 声明 toggle_keys 为必需载体
+        #   （cap.toggle_for_effort=True，如 zen muse：实测只发
+        #   reasoning_effort 时 zen 在流内报 openai_error，模板开关是
+        #   思考功能的必需载体——2026-09-04 双盲对照实证）。
+        #   纯推断的 enabled（从档位合成）对其余模型不注入——发明意图
+        #   曾连带合成 thinking_budget=32768 挤占窗口（zcode muse 案）。
         # 直接构造 ThinkingSpec 的内部调用方（无显式标记）同归推断态。
         kwargs = dict(spec.template_kwargs)
-        toggle_wanted = (enabled is False or spec.explicit_toggle)
+        toggle_wanted = (enabled is False or spec.explicit_toggle
+                         or (enabled is not None and cap.toggle_for_effort)
+                         # 预算意图：模板变量是预算到达 vLLM 系上游的
+                         # 唯一通道（zen muse 实测顶层字段被静默忽略）
+                         or spec.budget is not None)
         if toggle_wanted:
             for key in cap.toggle_keys:
                 kwargs[key] = enabled
