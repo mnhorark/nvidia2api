@@ -253,6 +253,47 @@ def _build_upstream_body(body: dict, model_name: str, channel=None,
     return upstream
 
 
+def _messages_shape(messages) -> list[dict]:
+    """messages 形态摘要（诊断）：每条消息的 role/content 类型/工具结构。
+
+    zcode（AI SDK）系客户端的方言（数组 content、null content、空
+    arguments、tool 消息附加键）是上游 400 的高频来源；正文不落库，
+    只记形态。
+    """
+    out: list[dict] = []
+    if not isinstance(messages, list):
+        return out
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            out.append({"i": i, "kind": repr(type(msg).__name__)})
+            continue
+        content = msg.get("content")
+        entry: dict = {
+            "i": i,
+            "role": msg.get("role"),
+            "content_type": type(content).__name__,
+            "content_len": len(content) if isinstance(content, str) else None,
+        }
+        if isinstance(content, list):
+            entry["content_blocks"] = [p.get("type") if isinstance(p, dict)
+                                       else type(p).__name__ for p in content[:8]]
+        tcs = msg.get("tool_calls")
+        if isinstance(tcs, list):
+            entry["tool_calls"] = [
+                {"name": (tc.get("function") or {}).get("name"),
+                 "args_len": len(str((tc.get("function") or {}).get("arguments") or "")),
+                 "args_head": str((tc.get("function") or {}).get("arguments") or "")[:48]}
+                for tc in tcs if isinstance(tc, dict)][:16]
+        if msg.get("tool_call_id"):
+            entry["tool_call_id"] = msg["tool_call_id"]
+        extra = set(msg.keys()) - {"role", "content", "tool_calls",
+                                   "tool_call_id", "name"}
+        if extra:
+            entry["extra_keys"] = sorted(extra)
+        out.append(entry)
+    return out
+
+
 def _request_summary(body: dict, tool_alias_map: dict | None) -> dict:
     """构建请求体摘要（诊断用，不含 messages 正文——防膨胀且防泄露）。
 
@@ -281,6 +322,10 @@ def _request_summary(body: dict, tool_alias_map: dict | None) -> dict:
         "max_completion_tokens": body.get("max_completion_tokens"),
         "temperature": body.get("temperature"),
         "top_p": body.get("top_p"),
+        # 每条消息的形态摘要（不含正文）：role / content 类型 /
+        # tool_calls 数 / tool_call_id——AI SDK 系客户端的数组 content、
+        # null content、空 arguments 等方言在此一览无余
+        "messages_shape": _messages_shape(body.get("messages")),
     }
     if tool_alias_map:
         summary["tool_alias_rewritten"] = len(tool_alias_map)
