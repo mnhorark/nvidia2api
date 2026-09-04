@@ -270,20 +270,41 @@ def _error_detail(data) -> str:
     - 通用:    {"message": "..."} / {"detail": "..."}
     此前只取 `data.error`，NVIDIA 类 400（detail/title）被忽略 → 日志只显示 http_400，
     用户无法得知真实原因（如 "DEGRADED function cannot be invoked"）。
+
+    2026-09 增强：部分上游网关的 message 字段是敷衍的占位文案（如
+    "openai_error (400)"），真实校验原因藏在 body 其它字段（pydantic
+    的 loc/msg 数组、vendored 的 errors 列表等）。结构化提取后仍保留
+    **完整 body 的 JSON 摘要**（截断 1024 字符）追加在末尾，保证诊断
+    时原始字节可见。
     """
     if not isinstance(data, dict):
         return ""
+    parts: list[str] = []
     err = data.get("error")
     if isinstance(err, dict):
         msg = err.get("message") or err.get("code") or ""
-        return str(msg)[:256]
-    if isinstance(err, str) and err:
-        return err[:256]
-    for key in ("detail", "message", "title"):
-        v = data.get(key)
-        if v:
-            return str(v)[:256]
-    return ""
+        if msg:
+            parts.append(str(msg)[:256])
+        # pydantic v2 风格：{"error": {"detail": [{"loc": [...], "msg": "..."}]}}
+        detail = err.get("detail")
+        if detail and detail != msg:
+            parts.append("detail=" + json.dumps(detail, ensure_ascii=False)[:512])
+    elif isinstance(err, str) and err:
+        parts.append(err[:256])
+    if not parts:
+        for key in ("detail", "message", "title"):
+            v = data.get(key)
+            if v:
+                parts.append(f"{key}=" + str(v)[:256])
+                break
+    # 完整 body 摘要兜底：结构化提取漏掉的真实原因在这里可见
+    try:
+        raw = json.dumps(data, ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        raw = str(data)
+    if raw and raw not in " ".join(parts):
+        parts.append("body=" + raw[:1024])
+    return " | ".join(parts)
 
 
 async def _mark_success(route: Route):

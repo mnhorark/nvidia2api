@@ -392,6 +392,11 @@ class RequestLog(models.Model):
     client_thinking = models.JSONField(default=dict, blank=True)
     # 实际下发到上游的思考强度参数（reasoning_effort / reasoning_budget / chat_template_kwargs）
     upstream_thinking = models.JSONField(default=dict, blank=True)
+    # 请求体摘要（诊断用，不含 messages 内容）：顶层字段清单、tools 数量
+    # 与工具名、超长工具名别名改写情况等——zcode 等 agent 的 400 排查
+    # 依赖它区分"哪个请求部件引发上游拒绝"（messages 正文不落库防膨胀）。
+    # null=True：诊断数据绝不阻塞主链路（旧代码路径/迁移时序差均可写库）
+    request_summary = models.JSONField(default=dict, blank=True, null=True)
 
     class Meta:
         db_table = "request_log"

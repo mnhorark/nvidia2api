@@ -910,18 +910,29 @@ class R10_UpstreamErrorDetailTests(TestCase):
     def test_error_detail_extracts_common_formats(self):
         from services.race_engine import _error_detail
 
-        # OpenAI 格式
-        self.assertEqual(
-            _error_detail({"error": {"message": "bad key", "code": "invalid_api_key"}}),
-            "bad key")
+        # OpenAI 格式：结构化提取在前，body 完整摘要兜底在后
+        detail = _error_detail({"error": {"message": "bad key", "code": "invalid_api_key"}})
+        self.assertTrue(detail.startswith("bad key"), detail)
+        self.assertIn("body=", detail)  # 零丢失：完整 body 摘要可见
         # NVIDIA 格式（detail/title）
         self.assertIn(
             "DEGRADED",
             _error_detail({"status": 400, "title": "Bad Request",
                            "detail": "Function id x: DEGRADED function cannot be invoked"}))
-        # 通用 message / 非 dict
-        self.assertEqual(_error_detail({"message": "boom"}), "boom")
+        # 通用 message / 非 dict（顶层 message 走 key=value 形态）
+        self.assertIn("message=boom", _error_detail({"message": "boom"}))
         self.assertEqual(_error_detail(None), "")
+
+    def test_error_detail_keeps_full_body_for_diag(self):
+        """敷衍 message（如 "openai_error (400)"）时，完整 body 摘要兜底可见。"""
+        from services.race_engine import _error_detail
+        body = {"error": {"message": "openai_error (400)", "code": 400},
+                "detail": [{"loc": ["tools", 0, "function", "parameters"],
+                            "msg": "invalid schema"}]}
+        out = _error_detail(body)
+        self.assertIn("openai_error (400)", out)
+        self.assertIn("invalid schema", out)
+        self.assertIn("body=", out)
 
     def test_non_stream_error_carries_detail(self):
         """非流式竞速失败线路的 error_message 应包含上游 detail（NVIDIA 格式）。"""

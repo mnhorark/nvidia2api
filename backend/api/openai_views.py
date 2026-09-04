@@ -253,6 +253,36 @@ def _build_upstream_body(body: dict, model_name: str, channel=None,
     return upstream
 
 
+def _request_summary(body: dict, tool_alias_map: dict | None) -> dict:
+    """构建请求体摘要（诊断用，不含 messages 正文——防膨胀且防泄露）。
+
+    zcode 等 agent 的上游 400 排查依赖它回答"请求的哪个部件引发拒绝"：
+    - 顶层参数清单（messages/stream_options 剔除）
+    - tools 规模 + 工具名（超长名被 tool_alias 改写的在此可见）
+    - tool_choice / response_format 等结构性字段原样
+    """
+    tools = body.get("tools")
+    tool_names: list[str] = []
+    if isinstance(tools, list):
+        for t in tools:
+            if isinstance(t, dict):
+                fn = t.get("function") or {}
+                tool_names.append(str(fn.get("name") or t.get("name") or ""))
+    summary: dict = {
+        "top_keys": sorted(k for k in body.keys() if k != "messages"),
+        "messages_count": len(body.get("messages") or [])
+        if isinstance(body.get("messages"), list) else 0,
+        "tools_count": len(tools) if isinstance(tools, list) else 0,
+        "tool_names": tool_names[:64],
+        "tool_names_truncated": len(tool_names) > 64,
+    }
+    if tool_alias_map:
+        summary["tool_alias_rewritten"] = len(tool_alias_map)
+        summary["tool_alias_map"] = {
+            alias: orig for alias, orig in list(tool_alias_map.items())[:64]}
+    return summary
+
+
 def _authorize(request):
     user_key = _authenticate(request)
     if user_key is None:
@@ -369,6 +399,7 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
             channel=channel, request_id=request_id, user_api_key=user_key,
             model=requested_name, routes_count=len(routes), is_stream=stream,
             client_thinking=client_thinking, upstream_thinking=upstream_thinking,
+            request_summary=_request_summary(body, tool_alias_map),
         )
         started = time.monotonic()
 
