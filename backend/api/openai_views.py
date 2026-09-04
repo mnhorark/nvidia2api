@@ -275,6 +275,12 @@ def _request_summary(body: dict, tool_alias_map: dict | None) -> dict:
         "tools_count": len(tools) if isinstance(tools, list) else 0,
         "tool_names": tool_names[:64],
         "tool_names_truncated": len(tool_names) > 64,
+        # 值敏感字段单独记值：max_tokens 超上游窗口是 zcode 类客户端
+        # 400/context-window 报错的高频根因（值必须可见，键名不够）
+        "max_tokens": body.get("max_tokens"),
+        "max_completion_tokens": body.get("max_completion_tokens"),
+        "temperature": body.get("temperature"),
+        "top_p": body.get("top_p"),
     }
     if tool_alias_map:
         summary["tool_alias_rewritten"] = len(tool_alias_map)
