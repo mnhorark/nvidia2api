@@ -58,6 +58,10 @@ class AdminChatView(AdminRequiredMixin, APIView):
         body['model'] = model
         body['messages'] = messages
         body.update(thinking.build_upstream(request.data, model, channel))
+        # 消息形态钳制（与 /v1 主链路同规）：历史消息可能带 AI SDK 方言
+        # （tool content 数组、assistant reasoning 块），强校验上游整包 400
+        from services import message_shape as _ms
+        _ms.clamp_message_shapes(body)
         client_thinking = {k: request.data.get(k) for k in thinking.THINKING_PARAM_KEYS if k in request.data and request.data.get(k) is not None}
         upstream_thinking = thinking.build_upstream(request.data, model, channel)
         proxy_group = model_rec.proxy_group_id if model_rec else None

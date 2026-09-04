@@ -60,7 +60,10 @@ def clamp_message_shapes(body: dict) -> int:
     规则：
     - role=tool：content 数组 -> 字符串；白名单外附加键剔除
     - assistant：content 数组 -> 字符串（有 tool_calls 时 content
-      允许为 null/字符串；数组形态多数上游不认）
+      允许为 null/字符串；数组形态多数上游不认）。AI SDK 方言的
+      {"type":"reasoning"} 历史块剥离：它不是 OpenAI 规范块类型
+      （上游 400：messages[N].content[0].type类型错误，req_155f7e78
+      实证），且历史轮的思考内容对新回复毫无语义价值
     - 其它角色的 content 数组含纯文本块时，同样收敛为字符串
       （多模态 image 块保留原数组——那是合法形态）
     """
@@ -89,6 +92,18 @@ def clamp_message_shapes(body: dict) -> int:
         elif role == "assistant":
             content = msg.get("content")
             if isinstance(content, list):
+                # reasoning 历史块是 AI SDK 方言（非 OpenAI 规范类型），
+                # 先剥离再判断是否有多模态——带着它原样透传整包 400
+                if any(isinstance(p, dict) and p.get("type") == "reasoning"
+                       for p in content):
+                    kept = [p for p in content
+                            if not (isinstance(p, dict)
+                                    and p.get("type") == "reasoning")]
+                    content = kept
+                    msg["content"] = content
+                    changed += 1
+                if not isinstance(content, list):
+                    continue
                 # 只有当没有 image 等多模态块时才收敛为字符串
                 has_multimodal = any(
                     isinstance(p, dict) and p.get("type") not in

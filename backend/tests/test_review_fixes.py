@@ -300,6 +300,52 @@ class MessageShapeClampTests(TestCase):
         clamp_message_shapes(body)
         self.assertEqual(body["messages"][0]["content"], "ab")
 
+    def test_assistant_reasoning_blocks_stripped_not_passthrough(self):
+        """assistant 历史 reasoning 块剥离，不因它豁免收敛（req_155f7e78 案）。
+
+        AI SDK 系客户端把上轮思考作为 {"type":"reasoning"} 块回传；该类型
+        不在 OpenAI 规范词汇表里，严格上游整包 400
+        （"messages[4].content[0].type类型错误"）。旧实现把 reasoning 块
+        当"多模态"跳过收敛 → 方言原样透传。
+        """
+        from services.message_shape import clamp_message_shapes
+        body = {"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "reasoning", "text": "[P] 思考中……"},
+                {"type": "text", "text": "回答正文"},
+            ]},
+            {"role": "user", "content": "继续"},
+        ]}
+        changed = clamp_message_shapes(body)
+        # 2 次：剥 reasoning 块 + 剩余文本块收敛为字符串（同一消息计两次）
+        self.assertEqual(changed, 2)
+        self.assertEqual(body["messages"][1]["content"], "回答正文")
+
+    def test_assistant_pure_reasoning_array_collapses_to_empty(self):
+        """纯 reasoning 数组：剥离后收敛为空字符串（不给上游留数组方言）。"""
+        from services.message_shape import clamp_message_shapes
+        body = {"messages": [
+            {"role": "assistant", "content": [
+                {"type": "reasoning", "text": "只有思考没有正文"},
+            ]},
+        ]}
+        changed = clamp_message_shapes(body)
+        # 2 次：剥 reasoning 块 + 空数组收敛为 ""（同一消息计两次）
+        self.assertEqual(changed, 2)
+        self.assertEqual(body["messages"][0]["content"], "")
+
+    def test_multimodal_assistant_content_keeps_image_but_strips_reasoning(self):
+        """assistant 数组混有 image 与 reasoning：剥 reasoning、保 image 数组。"""
+        from services.message_shape import clamp_message_shapes
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}
+        body = {"messages": [{"role": "assistant", "content": [
+            {"type": "reasoning", "text": "想"},
+            image,
+        ]}]}
+        clamp_message_shapes(body)
+        self.assertEqual(body["messages"][0]["content"], [image])
+
     def test_request_summary_populated(self):
         """诊断摘要：tools 数量/工具名/改写映射入日志。"""
         from api.openai_views import _request_summary
