@@ -93,7 +93,7 @@ RUNTIME_PARAMS: dict[str, tuple[str, object, str, str]] = {
     "upstream_connect_timeout": ("float", lambda: settings.UPSTREAM_CONNECT_TIMEOUT,
                                  "上游连接超时（秒）", "timeout"),
     "upstream_read_timeout": ("float", lambda: settings.UPSTREAM_READ_TIMEOUT,
-                              "非流式请求的上游读超时（秒）", "timeout"),
+                              "非流式请求的上游读超时（秒，0=不限制）", "timeout"),
     "stream_first_byte_timeout": ("float", 180,
                                   "竞速等待首个 SSE 块超时（0=不限制）", "timeout"),
     "stream_heartbeat_interval": ("float", 20,

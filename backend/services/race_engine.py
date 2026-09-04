@@ -140,6 +140,9 @@ def _client_kwargs(route: Route, stream: bool) -> dict:
         # 死线路统一由应用层探测制兜底：竞速阶段 stream_first_byte_timeout、
         # 转发阶段 stream_idle_timeout + 心跳探测（见 openai_views._drain）。
         read = None
+    elif not read:
+        # 0=不限制：httpx 语义里 None 才是无超时，0 反而是"0 秒即超时"
+        read = None
     kwargs: dict[str, Any] = {
         "timeout": httpx.Timeout(
             connect=sysconfig.get("upstream_connect_timeout", channel),

@@ -83,7 +83,17 @@ ROOT_URLCONF = "config.urls"
 
 # Next.js 静态导出产物目录（Dockerfile 复制到 /app/static/frontend）。
 # 由 api/frontend_views 负责托管；目录不存在时前端路由返回明确提示，不影响 API。
-FRONTEND_DIR = _resolve_path(os.environ.get("FRONTEND_DIR", BASE_DIR / "static" / "frontend"))
+# 本地裸起 uvicorn 时（不带 FRONTEND_DIR 环境变量）自动探测仓库源码树的
+# frontend/out——否则每次手动重启都得记得带环境变量，忘了就是"前端未找到"
+# （Docker 内仓库树不存在，探测自然回落，不影响容器部署）。
+def _default_frontend_dir() -> Path:
+    repo_out = PROJECT_ROOT / "frontend" / "out"
+    if (repo_out / "index.html").is_file():
+        return repo_out
+    return BASE_DIR / "static" / "frontend"
+
+
+FRONTEND_DIR = _resolve_path(os.environ.get("FRONTEND_DIR") or _default_frontend_dir())
 # DATABASE_PATH 留空时回落到 $DATA_DIR/db.sqlite3（.env 里写空的场景按未设置处理）
 DATABASES = {
     "default": {
@@ -148,7 +158,7 @@ NVIDIA_BASE_URL = os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidi
 DEFAULT_NVIDIA_RPM = int(os.environ.get("DEFAULT_NVIDIA_RPM", "0"))
 PROXY_TIMEOUT = float(os.environ.get("PROXY_TIMEOUT", "10"))
 UPSTREAM_CONNECT_TIMEOUT = float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "10"))
-UPSTREAM_READ_TIMEOUT = float(os.environ.get("UPSTREAM_READ_TIMEOUT", "120"))
+UPSTREAM_READ_TIMEOUT = float(os.environ.get("UPSTREAM_READ_TIMEOUT", "300"))
 MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "500"))
 MAX_ROUTES_PER_REQUEST = int(os.environ.get("MAX_ROUTES_PER_REQUEST", "80"))
 # 全平台同时打开的上游 HTTP 连接数上限（跨请求的全局 socket 阀门）。
