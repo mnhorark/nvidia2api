@@ -66,8 +66,10 @@ class ParseTests(TestCase):
         spec = parse({"reasoning_effort": "high"})
         self.assertTrue(spec.enabled)
         out = to_upstream(spec, "deepseek-ai/deepseek-v4-pro")
+        # 2026-09 收紧：纯档位意图不再合成 thinking 开关——档位本身
+        # 就是开启表达，凭空注入是发明意图（严格上游 400 风险面）
         self.assertEqual(out["reasoning_effort"], "high")
-        self.assertTrue(out["chat_template_kwargs"]["thinking"])
+        self.assertNotIn("chat_template_kwargs", out)
 
     def test_effort_clamped_to_model_supported(self):
         # DeepSeek 只支持 high/max：客户端 low 提到 high，max 保持
@@ -176,8 +178,26 @@ class UpstreamGateTests(TestCase):
         self.assertEqual(to_upstream(spec, "deepseek-ai/deepseek-r1"), {})
 
     def test_passthrough_enabled_by_default(self):
+        # 2026-09 收紧：推断态 enabled（无 explicit_toggle 标记）不再
+        # 合成开关——on 意图由档位/预算字段本身表达。显式开关见
+        # test_explicit_toggle_reaches_toggling_model。
         spec = ThinkingSpec(enabled=True)
-        self.assertIn("chat_template_kwargs", to_upstream(spec, "any/model"))
+        self.assertNotIn("chat_template_kwargs", to_upstream(spec, "any/model"))
+        self.assertEqual(to_upstream(spec, "any/model")["reasoning_effort"], "high")
+
+    def test_explicit_toggle_always_injected(self):
+        """显式开关注入不受推断收窄影响（off 场景 + 显式 on 场景）。"""
+        # off：推断 False 也注入（关不掉是真实故障）
+        out = to_upstream(parse({"enable_thinking": False}), "qwen/qwen3.8-flash")
+        self.assertEqual(out["chat_template_kwargs"], {"enable_thinking": False})
+        # 显式 on：正常注入
+        out = to_upstream(parse({"thinking": True}), "deepseek-ai/deepseek-v4-pro")
+        self.assertEqual(out["chat_template_kwargs"], {"thinking": True})
+
+    def test_explicit_toggle_reaches_toggling_model(self):
+        """显式开关注入不受档位驱动收窄影响（客户端意图必须传递）。"""
+        out = to_upstream(parse({"thinking": True}), "deepseek-ai/deepseek-v4-pro")
+        self.assertEqual(out["chat_template_kwargs"], {"thinking": True})
 
     def test_strip_models(self):
         set_setting("thinking_strip_models", "mistral-large, stepfun")
@@ -284,9 +304,9 @@ class UpstreamWireTests(TransactionTestCase):
             "reasoning_effort": "high",
         })
         self.assertEqual(body["reasoning_effort"], "high")
-        # DeepSeek 族只发 thinking 开关，不发 enable_thinking（避免非法关键字）
-        self.assertTrue(body["chat_template_kwargs"]["thinking"])
-        self.assertNotIn("enable_thinking", body["chat_template_kwargs"])
+        # 2026-09 收紧：纯档位意图不合成 thinking 开关（发明意图修复）。
+        # 显式开关仍正常传递（见 test_chat_template_kwargs_known_keys）。
+        self.assertNotIn("chat_template_kwargs", body)
 
     def test_extra_body_chat_template_kwargs_reaches_upstream(self):
         body = self._call_upstream({
@@ -361,8 +381,10 @@ class R14_EffortVocabularyTests(TestCase):
         self.assertEqual(out["reasoning_effort"], "xhigh")
         out = to_upstream(parse({"reasoning_effort": "high"}), "muse-spark-1.3-contributor-free")
         self.assertEqual(out["reasoning_effort"], "high")
-        # budget_kwarg 双通道：档位换算成 chat_template_kwargs.thinking_budget
-        self.assertEqual(out["chat_template_kwargs"]["thinking_budget"], 16384)
+        # 2026-09 收紧：档位意图不再经换算表合成 thinking_budget——
+        # 凭空注入 32K 预算挤占模型上下文窗口（zcode muse 案），且是
+        # 客户端未表达的意图。预算双通道仅在客户端显式给预算时生效。
+        self.assertNotIn("chat_template_kwargs", out)
 
     def test_true_gateway_still_uses_reasoning_object(self):
         """真网关（openrouter host）仍走 reasoning 对象格式。"""

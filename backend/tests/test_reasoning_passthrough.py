@@ -80,9 +80,8 @@ class KiloOpenRouterReasoningTests(TestCase):
             # 使用非 always_on 的模型（如 deepseek 非 r1）
             payload = {"reasoning_effort": "high", "model": "test", "messages": []}
             out = thinking.build_upstream(payload, "deepseek-ai/deepseek-v4-pro", ch)
-        # NVIDIA 非 r1 模型应该用 chat_template_kwargs 格式
-        self.assertIn("chat_template_kwargs", out)
-        self.assertIn("reasoning_effort", out)
+        # 2026-09 收紧：纯档位意图只发 reasoning_effort（不合成开关）
+        self.assertEqual(out, {"reasoning_effort": "high"})
 
     def test_nvidia_r1_model_uses_reasoning_effort_only(self):
         """NVIDIA deepseek-r1：always_on 模型只输出 reasoning_effort"""

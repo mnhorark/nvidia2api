@@ -259,6 +259,10 @@ class ThinkingSpec:
     template_kwargs: dict = field(default_factory=dict)
     # 保留原始 reasoning 对象（用于 gateway 格式透传）
     raw_reasoning: dict | None = None
+    # 客户端是否**显式**发送过开关键（thinking/enable_thinking/reasoning
+    # 对象等）：True=开关意图是客户端的真实表达；False=enabled 是 parse
+    # 从档位/预算推断的——下游据此区分"传递"与"不发明"
+    explicit_toggle: bool = False
 
     def is_set(self) -> bool:
         return (
@@ -426,10 +430,16 @@ def parse(payload) -> ThinkingSpec:
     src = _flatten(payload)
     spec = ThinkingSpec()
 
+    # 客户端是否**显式**表达了开关意图（thinking/enable_thinking 等
+    # 顶层/嵌套键真实出现过）：to_upstream 据此区分"传递显式开关"与
+    # "从档位推断 enabled 后凭空合成开关"——后者是发明意图
+    explicit_toggle = False
+
     kwargs = src.get("chat_template_kwargs")
     if isinstance(kwargs, dict):
         for key, value in kwargs.items():
             if key in _KWARG_SWITCH_KEYS:
+                explicit_toggle = True
                 flag, budget = _thinking_from_value(value)
                 if flag is not None and spec.enabled is None:
                     spec.enabled = flag
@@ -448,10 +458,12 @@ def parse(payload) -> ThinkingSpec:
 
     for key in _TOP_SWITCH_KEYS:
         flag, budget = _thinking_from_value(src.get(key))
-        if flag is not None and spec.enabled is None:
-            spec.enabled = flag
-            if budget is not None and spec.budget is None:
-                spec.budget = budget
+        if flag is not None:
+            explicit_toggle = True
+            if spec.enabled is None:
+                spec.enabled = flag
+                if budget is not None and spec.budget is None:
+                    spec.budget = budget
 
     # Claude betas 风格：betas 中包含 thinking 表示开启
     if src.get("enabled") is True and spec.enabled is None:
@@ -470,8 +482,10 @@ def parse(payload) -> ThinkingSpec:
         eff, flag, raw = _parse_reasoning(raw_reasoning)
         if eff and spec.effort is None:
             spec.effort = eff
-        if flag is not None and spec.enabled is None:
-            spec.enabled = flag
+        if flag is not None:
+            explicit_toggle = True
+            if spec.enabled is None:
+                spec.enabled = flag
         if isinstance(raw, dict):
             spec.raw_reasoning = raw
             b = _as_int(raw.get("budget_tokens") or raw.get("reasoning_budget") or raw.get("thinking_budget"))
@@ -491,6 +505,7 @@ def parse(payload) -> ThinkingSpec:
     if spec.budget is not None and spec.enabled is None:
         spec.enabled = True
 
+    spec.explicit_toggle = explicit_toggle
     return spec
 
 
@@ -621,8 +636,19 @@ def to_upstream(spec: ThinkingSpec, model_name: str = "", channel=None) -> dict:
         elif enabled is False and not cap.always_on:
             out["thinking"] = {"type": "disabled"}
     elif not cap.always_on:
+        # 开关注入的边界：区分"传递客户端意图"与"发明客户端意图"。
+        # - off（enabled=False）：**必须**注入 toggle=false——deepseek/
+        #   muse 等默认开启思考的模型，不发 false 关不掉；
+        # - on：仅当客户端**显式**发过开关注入（spec.explicit_toggle）。
+        #   推断出的 True（从档位/预算合成）不注入——档位已是开启表达，
+        #   旧行为对 "reasoning_effort: xhigh" 凭空合成
+        #   thinking:true+enable_thinking:true 属发明意图（严格上游
+        #   400 风险面，语义与档位重复），并曾连带合成
+        #   thinking_budget=32768 挤占窗口（zcode muse 案）。
+        # 直接构造 ThinkingSpec 的内部调用方（无显式标记）同归推断态。
         kwargs = dict(spec.template_kwargs)
-        if enabled is not None:
+        toggle_wanted = (enabled is False or spec.explicit_toggle)
+        if toggle_wanted:
             for key in cap.toggle_keys:
                 kwargs[key] = enabled
         if kwargs:
@@ -657,15 +683,18 @@ def to_upstream(spec: ThinkingSpec, model_name: str = "", channel=None) -> dict:
             and not cap.effort_budget_exclusive:
         out["reasoning_budget"] = spec.budget
 
-    # budget_kwarg 双通道：把预算意图（显式预算，或档位经换算表合成）
-    # 同步写进 chat_template_kwargs——vLLM 系上游只认模板变量，
-    # 顶层字段会被静默忽略（zen muse 实测）。
+    # budget_kwarg 双通道：把**客户端显式给的**预算意图写进
+    # chat_template_kwargs——vLLM 系上游只认模板变量，顶层字段会被
+    # 静默忽略（zen muse 实测）。
+    # 2026-09 收紧：档位意图**不再**经换算表合成预算注入。旧行为对
+    # "reasoning_effort: xhigh" 凭空合成 thinking_budget=32768——
+    # 32K 思考预算挤占模型上下文窗口，正是 zcode 场景 muse 请求耗时
+    # 暴涨/上游窗口拒绝的推手。档位意图只发档位；预算意图只在客户端
+    # 显式给预算时走双通道。
     # 互斥渠道例外：effort 档位已在顶层下发时**不再**注入模板变量，
     # 否则 reasoning_effort + thinking_budget 同发（qwen3.8-flash 400）。
     if cap.budget_kwarg and not cap.effort_budget_exclusive:
         tokens = spec.budget
-        if tokens is None and spec.effort:
-            tokens = effort_to_budget(spec.effort)
         if tokens:
             kwargs = out.setdefault("chat_template_kwargs", {})
             kwargs[cap.budget_kwarg] = tokens
