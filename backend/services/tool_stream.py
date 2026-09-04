@@ -74,8 +74,12 @@ class ToolCallStreamNormalizer:
         # 槽位键 (choice_index, tool_index) —— 对齐 OpenAI/new-api 的复合键语义
         self._slots: dict[tuple[int, int], _SlotState] = {}
 
-    def _normalize_entry(self, entry: dict, state: _SlotState) -> dict | None:
-        idx = entry.get("index", 0)
+    def _normalize_entry(self, entry: dict, state: _SlotState,
+                         eidx: int | None = None) -> dict | None:
+        # 发射 index 必须与槽位键同源（feed() 传入 eidx）：Gemini 式
+        # 省略 index 的并行调用按列表位置分槽，若此处回落 0，两个并行
+        # 调用都发 index 0——客户端把参数拼进同一个调用，JSON 损坏。
+        idx = eidx if eidx is not None else entry.get("index", 0)
         if not isinstance(idx, int):
             idx = 0
         out: dict[str, Any] = {"index": idx}
@@ -178,7 +182,7 @@ class ToolCallStreamNormalizer:
                 if not isinstance(eidx, int):
                     eidx = pos
                 state = self._slots.setdefault((choice_idx, eidx), _SlotState())
-                norm = self._normalize_entry(entry, state)
+                norm = self._normalize_entry(entry, state, eidx)
                 if norm is not None:
                     out_entries.append(norm)
                     fn = norm.get("function") or {}
@@ -202,7 +206,7 @@ class ToolCallStreamNormalizer:
             return [chunk]  # 无 tool_calls 字段：字节级原样透传
         if not any_emitted:
             rest_present = any(
-                (isinstance(c, dict) and c.get("delta")
+                (isinstance(c, dict) and isinstance(c.get("delta"), dict)
                  and any(v not in (None, "", [], {}) for v in c["delta"].values()))
                 or (isinstance(c, dict) and c.get("finish_reason"))
                 for c in choices if isinstance(c, dict)

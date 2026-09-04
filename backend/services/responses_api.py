@@ -1064,6 +1064,21 @@ def _sse_event(name: str, obj: dict) -> str:
     return f"event: {name}\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
+class _SeqNumbering:
+    """Responses SSE 事件的 sequence_number 单调计数器。
+
+    openai SDK 的全部流式事件模型把 sequence_number 声明为必填（无默认
+    值）——旧实现所有事件都缺它，官方 SDK 流式解析直接 ValidationError。
+    """
+
+    def __init__(self) -> None:
+        self._n = 0
+
+    def next(self) -> int:
+        self._n += 1
+        return self._n
+
+
 async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIterator[str]:
     """把内部 chat 格式的 SSE 行流转成 Responses API SSE 事件流。
 
@@ -1085,6 +1100,18 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
     usage: dict = {}
     reasoning_acc = ""
     content_acc = ""
+    # openai SDK 流式事件必填 sequence_number：全部事件统一注入
+    seq = _SeqNumbering()
+
+    def _emit(name: str, obj: dict) -> str:
+        if "sequence_number" not in obj:
+            obj = {**obj, "sequence_number": seq.next()}
+        return _sse_event(name, obj)
+    # response 对象必填字段（openai.types.responses.Response 无默认值）：
+    # created_at / parallel_tool_calls / tool_choice / tools / output
+    created_at = time.time()
+    response_base: dict = {"parallel_tool_calls": False,
+                           "tool_choice": "auto", "tools": []}
     # 工具槽位注册表：slot_key -> {item_id, name, args, output_index}
     tool_slots: dict = {}
     # 已宣告过的条目 id（用于 output_item.added 去重）及其 output_index
@@ -1103,7 +1130,7 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
             return
         announced.add(iid)
         output_indices[iid] = next_output_index
-        yield _sse_event("response.output_item.added",
+        yield _emit("response.output_item.added",
                          {"type": "response.output_item.added",
                           "output_index": next_output_index, "item": item})
         next_output_index += 1
@@ -1113,17 +1140,37 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
             status = "completed"
         else:
             status = "incomplete"
+        # response 对象必填字段补全（output 按累积内容回放终态）
+        output: list = []
+        if reasoning_acc:
+            output.append({"id": "rs_0", "type": "reasoning",
+                           "status": "completed", "summary": []})
+        if message_item_id in announced:
+            output.append({"id": message_item_id, "type": "message",
+                           "role": "assistant", "status": "completed",
+                           "content": [{"type": "output_text",
+                                        "text": content_acc,
+                                        "annotations": []}]})
+        for entry in tool_slots.values():
+            output.append({"id": entry["item_id"], "type": "function_call",
+                           "status": "completed",
+                           "call_id": entry["item_id"],
+                           "name": entry["name"],
+                           "arguments": entry["args"]})
         completed: dict = {
             "type": "response.completed",
-            "response": {"id": rid, "object": "response",
+            "response": {**response_base,
+                         "created_at": created_at,
+                         "id": rid, "object": "response",
                          "status": status, "model": model,
+                         "output": output,
                          # chat 键名 -> Responses 键名（input/output_tokens）
                          "usage": _usage_to_responses(usage)},
         }
         if finish in _FINISH_TO_RESPONSES:
             completed["response"]["incomplete_details"] = {
                 "reason": _FINISH_TO_RESPONSES[finish]}
-        return _sse_event("response.completed", completed)
+        return _emit("response.completed", completed)
 
     async def emit_terminator(rid: str, model: str, finish) -> AsyncIterator[str]:
         """流尾收尾：completed（finish 已见且无 error）+ [DONE]。"""
@@ -1164,13 +1211,15 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
                 # created 前置保证 response.failed 不悬空。
                 if not emitted_created:
                     emitted_created = True
-                    yield _sse_event("response.created", {
+                    yield _emit("response.created", {
                         "type": "response.created",
-                        "response": {"id": data.get("id") or "resp_x",
+                        "response": {**response_base, "output": [],
+                                     "created_at": created_at,
+                                     "id": data.get("id") or "resp_x",
                                      "object": "response",
                                      "status": "in_progress", "model": ""},
                     })
-                yield _sse_event("response.failed",
+                yield _emit("response.failed",
                                  {"type": "response.failed", "error": data["error"]})
                 yield "data: [DONE]\n\n"
                 done_sent = True
@@ -1185,15 +1234,23 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
             rid = data.get("id") or "resp_x"
             if not emitted_created:
                 emitted_created = True
-                yield _sse_event("response.created", {
+                # Response 必填字段补全：created_at/output/parallel_tool_calls/
+                # tool_choice/tools——openai SDK 对 response 对象逐字段校验
+                yield _emit("response.created", {
                     "type": "response.created",
-                    "response": {"id": rid, "object": "response",
-                                 "status": "in_progress", "model": data.get("model") or ""},
+                    "response": {**response_base, "output": [],
+                                 "created_at": created_at,
+                                 "id": rid, "object": "response",
+                                 "status": "in_progress",
+                                 "model": data.get("model") or ""},
                 })
-                yield _sse_event("response.in_progress", {
+                yield _emit("response.in_progress", {
                     "type": "response.in_progress",
-                    "response": {"id": rid, "object": "response",
-                                 "status": "in_progress", "model": data.get("model") or ""},
+                    "response": {**response_base, "output": [],
+                                 "created_at": created_at,
+                                 "id": rid, "object": "response",
+                                 "status": "in_progress",
+                                 "model": data.get("model") or ""},
                 })
             delta = ch.get("delta") or {}
             if pending_finish is not None:
@@ -1208,9 +1265,11 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
                 async for _ev in announce({"id": "rs_0", "type": "reasoning",
                                            "status": "in_progress", "summary": []}):
                     yield _ev
-                yield _sse_event("response.reasoning_summary_text.delta", {
+                yield _emit("response.reasoning_summary_text.delta", {
                     "type": "response.reasoning_summary_text.delta",
                     "output_index": output_indices.get("rs_0", 0),
+                    # openai SDK 必填字段（ResponseReasoningSummaryTextDeltaEvent）
+                    "item_id": "rs_0", "summary_index": 0,
                     "delta": str(reasoning),
                 })
             content = delta.get("content")
@@ -1220,9 +1279,11 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
                                            "role": "assistant", "status": "in_progress",
                                            "content": []}):
                     yield _ev
-                yield _sse_event("response.output_text.delta", {
+                yield _emit("response.output_text.delta", {
                     "type": "response.output_text.delta",
                     "output_index": output_indices.get(message_item_id, 0),
+                    # openai SDK 必填字段（ResponseTextDeltaEvent）
+                    "item_id": message_item_id, "content_index": 0,
                     "delta": str(content),
                 })
             tool_calls = delta.get("tool_calls")
@@ -1262,7 +1323,7 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
                         next_output_index += 1
                         announced.add(entry["item_id"])
                         output_indices[entry["item_id"]] = entry["output_index"]
-                        yield _sse_event("response.output_item.added", {
+                        yield _emit("response.output_item.added", {
                             "type": "response.output_item.added",
                             "output_index": entry["output_index"],
                             "item": {"id": entry["item_id"], "type": "function_call",
@@ -1271,7 +1332,7 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
                                      "name": entry["name"], "arguments": ""}})
                     if args:
                         entry["args"] += args
-                        yield _sse_event("response.function_call_arguments.delta", {
+                        yield _emit("response.function_call_arguments.delta", {
                             "type": "response.function_call_arguments.delta",
                             "output_index": entry["output_index"],
                             "item_id": entry["item_id"],
@@ -1286,19 +1347,21 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
                 # 结束各 output_item（内容已定）；response.completed 延迟到
                 # [DONE]/流尾——usage 尾帧在 finish 之后才到
                 if "rs_0" in announced:
-                    yield _sse_event("response.output_item.done", {
+                    yield _emit("response.output_item.done", {
                         "type": "response.output_item.done",
                         "output_index": output_indices.get("rs_0", 0),
                         "item": {"id": "rs_0", "type": "reasoning",
                                  "status": "completed", "summary": []},
                     })
                 if message_item_id in announced:
-                    yield _sse_event("response.output_text.done", {
+                    yield _emit("response.output_text.done", {
                         "type": "response.output_text.done",
                         "output_index": output_indices.get(message_item_id, 0),
                         "text": content_acc, "item_id": message_item_id,
+                        # openai SDK 必填字段（ResponseTextDoneEvent）
+                        "content_index": 0,
                     })
-                    yield _sse_event("response.output_item.done", {
+                    yield _emit("response.output_item.done", {
                         "type": "response.output_item.done",
                         "output_index": output_indices.get(message_item_id, 0),
                         "item": {"id": message_item_id, "type": "message",
@@ -1306,7 +1369,7 @@ async def iter_chat_sse_as_responses(chat_iter: AsyncIterator[str]) -> AsyncIter
                                  "content": [{"type": "output_text", "text": content_acc}]},
                     })
                 for entry in tool_slots.values():
-                    yield _sse_event("response.output_item.done", {
+                    yield _emit("response.output_item.done", {
                         "type": "response.output_item.done",
                         "output_index": entry["output_index"],
                         "item": {"id": entry["item_id"], "type": "function_call",

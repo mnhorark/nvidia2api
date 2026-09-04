@@ -159,12 +159,24 @@ class ReviewFixRegressionTests(TestCase):
             _achunks(iter(chunks))))
         stops = [l for l in out if l.startswith("event: content_block_stop")]
         # 工具块 stop（插话开块时关）+ 插话 text 块 stop（finish 时关），无重复
-        self.assertEqual(len(stops), 2)
+        # 2026-09 语义升级：回到已 stop 的工具块时**重开新块**承接余下
+        # input_json_delta（旧实现 delta-after-stop 是协议违例且重拼 JSON
+        # 损坏）。stop 数：工具块(0) + text 插话块(1) + 工具重开块(2)。
+        self.assertEqual(len(stops), 3)
+        # 每个 stop 都有对应 start，且 start/stop 严格配对（无重复 stop）
+        starts = [l for l in out if l.startswith("event: content_block_start")]
+        self.assertEqual(len(starts), 3)
         args = "".join(json.loads(l.split("data: ", 1)[1])["delta"]["partial_json"]
                        for l in out
                        if l.startswith("event: content_block_delta")
                        and "input_json_delta" in l)
         self.assertEqual(args, '{"x":1}')  # 参数零丢失
+        # 重开的 tool_use 块声明 id/name 完整（客户端可按 id 归并两段 input）
+        reopened = json.loads(starts[-1].split("data: ", 1)[1])
+        cb = reopened["content_block"]
+        self.assertEqual(cb["type"], "tool_use")
+        self.assertEqual(cb["id"], "t1")
+        self.assertEqual(cb["name"], "f")
 
     def test_input_file_audio_refusal_parts_survive(self):
         """Responses 入口：input_file/input_audio/refusal 分片不蒸发。"""

@@ -655,3 +655,186 @@ class ToolCallDeltaFrameShapeTests(TestCase):
         self.assertEqual(len(by_slot), 2)
         self.assertEqual(by_slot[0], ['{"x"'])
         self.assertEqual(by_slot[1], ['{"y"'])
+
+
+class ToolStreamIndexNormalizationTests(TestCase):
+    """规整器发射 index 与槽位键同源（Gemini 无 index 并行调用案）。
+
+    旧实现槽位键用列表位置 pos 分槽、发射 index 却回落 0——两个并行
+    调用都发 index 0，客户端把参数拼进同一调用（JSON 损坏）。
+    """
+
+    def _feed(self, tcs: list) -> dict:
+        from services.tool_stream import ToolCallStreamNormalizer
+        chunk = "data: " + json.dumps(
+            {"choices": [{"index": 0, "delta": {"tool_calls": tcs}}]}) + "\n\n"
+        out = ToolCallStreamNormalizer().feed(chunk)
+        data = json.loads(out[0][5:].strip()) if out else {"choices": []}
+        return data
+
+    def test_indexless_parallel_calls_keep_distinct_indices(self):
+        data = self._feed([
+            {"id": "a", "type": "function",
+             "function": {"name": "t1", "arguments": "{\"x\":1}"}},
+            {"id": "b", "type": "function",
+             "function": {"name": "t2", "arguments": "{\"y\":2}"}},
+        ])
+        entries = data["choices"][0]["delta"]["tool_calls"]
+        self.assertEqual([e["index"] for e in entries], [0, 1])
+
+    def test_malformed_delta_type_does_not_crash(self):
+        """delta 为非 dict（畸形上游）不抛 AttributeError，流不中断。"""
+        from services.tool_stream import ToolCallStreamNormalizer
+        bad = "data: " + json.dumps({"choices": [
+            {"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "type": "function",
+                 "function": {"name": "t", "arguments": "{}"}}]}},
+            {"index": 1, "delta": ["not", "a", "dict"]},
+        ]}) + "\n\n"
+        out = ToolCallStreamNormalizer().feed(bad)
+        self.assertTrue(out)  # 正常产出，不抛异常
+
+
+class ResponsesExitSchemaTests(TestCase):
+    """/v1/responses 出口事件 schema 完整性（openai SDK 严格校验案）。
+
+    旧实现事件缺 sequence_number（全系必填）、缺 item_id/content_index/
+    summary_index（delta 类必填）、response 对象缺 created_at/output/
+    parallel_tool_calls/tool_choice/tools——openai-python 流式解析
+    ValidationError。
+    """
+
+    def _events(self, chunks: list) -> list[dict]:
+        import asyncio
+
+        async def src():
+            for c in chunks:
+                yield c
+
+        async def _gather():
+            parts = []
+            async for ev in responses_api.iter_chat_sse_as_responses(src()):
+                parts.append(ev)
+            return "".join(parts)
+
+        out = asyncio.run(_gather())
+        return [json.loads(l[5:]) for l in out.splitlines()
+                if l.startswith("data: ") and l[5:].strip() != "[DONE]"]
+
+    def test_sequence_number_monotonic_on_all_events(self):
+        evs = self._events([
+            'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n',
+            'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+            'data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n',
+            'data: [DONE]\n\n',
+        ])
+        seqs = [e["sequence_number"] for e in evs if "sequence_number" in e]
+        self.assertEqual(len(seqs), len(evs))
+        self.assertEqual(seqs, sorted(seqs))
+        self.assertGreaterEqual(seqs[0], 1)
+
+    def test_text_delta_carries_item_id_and_content_index(self):
+        evs = self._events([
+            'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n',
+            'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+            'data: [DONE]\n\n',
+        ])
+        text_delta = next(e for e in evs
+                          if e.get("type") == "response.output_text.delta"
+                          and e.get("delta"))
+        self.assertEqual(text_delta["item_id"], "msg_0")
+        self.assertEqual(text_delta["content_index"], 0)
+
+    def test_response_object_has_required_fields(self):
+        evs = self._events([
+            'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n',
+            'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+            'data: [DONE]\n\n',
+        ])
+        created = next(e for e in evs if e.get("type") == "response.created")
+        resp = created["response"]
+        for field in ("created_at", "parallel_tool_calls", "tool_choice",
+                      "tools", "output"):
+            self.assertIn(field, resp, f"response.{field} 必填")
+        completed = next(e for e in evs if e.get("type") == "response.completed")
+        cresp = completed["response"]
+        self.assertEqual(cresp["status"], "completed")
+        self.assertIn("output", cresp)
+        kinds = [o.get("type") for o in cresp["output"]]
+        self.assertIn("message", kinds)
+
+
+class AnthropicExitInterleavedToolTests(TestCase):
+    """Anthropic 出口交错并行工具：delta-after-stop 重开块（严格串行协议）。
+
+    旧实现对已 stop 的块索引继续发 input_json_delta——协议违例且重拼
+    JSON 损坏。
+    """
+
+    def _events(self, chunks: list) -> list[dict]:
+        import asyncio
+        from services import anthropic_api
+
+        async def src():
+            for c in chunks:
+                yield c
+
+        async def _gather():
+            parts = []
+            async for ev in anthropic_api.iter_chat_sse_as_anthropic(src()):
+                parts.append(ev)
+            return "".join(parts)
+
+        out = asyncio.run(_gather())
+        return [json.loads(l[5:]) for l in out.splitlines()
+                if l.startswith("data: ")]
+
+    def _tc_chunk(self, idx: int, tid: str, name: str = "", args: str = ""):
+        fn = {"arguments": args}
+        if name:
+            fn["name"] = name
+        tc = {"index": idx, "type": "function", "id": tid, "function": fn}
+        return 'data: ' + json.dumps({"choices": [
+            {"index": 0, "delta": {"tool_calls": [tc]}}]}) + "\n\n"
+
+    def test_interleaved_tool_calls_never_delta_after_stop(self):
+        evs = self._events([
+            'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n',
+            self._tc_chunk(0, "call_A", "t1", '{"x"'),
+            self._tc_chunk(1, "call_B", "t2", '{"y"'),
+            self._tc_chunk(0, "call_A", args=":1}"),
+            self._tc_chunk(1, "call_B", args=":2}"),
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+            'data: [DONE]\n\n',
+        ])
+        # 每个块的 stop 之后不允许再出现同 index 的 delta
+        last_stop_at: dict = {}
+        last_event_kind: dict = {}
+        for i, e in enumerate(evs):
+            if e.get("type") == "content_block_stop":
+                last_stop_at[e["index"]] = i
+            elif e.get("type") == "content_block_delta":
+                stopped = [idx for idx, at in last_stop_at.items() if at > -1]
+                if e["index"] in last_stop_at and \
+                        last_stop_at[e["index"]] < i:
+                    # 允许：stop 之后该 index 被重开过（新 content_block_start）
+                    reopened = any(
+                        s.get("type") == "content_block_start"
+                        and s["index"] == e["index"]
+                        for s in evs[last_stop_at[e["index"]]:i])
+                    self.assertTrue(
+                        reopened,
+                        f"delta-after-stop 且未重开: event#{i} {e}")
+                    _ = stopped
+        # 重开块必须带完整 tool_use 声明（id/name 非空）
+        starts = [e for e in evs if e.get("type") == "content_block_start"
+                  and e.get("content_block", {}).get("type") == "tool_use"]
+        for s in starts:
+            self.assertTrue(s["content_block"]["id"])
+            self.assertTrue(s["content_block"]["name"])
+        # 两次重开（A、B 各被 stop 一次后回到）→ 至少 4 个 tool_use 块
+        self.assertGreaterEqual(len(starts), 4)
+        _ = last_event_kind

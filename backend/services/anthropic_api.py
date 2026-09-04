@@ -401,6 +401,13 @@ async def iter_chat_sse_as_anthropic(chat_iter: AsyncIterator[str]) -> AsyncIter
                 "content_block": {"type": "tool_use", "id": "", "name": "", "input": {}}})
 
     async def close_block(idx: int, btype: str) -> AsyncIterator[str]:
+        if btype == "tool_use":
+            # 标记该工具条目已 stop：交错并行流回到它时须重开新块
+            # 承接余下 input_json_delta（delta-after-stop 协议违例）
+            for ent in tool_slots.values():
+                if ent.get("idx") == idx:
+                    ent["stopped"] = True
+                    break
         yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
 
     async def finish_message(default_stop: str) -> AsyncIterator[str]:
@@ -538,11 +545,11 @@ async def iter_chat_sse_as_anthropic(chat_iter: AsyncIterator[str]) -> AsyncIter
                                               "id": iid, "name": name, "input": {}}})
                     else:
                         # 回到已有工具块：若中间开了 text/thinking，先关闭。
-                        # 该工具块此前已被 stop 过（无法重开），所以**不再**
-                        # 把它放回 opened——否则 finish_message 会再次对同
-                        # 一 index 发 content_block_stop（重复 stop 协议违
-                        # 约）。后续 delta 继续对工具块索引发（已知取舍：
-                        # Anthropic 串行协议下的最不坏形态）。
+                        # 若该工具块此前已被 stop（并行调用交错流：slot0
+                        # → slot1 → 又回到 slot0），Anthropic 协议不允许
+                        # 对已 stop 的索引发 delta——**重开一个新块**承接
+                        # 余下的 input_json_delta（客户端把同 id 的两段
+                        # input 合并即可），否则重拼 JSON 损坏。
                         if opened and opened[-1][0] != entry["idx"]:
                             async for _e in close_block(*opened[-1]):
                                 yield _e
@@ -551,6 +558,21 @@ async def iter_chat_sse_as_anthropic(chat_iter: AsyncIterator[str]) -> AsyncIter
                             entry["id"] = iid
                         if name and not entry["name"]:
                             entry["name"] = name
+                        if entry.get("stopped"):
+                            new_idx = block_index
+                            block_index += 1
+                            entry = {**entry, "idx": new_idx, "args": "",
+                                     "stopped": False}
+                            if key is not None:
+                                tool_slots[key] = entry
+                            opened.append((new_idx, "tool_use"))
+                            yield _sse("content_block_start", {
+                                "type": "content_block_start",
+                                "index": new_idx,
+                                "content_block": {"type": "tool_use",
+                                                  "id": entry["id"],
+                                                  "name": entry["name"],
+                                                  "input": {}}})
                     if args:
                         entry["args"] += args
                         yield _sse("content_block_delta", {
