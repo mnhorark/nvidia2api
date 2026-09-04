@@ -523,3 +523,135 @@ class ChatExitUntranslatedResponseEventTests(TestCase):
         self.assertNotIn("in_progress", out)
         # prelude 不经翻译器：协议 data 帧整帧截留，正文从首帧翻译起步
         self.assertIn("data: [DONE]", out)
+
+
+class ToolCallDeltaFrameShapeTests(TestCase):
+    """tool_call 增量帧合法性（ZCode AI_InvalidResponseDataError 案）。
+
+    Vercel AI SDK 的 zod schema 逐字段校验 function.name 必须 string，
+    翻译层发 "name": null 即抛 AI_InvalidResponseDataError（网关侧字节
+    合法、日志成功，客户端解析崩溃）。另修复 item.id/call_id 双标识
+    槽位分裂：arguments.delta 只带 item.id，added/done 只带 call_id，
+    旧实现按两个 key 各自分槽 → 参数流进空槽 + done 兜底重复发参数。
+    """
+
+    def _stream_out(self, lines: list) -> list[dict]:
+        import asyncio
+
+        async def src():
+            for l in lines:
+                yield l
+
+        async def _gather():
+            parts = []
+            async for c in responses_api.iter_responses_sse(
+                    "", src(), include_first=False):
+                parts.append(c)
+            return "".join(parts)
+
+        out = asyncio.run(_gather())
+        return [json.loads(l[5:]) for l in out.splitlines()
+                if l.startswith("data: ") and l[5:].strip() != "[DONE]"]
+
+    def _fc_added(self, item_id="fc_abc123", call_id="call_001"):
+        return ('data: {"type":"response.output_item.added",'
+                '"item":{"id":"%s","call_id":"%s","type":"function_call",'
+                '"name":"get_weather","arguments":""}}\n\n'
+                % (item_id, call_id))
+
+    def _args_delta(self, frag: str, item_id="fc_abc123"):
+        return ('data: {"type":"response.function_call_arguments.delta",'
+                '"item_id":"%s","delta":%s}\n\n'
+                % (item_id, json.dumps(frag)))
+
+    def _tc_of(self, frames):
+        """抽出全部 tool_call 增量对象。"""
+        out = []
+        for f in frames:
+            for tc in (f.get("choices") or [{}])[0].get("delta", {}).get(
+                    "tool_calls") or []:
+                out.append(tc)
+        return out
+
+    def test_no_null_name_in_tool_call_deltas(self):
+        """任何 tool_call 帧都不允许出现 "name": null。
+
+        added 声明帧必须带 name（string）；参数增量帧的 function 键集
+        里 name 必须整体省略（null 是 AI SDK zod 校验的非法值）。
+        """
+        frames = self._stream_out([
+            self._fc_added(),
+            self._args_delta('{"city":'),
+            self._args_delta('"北京"}'),
+            'data: {"type":"response.output_item.done",'
+            '"item":{"id":"fc_abc123","call_id":"call_001",'
+            '"type":"function_call","name":"get_weather",'
+            '"arguments":"{\\"city\\":\\"北京\\"}"}}\n\n',
+            'data: [DONE]\n\n',
+        ])
+        for tc in self._tc_of(frames):
+            fn = tc["function"]
+            if "name" in fn:
+                self.assertIsInstance(fn["name"], str,
+                                      f"name 出现时必须是 string: {tc}")
+
+    def test_slot_unified_across_item_id_and_call_id(self):
+        """added/args-delta/done 三阶段同一 call_id 必须同一槽位。"""
+        frames = self._stream_out([
+            self._fc_added(),
+            self._args_delta('{"city":'),
+            self._args_delta('"北京"}'),
+            'data: [DONE]\n\n',
+        ])
+        slots = [tc["index"] for tc in self._tc_of(frames)]
+        self.assertEqual(slots, [0, 0, 0])  # 全部同一槽位（旧实现 [0,1,1]）
+
+    def test_done_not_duplicate_after_deltas(self):
+        """delta 已透传参数时，done 不再兜底补发完整参数（防双倍拼接）。"""
+        frames = self._stream_out([
+            self._fc_added(),
+            self._args_delta('{"city":'),
+            self._args_delta('"北京"}'),
+            'data: {"type":"response.output_item.done",'
+            '"item":{"id":"fc_abc123","call_id":"call_001",'
+            '"type":"function_call","name":"get_weather",'
+            '"arguments":"{\\"city\\":\\"北京\\"}"}}\n\n',
+            'data: [DONE]\n\n',
+        ])
+        args_chunks = [tc["function"].get("arguments")
+                       for tc in self._tc_of(frames)
+                       if tc["function"].get("arguments")]
+        joined = "".join(args_chunks)
+        self.assertEqual(joined, '{"city":"北京"}')  # 恰好一次拼接，合法 JSON
+
+    def test_id_only_on_first_delta_frame(self):
+        """id 仅在参数增量首帧携带，后续帧省略（重复 id 视同新调用）。"""
+        frames = self._stream_out([
+            self._fc_added(),
+            self._args_delta('{"a"'),
+            self._args_delta(':1}'),
+            'data: [DONE]\n\n',
+        ])
+        ids = [tc.get("id") for tc in self._tc_of(frames)]
+        # added 帧、参数首帧携带 id；参数后续帧省略
+        self.assertEqual(ids[0], "call_001")
+        self.assertEqual(ids[1], "call_001")
+        self.assertIsNone(ids[2])
+
+    def test_parallel_calls_get_distinct_slots(self):
+        """并行双工具：item.id 各自归一，两个槽位不串流。"""
+        frames = self._stream_out([
+            self._fc_added("fc_1", "call_A"),
+            self._fc_added("fc_2", "call_B"),
+            self._args_delta('{"x"', "fc_1"),
+            self._args_delta('{"y"', "fc_2"),
+            'data: [DONE]\n\n',
+        ])
+        by_slot: dict = {}
+        for tc in self._tc_of(frames):
+            if tc["function"].get("arguments"):
+                by_slot.setdefault(tc["index"], []).append(
+                    tc["function"]["arguments"])
+        self.assertEqual(len(by_slot), 2)
+        self.assertEqual(by_slot[0], ['{"x"'])
+        self.assertEqual(by_slot[1], ['{"y"'])

@@ -754,6 +754,11 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
     # delta 必须各占一个 index——旧实现硬编码 index 0，openai-python 等
     # 按 index 累积的 SDK 会把第二个调用的参数追加到第一个上（参数损坏）。
     tool_index: dict = state.setdefault("tool_index_by_id", {})
+    # item.id（fc_…/msg_…，arguments.delta 事件携带的是它）-> call_id
+    # （call_…，output_item.added/done 携带的是它）。两套标识必须归一，
+    # 否则同一工具调用被 _slot_for 拆成两个槽位（参数流进空槽），
+    # 且 done 的 args_seen 判定失效 → 完整参数重复追加（JSON 损坏）。
+    item_to_call: dict = state.setdefault("item_id_to_call_id", {})
 
     def _slot_for(call_id: str) -> int:
         if call_id not in tool_index:
@@ -794,8 +799,13 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
         if not isinstance(item, dict):
             return None
         if item.get("type") == "function_call":
-            # 工具开始：先发 id + name，参数随后按增量透传
+            # 工具开始：先发 id + name，参数随后按增量透传。
+            # item.id（fc_…）与 call_id（call_…）在此登记映射——后续
+            # arguments.delta 事件只带 item.id，靠它归一回同一槽位。
             call_id = str(item.get("call_id") or "")
+            item_key = str(item.get("id") or "")
+            if item_key:
+                item_to_call[item_key] = call_id
             slot = _slot_for(call_id)
             return json.dumps({"choices": [{"index": 0,
                                             "delta": {"tool_calls": [{
@@ -821,19 +831,29 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
                                         "delta": {"refusal": str(data.get("delta") or "")},
                                         "finish_reason": None}]})
     if etype == "response.function_call_arguments.delta":
-        call_id = str(data.get("item_id") or "")
-        args_seen.add(call_id)
+        # 参数增量。三个合法帧细节（AI SDK/openai-python 的 zod 校验
+        # 逐字段验证 function.name 必须 string，null 直接抛
+        # AI_InvalidResponseDataError——ZCode 案 req 侧报错根因）：
+        # - function.name 用**省略**表达"不变"，绝不发 null；
+        # - id 仅在此调用首帧携带，后续帧不重复（部分 SDK 视重复 id
+        #   为新工具调用开始）；
+        # - item.id 经 item_to_call 归一回 call_id，与 added/done 同槽。
+        item_key = str(data.get("item_id") or "")
+        call_id = item_to_call.get(item_key, item_key)
         slot = _slot_for(call_id)
+        is_first = item_key not in args_seen
+        args_seen.add(item_key)
+        delta_tc: dict = {
+            "index": slot,
+            "type": "function",
+            "function": {
+                "arguments": str(data.get("delta") or ""),
+            },
+        }
+        if is_first:
+            delta_tc["id"] = call_id
         return json.dumps({"choices": [{"index": 0,
-                                        "delta": {"tool_calls": [{
-                                            "index": slot,
-                                            "id": call_id,
-                                            "type": "function",
-                                            "function": {
-                                                "name": None,
-                                                "arguments": str(data.get("delta") or ""),
-                                            },
-                                        }]},
+                                        "delta": {"tool_calls": [delta_tc]},
                                         "finish_reason": None}]})
     if etype == "response.output_text.done":
         # 部分实现把 usage 挂在该事件上
@@ -872,9 +892,14 @@ def _translate_event(line: str, state: dict | None = None) -> str | None:
             return None
         if item.get("type") == "function_call":
             call_id = str(item.get("call_id") or "")
+            item_key = str(item.get("id") or "")
             # 参数已按增量透传（标准实现），done 不再重复追加完整参数；
-            # 若上游只发 done 未发 delta（非标准），则在此兜底补发一次完整参数
-            if call_id in args_seen:
+            # 若上游只发 done 未发 delta（非标准），则在此兜底补发一次完整参数。
+            # 判定须同时核对 item.id——arguments.delta 在 args_seen 里登记
+            # 的是 item_key（它只带 item.id，不带 call_id）。
+            already_streamed = call_id in args_seen or (
+                item_key and item_key in args_seen)
+            if already_streamed:
                 return None
             slot = _slot_for(call_id)
             return json.dumps({"choices": [{"index": 0,
