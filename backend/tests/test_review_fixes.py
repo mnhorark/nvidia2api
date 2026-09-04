@@ -237,3 +237,81 @@ class ReviewFixRegressionTests(TestCase):
         msg = {"reasoning_content": blob, "content": "答"}
         decrypt_chat_message(msg)
         self.assertEqual(msg["reasoning_content"], blob)
+
+
+class MessageShapeClampTests(TestCase):
+    """消息形态钳制（AI SDK 方言 -> OpenAI 规范形态）。
+
+    根因背景：zcode/keysmith（AI SDK 系）与对话页的请求差异不在思考
+    参数，而在消息形态——role=tool 的 content 数组形态被多数上游强校验
+    拒绝（string 类型校验），表现为 agent 请求全线路 400 而对话页成功。
+    """
+
+    def test_tool_content_array_clamped_to_string(self):
+        from services.message_shape import clamp_message_shapes
+        body = {"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "t1", "type": "function",
+                 "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "t1",
+             "content": [{"type": "text", "text": "结果42"}]},
+        ]}
+        changed = clamp_message_shapes(body)
+        self.assertEqual(changed, 1)
+        self.assertEqual(body["messages"][2]["content"], "结果42")
+        self.assertIsInstance(body["messages"][2]["content"], str)
+
+    def test_tool_extra_keys_stripped(self):
+        """role=tool 的规范外附加键（SDK 泄漏）剔除——上游强校验三键。"""
+        from services.message_shape import clamp_message_shapes
+        body = {"messages": [
+            {"role": "tool", "tool_call_id": "t1", "content": "ok",
+             "name": "f", "some_sdk_leak": {"x": 1}},
+        ]}
+        clamp_message_shapes(body)
+        self.assertEqual(set(body["messages"][0].keys()),
+                         {"role", "tool_call_id", "content"})
+
+    def test_assistant_array_content_clamped(self):
+        from services.message_shape import clamp_message_shapes
+        body = {"messages": [
+            {"role": "assistant",
+             "content": [{"type": "text", "text": "上轮回答"}]},
+        ]}
+        clamp_message_shapes(body)
+        self.assertEqual(body["messages"][0]["content"], "上轮回答")
+
+    def test_multimodal_user_content_preserved(self):
+        """user 消息含 image 块：数组形态合法，保留不收敛。"""
+        from services.message_shape import clamp_message_shapes
+        original = [
+            {"type": "text", "text": "看"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}},
+        ]
+        body = {"messages": [{"role": "user", "content": original}]}
+        clamp_message_shapes(body)
+        self.assertEqual(body["messages"][0]["content"], original)
+
+    def test_user_pure_text_array_clamped(self):
+        from services.message_shape import clamp_message_shapes
+        body = {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}]}
+        clamp_message_shapes(body)
+        self.assertEqual(body["messages"][0]["content"], "ab")
+
+    def test_request_summary_populated(self):
+        """诊断摘要：tools 数量/工具名/改写映射入日志。"""
+        from api.openai_views import _request_summary
+        body = {"model": "m", "stream": True,
+                "messages": [{"role": "user", "content": "x"}],
+                "tools": [{"type": "function", "function": {
+                    "name": "mcp__serena__replace_symbol_body",
+                    "parameters": {}}}],
+                "tool_choice": "auto"}
+        summary = _request_summary(body, {"fn_a": "very_long_name"})
+        self.assertEqual(summary["tools_count"], 1)
+        self.assertEqual(summary["tool_names"], ["mcp__serena__replace_symbol_body"])
+        self.assertEqual(summary["top_keys"],
+                         ["model", "stream", "tool_choice", "tools"])
+        self.assertEqual(summary["tool_alias_rewritten"], 1)

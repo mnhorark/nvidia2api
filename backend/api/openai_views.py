@@ -23,7 +23,7 @@ from django.views.decorators.csrf import csrf_exempt
 from apps.core.models import AIModel, Channel, RequestLog
 from services import (
     anthropic_api, api_key_service, channel_service, key_service, model_registry,
-    message_fixups, responses_api, sysconfig, thinking, tool_alias,
+    message_fixups, message_shape, responses_api, sysconfig, thinking, tool_alias,
 )
 from services.load_balancer import build_routes
 from services.race_engine import (
@@ -368,6 +368,11 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
         upstream_thinking = thinking.build_upstream(body, model_name, channel)
         upstream_body = _build_upstream_body(body, model_name, channel,
                                              thinking_params=upstream_thinking)
+        # 消息形态钳制（AI SDK 系客户端方言）：tool/assistant 消息的
+        # content 数组 -> 字符串、tool 消息剔除规范外附加键——多数上游
+        # 对 tool.content 强校验 string，数组形态整包 400（字节零丢失，
+        # 纯形态转换）
+        message_shape.clamp_message_shapes(upstream_body)
         # 跨轮重复 tool_call id 唯一化（zen/Anthropic 系强校验
         # "每个 function_call 恰好一个 output"，跨轮同名 id 整包 400）
         message_fixups.dedupe_tool_call_ids(upstream_body)
