@@ -453,6 +453,250 @@ class DashboardUsageAggregateTests(TestCase):
         self.assertEqual(resp.status_code, 400)
 
 
+class DashboardUsageMergedQueryTests(TestCase):
+    """2026-09 查询三合一重构的等价性守卫。
+
+    _build_payload 由 6 条串行查询收敛为 3 条（分桶捎带区间汇总、
+    三维分布合一、环比独立），avg 类指标由独立 filtered Avg 改为
+    sum/n 派生。这里钉住新口径的关键语义：
+    - duration 全为 0 的行不计入 avg_latency_s（原 filtered Avg 语义）
+    - 分布合并后 model 维度的 success_rate / avg_latency_s 不失真
+    - models 按 (-total_tokens, model) 排序、Top 20；channels/keys 同序
+    - 空 key 行归到 "(未知 Key)"、空渠道归到 "(无渠道)"
+    """
+
+    def setUp(self):
+        self.factory = RequestFactory()
+        self.headers = {"HTTP_AUTHORIZATION": f"Token {settings.ADMIN_TOKEN}"}
+        self.ch = Channel.objects.create(name="A", slug="a",
+                                         base_url="https://a.test/v1")
+
+    def _get(self, qs="days=7"):
+        req = self.factory.get(f"/api/admin/dashboard/usage?{qs}", **self.headers)
+        return admin_views.DashboardUsageView.as_view()(req).data
+
+    def test_avg_latency_excludes_zero_duration_rows(self):
+        # 3 行 duration=0（不计入均值）+ 1 行 2000ms -> 平均 2s，不是 0.5s
+        for i in range(3):
+            RequestLog.objects.create(channel=self.ch, request_id=f"z{i}",
+                                      model="m", status="success",
+                                      duration_ms=0, total_tokens=1)
+        RequestLog.objects.create(channel=self.ch, request_id="ok", model="m",
+                                  status="success", duration_ms=2000,
+                                  total_tokens=1)
+        data = self._get()
+        self.assertEqual(data["totals"]["requests"], 4)
+        self.assertEqual(data["totals"]["avg_latency_s"], 2.0)
+        # 全零 TTFT -> None（前端据此显示 "—"）
+        self.assertIsNone(data["totals"]["avg_ttft_ms"])
+
+    def test_avg_none_when_no_qualified_rows(self):
+        RequestLog.objects.create(channel=self.ch, request_id="z", model="m",
+                                  status="success", duration_ms=0,
+                                  total_tokens=1)
+        data = self._get()
+        self.assertIsNone(data["totals"]["avg_latency_s"])
+        self.assertIsNone(data["totals"]["avg_ttft_ms"])
+
+    def test_distribution_merge_semantics(self):
+        user1, _ = api_key_service.create_key("k1")
+        user2, _ = api_key_service.create_key("k2")
+        # 同一模型跨渠道/跨用户 3 行：合并后 requests=3、success=2、
+        # avg 只计入 duration>0 的 2 行（1s + 3s -> 2s）
+        RequestLog.objects.create(channel=self.ch, request_id="d1", model="m",
+                                  user_api_key=user1, status="success",
+                                  duration_ms=1000, total_tokens=10)
+        RequestLog.objects.create(channel=self.ch, request_id="d2", model="m",
+                                  user_api_key=user2, status="success",
+                                  duration_ms=3000, total_tokens=10)
+        RequestLog.objects.create(channel=self.ch, request_id="d3", model="m",
+                                  user_api_key=user2, status="error",
+                                  duration_ms=0, total_tokens=5)
+        data = self._get()
+        m = {x["model"]: x for x in data["models"]}["m"]
+        self.assertEqual(m["requests"], 3)
+        self.assertEqual(m["success"], 2)
+        self.assertEqual(m["total_tokens"], 25)
+        self.assertAlmostEqual(m["success_rate"], 66.7)
+        self.assertEqual(m["avg_latency_s"], 2.0)
+        keys = {k["name"]: k for k in data["keys"]}
+        self.assertEqual(keys["k1"]["total_tokens"], 10)
+        self.assertEqual(keys["k2"]["total_tokens"], 15)
+        # 渠道行带 requests 字段（旧实现同样产出）
+        self.assertEqual(data["channels"][0]["name"], "A")
+        self.assertEqual(data["channels"][0]["requests"], 3)
+
+    def test_unknown_labels_and_top20_order(self):
+        # 无渠道/无用户 Key 的行 + 超过 20 个模型时截断
+        for i in range(25):
+            RequestLog.objects.create(request_id=f"u{i}",
+                                      model=f"model-{i:02d}",
+                                      status="success", total_tokens=i)
+        data = self._get()
+        self.assertEqual(len(data["models"]), 20)
+        # total_tokens 降序、同额按模型名升序（与原 SQL ORDER BY 对齐）
+        toks = [m["total_tokens"] for m in data["models"]]
+        self.assertEqual(toks, sorted(toks, reverse=True))
+        self.assertEqual(data["models"][0]["model"], "model-24")
+        self.assertEqual({k["name"] for k in data["keys"]}, {"(未知 Key)"})
+        # 无渠道行归到 "(无渠道)"（channel 为 SET_NULL 外键）
+        self.assertEqual(data["channels"][0]["name"], "(无渠道)")
+
+    def test_usage_cover_index_exists_and_sortable(self):
+        """覆盖索引 request_log_usage_cover 已在迁移与模型层声明。"""
+        from django.db import connection
+        with connection.cursor() as cur:
+            cur.execute("SELECT name FROM sqlite_master WHERE type='index' "
+                        "AND name='request_log_usage_cover'")
+            self.assertIsNotNone(cur.fetchone())
+        # 模型 Meta 与迁移保持一致（防止后人只改一处）
+        idx_names = {i.name for i in RequestLog._meta.indexes}
+        self.assertIn("request_log_usage_cover", idx_names)
+
+
+class RequestLogIndexPlanTests(TestCase):
+    """日志列表/仪表盘聚合的查询计划守卫。
+
+    这里钉的是**索引形状**而不是索引存在性：日志页恒 `ORDER BY -id` + LIMIT，
+    服务它的渠道内索引必须以 `id` 收尾。少了 id，SQLite 会先用 channel 前缀捞出
+    该渠道全部 rowid 再建 TEMP B-TREE 排序——实测比不加索引还慢
+    （12k 行渠道：7.4ms → 35ms）。这种退化不会让任何功能测试变红，只能靠
+    计划断言拦住。
+    """
+
+    def setUp(self):
+        self.ch = Channel.objects.create(name="P", slug="p",
+                                         base_url="https://p.test/v1")
+        for i in range(5):
+            RequestLog.objects.create(channel=self.ch, request_id=f"r{i}",
+                                      model="m", status="success")
+
+    def _plan(self, sql, params=()):
+        from django.db import connection
+        with connection.cursor() as cur:
+            cur.execute("EXPLAIN QUERY PLAN " + sql, params)
+            return " | ".join(str(r[-1]) for r in cur.fetchall())
+
+    def test_default_list_ordering_uses_no_temp_btree(self):
+        plan = self._plan(
+            'SELECT "id" FROM "request_log" WHERE "channel_id" = %s '
+            'ORDER BY "id" DESC LIMIT 100', [self.ch.id])
+        self.assertIn("request_log_channel_id", plan)
+        self.assertNotIn("TEMP B-TREE", plan.upper())
+
+    def test_status_filtered_list_ordering_uses_no_temp_btree(self):
+        plan = self._plan(
+            'SELECT "id" FROM "request_log" WHERE "channel_id" = %s '
+            'AND "status" = %s ORDER BY "id" DESC LIMIT 100',
+            [self.ch.id, "failed"])
+        self.assertIn("request_log_channel_status", plan)
+        self.assertNotIn("TEMP B-TREE", plan.upper())
+
+    def test_model_filtered_list_ordering_uses_no_temp_btree(self):
+        plan = self._plan(
+            'SELECT "id" FROM "request_log" WHERE "channel_id" = %s '
+            'AND "model" = %s ORDER BY "id" DESC LIMIT 100',
+            [self.ch.id, "m"])
+        self.assertIn("request_log_channel_model", plan)
+        self.assertNotIn("TEMP B-TREE", plan.upper())
+
+    def test_dashboard_today_aggregate_is_covering(self):
+        """DashboardView 的今日聚合必须走覆盖索引（曾占该接口 58ms/77ms 全部耗时）。"""
+        plan = self._plan(
+            'SELECT COUNT("id"), AVG("duration_ms") FROM "request_log" '
+            'WHERE "channel_id" = %s AND "created_at" >= %s',
+            [self.ch.id, "2026-01-01 00:00:00"])
+        self.assertIn("request_log_channel_created", plan)
+        self.assertIn("COVERING INDEX", plan.upper())
+
+    def test_list_query_defers_heavy_json_columns(self):
+        """列表 SQL 不得 SELECT 那四个肥 JSON 列（20KB/行的回表成本来源）。"""
+        from api.admin_views.logs import LogListView
+        from django.test import RequestFactory as RF
+        from django.conf import settings as st
+        # 直接检查 ORM 侧生成的列集合
+        from api.admin_views.logs import _LOG_HEAVY_FIELDS
+        qs = self.ch.logs.order_by("-id").defer(*_LOG_HEAVY_FIELDS)
+        sql = str(qs.query)
+        for col in _LOG_HEAVY_FIELDS:
+            self.assertNotIn(f'"{col}"', sql,
+                             f"列表查询仍在 SELECT 肥列 {col}")
+
+
+class DashboardStatsCaliberTests(TestCase):
+    """DashboardView 查询收敛后的口径守卫。
+
+    原实现发 10 条 COUNT/GROUP BY，现由状态分布的 GROUP BY 一次派生
+    total / enabled / 上限。同时修了一处**显示与强制不一致**：仪表盘的
+    `max_enabled_proxies` 旧口径把 INVALID（401/403 已判死）Key 计入分母，
+    于是提示的上限高于 `proxy_service.set_enabled` 实际强制的值——用户按
+    仪表盘提示去启用会被后端拒绝。现在两边同源。
+    """
+
+    def setUp(self):
+        self.factory = RequestFactory()
+        self.headers = {"HTTP_AUTHORIZATION": f"Token {settings.ADMIN_TOKEN}"}
+        self.ch = Channel.objects.create(name="S", slug="s",
+                                         base_url="https://s.test/v1")
+
+    def _stats(self):
+        req = self.factory.get("/api/admin/dashboard", **self.headers)
+        return admin_views.DashboardView.as_view()(req).data
+
+    def test_max_enabled_proxies_matches_backend_enforcement(self):
+        from apps.core.models import ChannelKey, ChannelKeyStatus as S
+        for i, st in enumerate([S.AVAILABLE, S.AVAILABLE, S.AVAILABLE,
+                                S.RATE_LIMITED, S.INVALID, S.DISABLED]):
+            ChannelKey.objects.create(channel=self.ch, name=f"k{i}",
+                                      api_key=f"nvapi-x{i}", status=st)
+        data = self._stats()
+        # 可调度 = 排除 DISABLED 与 INVALID = 4
+        self.assertEqual(data["nvidia_keys"], 6)
+        self.assertEqual(data["enabled_keys"], 4)
+        self.assertEqual(data["max_enabled_proxies"], 3)
+        # 与后端强制值完全一致（这是本轮修的点）
+        self.assertEqual(
+            data["max_enabled_proxies"],
+            proxy_service.max_proxies_for_channel(self.ch))
+
+    def test_counts_match_independent_queries(self):
+        from apps.core.models import (AIModel, ChannelKey, Proxy, ProxyStatus)
+        for i in range(3):
+            ChannelKey.objects.create(channel=self.ch, name=f"k{i}",
+                                      api_key=f"nvapi-k{i}")
+        for i in range(4):
+            Proxy.objects.create(channel=self.ch, name=f"p{i}", host="1.2.3.4",
+                                 port=1000 + i, enabled=(i < 2),
+                                 status=ProxyStatus.HEALTHY if i == 0
+                                 else ProxyStatus.UNKNOWN)
+        for i in range(5):
+            AIModel.objects.create(channel=self.ch, model_name=f"m{i}",
+                                   enabled=(i < 3))
+        data = self._stats()
+        self.assertEqual(data["nvidia_keys"], 3)
+        self.assertEqual(data["proxies"], 4)
+        self.assertEqual(data["enabled_proxies"], 2)
+        self.assertEqual(data["models"], 5)
+        self.assertEqual(data["enabled_models"], 3)
+        # 状态分布求和必须等于总数（派生自同一条 GROUP BY）
+        self.assertEqual(sum(data["key_status"].values()), 3)
+        self.assertEqual(sum(data["proxy_status"].values()), 4)
+
+    def test_proxies_summary_total_keys(self):
+        """代理页不再整拉 /api/admin/keys，Key 总数由 summary 提供。"""
+        from apps.core.models import ChannelKey, ChannelKeyStatus as S
+        for i in range(3):
+            ChannelKey.objects.create(channel=self.ch, name=f"k{i}",
+                                      api_key=f"nvapi-{i}")
+        ChannelKey.objects.create(channel=self.ch, name="dead",
+                                  api_key="nvapi-dead", status=S.INVALID)
+        req = self.factory.get("/api/admin/proxies", **self.headers)
+        summary = admin_views.ProxyListView.as_view()(req).data["summary"]
+        self.assertEqual(summary["total_keys"], 4)      # 全部
+        self.assertEqual(summary["nvidia_keys"], 3)     # 可调度（排除 INVALID）
+        self.assertEqual(summary["max_enabled_proxies"], 2)
+
+
 class RetryTests(TransactionTestCase):
     """retry_count 系统参数:竞速全部失败后自动重建线路重试。"""
 

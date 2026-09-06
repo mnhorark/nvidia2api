@@ -33,26 +33,70 @@ from ..serializers import (
     UserApiKeySerializer,
 )
 class DashboardView(AdminRequiredMixin, APIView):
-    """当前渠道的运行指标（随顶部渠道切换变化；token 汇总在 usage 接口）。"""
+    """当前渠道的运行指标（随顶部渠道切换变化；token 汇总在 usage 接口）。
+
+    查询收敛：原先 keys/proxies/models 各自的 total、enabled、状态分布要发
+    10 条 COUNT/GROUP BY，且本接口被前端每 10s 轮询（多标签页叠加）。现在
+    状态分布的 GROUP BY 一次扫描即可派生 total 与 enabled 计数，models 用一
+    条条件聚合，合计 4 条查询。
+
+    口径修正：`max_enabled_proxies` 旧实现按 `exclude(DISABLED)` 算分母，
+    把 INVALID（401/403 已判死）的 Key 也计入，于是显示的启用上限会高于
+    `proxy_service.set_enabled` 实际强制的上限（其分母 `count_schedulable_keys`
+    同时排除 DISABLED 与 INVALID）——用户按仪表盘提示去启用会被后端拒绝。
+    现统一从 Key 状态分布派生 schedulable 数，与强制口径同源。
+    """
 
     def get(self, request):
         channel = current_channel(request)
         today = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        keys = channel.keys.all()
-        proxies = channel.proxies.all()
-        logs_today = channel.logs.filter(created_at__gte=today)
-        # 状态分布：一次 GROUP BY 代替 5/6 次逐状态 COUNT（仪表盘每次轮询约减 10 次查询）
+
+        # 1) Key 状态分布（一条 GROUP BY 派生 total / enabled / schedulable）
         key_status = {s: 0 for s, _ in ChannelKeyStatus.choices}
         key_status.update(dict(
             channel.keys.values('status').annotate(n=Count('id')).values_list('status', 'n')))
+        n_keys = sum(key_status.values())
+        # enabled_keys 与调度分母同口径：排除 DISABLED / INVALID
+        n_unusable = key_status[ChannelKeyStatus.DISABLED] + key_status[ChannelKeyStatus.INVALID]
+        n_schedulable_keys = n_keys - n_unusable
+
+        # 2) 代理状态分布 + 启用数（一条 GROUP BY (status, enabled) 全拿）
         proxy_status = {s: 0 for s, _ in ProxyStatus.choices}
-        proxy_status.update(dict(
-            channel.proxies.values('status').annotate(n=Count('id')).values_list('status', 'n')))
-        agg = logs_today.aggregate(n=Count('id'), ok=Count('id', filter=Q(status='success')), avg=Avg('duration_ms'))
+        n_proxies = n_enabled_proxies = 0
+        for st, en, n in channel.proxies.values('status', 'enabled').annotate(
+                c=Count('id')).values_list('status', 'enabled', 'c'):
+            proxy_status[st] = proxy_status.get(st, 0) + n
+            n_proxies += n
+            if en:
+                n_enabled_proxies += n
+
+        # 3) 模型计数（一条条件聚合）
+        m_agg = channel.models.aggregate(
+            total=Count('id'),
+            enabled=Count('id', filter=Q(enabled=True)))
+
+        # 4) 今日请求聚合（走 request_log 覆盖索引）
+        agg = channel.logs.filter(created_at__gte=today).aggregate(
+            n=Count('id'), ok=Count('id', filter=Q(status='success')),
+            avg=Avg('duration_ms'))
         today_count = agg['n'] or 0
-        n_active_keys = keys.exclude(status=ChannelKeyStatus.DISABLED).count()
+
         from api.openai_views import active_requests
-        return Response({'channel': channel.slug, 'channel_name': channel.name, 'active_requests': active_requests(), 'nvidia_keys': keys.count(), 'enabled_keys': keys.exclude(status__in=[ChannelKeyStatus.DISABLED, ChannelKeyStatus.INVALID]).count(), 'proxies': proxies.count(), 'enabled_proxies': proxies.filter(enabled=True).count(), 'max_enabled_proxies': max(n_active_keys - 1, 0), 'models': channel.models.count(), 'enabled_models': channel.models.filter(enabled=True).count(), 'requests_today': today_count, 'success_rate': round((agg['ok'] or 0) / today_count * 100, 1) if today_count else 0.0, 'avg_latency_s': round((agg['avg'] or 0) / 1000, 2), 'key_status': key_status, 'proxy_status': proxy_status})
+        return Response({
+            'channel': channel.slug, 'channel_name': channel.name,
+            'active_requests': active_requests(),
+            'nvidia_keys': n_keys,
+            'enabled_keys': n_schedulable_keys,
+            'proxies': n_proxies,
+            'enabled_proxies': n_enabled_proxies,
+            'max_enabled_proxies': max(n_schedulable_keys - 1, 0),
+            'models': m_agg['total'] or 0,
+            'enabled_models': m_agg['enabled'] or 0,
+            'requests_today': today_count,
+            'success_rate': round((agg['ok'] or 0) / today_count * 100, 1) if today_count else 0.0,
+            'avg_latency_s': round((agg['avg'] or 0) / 1000, 2),
+            'key_status': key_status, 'proxy_status': proxy_status,
+        })
 
 
 class DashboardUsageView(AdminRequiredMixin, APIView):
@@ -137,7 +181,10 @@ class DashboardUsageView(AdminRequiredMixin, APIView):
 
         base = RequestLog.objects.filter(created_at__gte=start)
 
-        # 1) 分桶聚合——一条 GROUP BY 完成
+        # 1) 分桶聚合 + 区间汇总合一——一条 GROUP BY 同时产出每桶的
+        #    计数/求和与区间级 duration/TTFT 的 sum+n（Avg 由 sum/n 派生，
+        #    与原独立 aggregate 的 filtered Avg 语义一致：n=0 -> None）。
+        #    原实现这里两条查询扫两遍范围，7~30 天尺度各扫 1 万+ 行。
         rows = (base.annotate(b=trunc('created_at', tzinfo=tz))
                 .values('b')
                 .annotate(requests=Count('id'),
@@ -145,79 +192,119 @@ class DashboardUsageView(AdminRequiredMixin, APIView):
                           prompt=Sum('prompt_tokens'),
                           completion=Sum('completion_tokens'),
                           cached=Sum('cached_tokens'),
-                          total=Sum('total_tokens')))
+                          total=Sum('total_tokens'),
+                          dur_sum=Sum('duration_ms', filter=~Q(duration_ms=0)),
+                          dur_n=Count('id', filter=~Q(duration_ms=0)),
+                          ttft_sum=Sum('first_token_ms', filter=~Q(first_token_ms=0)),
+                          ttft_n=Count('id', filter=~Q(first_token_ms=0))))
+        # 区间汇总（沿桶累加，等价于原独立 aggregate 的过滤口径）
+        n_req = n_ok = prompt = completion = cached = total = 0
+        dur_sum = dur_n = ttft_sum = ttft_n = 0
         for row in rows:
             # TruncHour 返回 datetime（可随时区转）；TruncDate 返回 date，
             # （带 tzinfo 时 Trunc 本身已做时区换算），date 直接格式化即可。
             b = row['b']
             key = b.astimezone(tz).strftime(fmt) if hasattr(b, 'astimezone') else b.strftime(fmt)
-            b = buckets.get(key)
-            if not b:
-                continue
-            b['requests'] = row['requests'] or 0
-            b['success'] = row['success'] or 0
-            b['prompt_tokens'] = row['prompt'] or 0
-            b['completion_tokens'] = row['completion'] or 0
-            b['cached_tokens'] = row['cached'] or 0
-            b['total_tokens'] = row['total'] or 0
+            bucket = buckets.get(key)
+            if bucket:
+                bucket['requests'] = row['requests'] or 0
+                bucket['success'] = row['success'] or 0
+                bucket['prompt_tokens'] = row['prompt'] or 0
+                bucket['completion_tokens'] = row['completion'] or 0
+                bucket['cached_tokens'] = row['cached'] or 0
+                bucket['total_tokens'] = row['total'] or 0
+            n_req += row['requests'] or 0
+            n_ok += row['success'] or 0
+            prompt += row['prompt'] or 0
+            completion += row['completion'] or 0
+            cached += row['cached'] or 0
+            total += row['total'] or 0
+            dur_sum += row['dur_sum'] or 0
+            dur_n += row['dur_n'] or 0
+            ttft_sum += row['ttft_sum'] or 0
+            ttft_n += row['ttft_n'] or 0
 
-        # 2) 区间汇总
-        agg = base.aggregate(
-            requests=Count('id'),
-            success=Count('id', filter=Q(status='success')),
-            prompt=Sum('prompt_tokens'), completion=Sum('completion_tokens'),
-            cached=Sum('cached_tokens'), total=Sum('total_tokens'),
-            avg_duration=Avg('duration_ms', filter=~Q(duration_ms=0)),
-            avg_ttft=Avg('first_token_ms', filter=~Q(first_token_ms=0)),
-        )
-        n_req = agg['requests'] or 0
+        avg_duration = dur_sum / dur_n if dur_n else None
+        avg_ttft = ttft_sum / ttft_n if ttft_n else None
         totals = {
             'requests': n_req,
-            'success': agg['success'] or 0,
-            'total_tokens': agg['total'] or 0,
-            'prompt_tokens': agg['prompt'] or 0,
-            'completion_tokens': agg['completion'] or 0,
-            'cached_tokens': agg['cached'] or 0,
-            'success_rate': round((agg['success'] or 0) / n_req * 100, 1) if n_req else 0.0,
-            'avg_latency_s': round((agg['avg_duration'] or 0) / 1000, 2) if agg['avg_duration'] is not None else None,
-            'avg_ttft_ms': round(agg['avg_ttft'] or 0, 1) if agg['avg_ttft'] is not None else None,
-            'cache_hit_rate': round((agg['cached'] or 0) / agg['prompt'] * 100, 1) if agg['prompt'] else 0.0,
+            'success': n_ok,
+            'total_tokens': total,
+            'prompt_tokens': prompt,
+            'completion_tokens': completion,
+            'cached_tokens': cached,
+            'success_rate': round(n_ok / n_req * 100, 1) if n_req else 0.0,
+            'avg_latency_s': round(avg_duration / 1000, 2) if avg_duration else None,
+            'avg_ttft_ms': round(avg_ttft, 1) if avg_ttft else None,
+            'cache_hit_rate': round(cached / prompt * 100, 1) if prompt else 0.0,
         }
 
-        # 3) 模型分布（Top 20）
-        model_rows = list(
-            base.values('model')
-            .annotate(requests=Count('id'),
-                      success=Count('id', filter=Q(status='success')),
-                      total_tokens=Sum('total_tokens'),
-                      avg_duration=Avg('duration_ms', filter=~Q(duration_ms=0)))
-            .order_by('-total_tokens', 'model')[:20])
-        for m in model_rows:
-            m['model'] = m['model'] or '(unknown)'
-            m['total_tokens'] = m['total_tokens'] or 0
-            m['success_rate'] = round(m['success'] / m['requests'] * 100, 1) if m['requests'] else 0.0
-            avg = m.pop('avg_duration')
-            m['avg_latency_s'] = round(avg / 1000, 2) if avg else None
+        # 2) 三维分布合一——模型/渠道/用户 Key 三张分布原先各扫一遍范围
+        #    （模型分布含 4 个聚合列最贵），一条三维 GROUP BY 后在 Python
+        #    侧归并（分组数 = 组合数，量级个位数~几十，归并成本可忽略）。
+        #    模型的 avg_latency 同样用 sum/n 口径，跨组合归并不会失真。
+        dist_rows = (base.values('model', 'channel__name', 'user_api_key__name')
+                     .annotate(requests=Count('id'),
+                               success=Count('id', filter=Q(status='success')),
+                               total_tokens=Sum('total_tokens'),
+                               dur_sum=Sum('duration_ms', filter=~Q(duration_ms=0)),
+                               dur_n=Count('id', filter=~Q(duration_ms=0))))
+        models_acc: dict[str, dict] = {}
+        channels_acc: dict[str, dict] = {}
+        keys_acc: dict[str, dict] = {}
+        for r in dist_rows:
+            m_key = r['model'] or '(unknown)'
+            m = models_acc.setdefault(m_key, {
+                'model': m_key, 'requests': 0, 'success': 0,
+                'total_tokens': 0, 'dur_sum': 0.0, 'dur_n': 0})
+            m['requests'] += r['requests'] or 0
+            m['success'] += r['success'] or 0
+            m['total_tokens'] += r['total_tokens'] or 0
+            m['dur_sum'] += r['dur_sum'] or 0
+            m['dur_n'] += r['dur_n'] or 0
 
-        # 4) 渠道分布
-        channel_rows = list(
-            base.values('channel__name')
-            .annotate(requests=Count('id'), total_tokens=Sum('total_tokens'))
-            .order_by('-total_tokens'))
-        for c in channel_rows:
-            c['name'] = c.pop('channel__name') or '(无渠道)'
-            c['total_tokens'] = c['total_tokens'] or 0
+            c_key = r['channel__name'] or '(无渠道)'
+            c = channels_acc.setdefault(c_key, {'name': c_key, 'requests': 0,
+                                                'total_tokens': 0})
+            c['requests'] += r['requests'] or 0
+            c['total_tokens'] += r['total_tokens'] or 0
 
-        # 5) 用户 Key 分布（Top 20）
-        key_rows = list(
-            base.values('user_api_key__name')
-            .annotate(requests=Count('id'), total_tokens=Sum('total_tokens'))
-            .order_by('-total_tokens')[:20])
-        for k in key_rows:
-            k['name'] = k.pop('user_api_key__name') or '(未知 Key)'
-            k['total_tokens'] = k['total_tokens'] or 0
+            k_key = r['user_api_key__name'] or '(未知 Key)'
+            k = keys_acc.setdefault(k_key, {'name': k_key, 'requests': 0,
+                                            'total_tokens': 0})
+            k['requests'] += r['requests'] or 0
+            k['total_tokens'] += r['total_tokens'] or 0
 
-        # 6) 上一周期环比
+        model_rows = []
+        for m in models_acc.values():
+            avg = m['dur_sum'] / m['dur_n'] if m['dur_n'] else None
+            model_rows.append({
+                'model': m['model'],
+                'requests': m['requests'],
+                'success': m['success'],
+                'total_tokens': m['total_tokens'],
+                'success_rate': round(m['success'] / m['requests'] * 100, 1)
+                if m['requests'] else 0.0,
+                'avg_latency_s': round(avg / 1000, 2) if avg else None,
+            })
+        # 与原 SQL 的 ORDER BY (-total_tokens, model) 对齐；total 全零组排尾
+        model_rows.sort(key=lambda m: (-(m['total_tokens'] or 0), m['model']))
+        model_rows = model_rows[:20]
+
+        channel_rows = [{
+            'name': c['name'], 'requests': c['requests'],
+            'total_tokens': c['total_tokens'],
+        } for c in channels_acc.values()]
+        channel_rows.sort(key=lambda c: (-c['total_tokens'], c['name']))
+
+        key_rows = [{
+            'name': k['name'], 'requests': k['requests'],
+            'total_tokens': k['total_tokens'],
+        } for k in keys_acc.values()]
+        key_rows.sort(key=lambda k: (-k['total_tokens'], k['name']))
+        key_rows = key_rows[:20]
+
+        # 3) 上一周期环比
         prev = RequestLog.objects.filter(
             created_at__gte=prev_start, created_at__lt=start
         ).aggregate(requests=Count('id'), total_tokens=Sum('total_tokens'),

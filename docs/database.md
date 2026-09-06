@@ -81,6 +81,39 @@ Proxy / ProxyGroup 均带 `channel_id`。唯一约束 `(channel, protocol, host,
 | prompt/completion/total/cached_tokens | token 指标（stream 时来自 `usage`，需 `stream_options.include_usage`） |
 | routes | JSON：本次竞速每条线路的 `{name,kind,key_name,proxy_name,status,latency_ms,error,http_status}` |
 
+#### 索引策略（2026-09 重排，迁移 0024 / 0025）
+
+本表**每请求都写**，且平均 **20KB/行**（`routes` 竞速明细 + `request_summary`
+诊断 JSON 占大头）。两个约束共同决定索引设计：读要覆盖管理端全部查询形态，
+写不能无限膨胀。最终 5 条业务索引（+ `request_id`、`user_api_key_id`）：
+
+| 索引 | 服务的查询 | 实测 |
+|---|---|---|
+| `request_log_usage_cover`<br>(created_at, status, model, channel, user_api_key,<br>5×token, duration_ms, first_token_ms) | 仪表盘 usage 分桶/汇总/分布、`/metrics`、日志清理 | 7~30 天 681→82ms |
+| `request_log_channel_created`<br>(channel, created_at, status, duration_ms) | DashboardView「今日」聚合（每 10s 被轮询） | 58→0.85ms |
+| `request_log_channel_id` (channel, id) | 日志页默认翻页 + COUNT | limit=100 82→5.7ms |
+| `request_log_channel_status` (channel, status, id) | 日志页按状态筛选 | 87→19ms |
+| `request_log_channel_model` (channel, model, id) | 日志页按模型筛选 | 44→5.4ms |
+
+三条经验，**改索引前请先读**：
+
+1. **服务列表的索引必须以 `id` 收尾。** 日志页恒 `ORDER BY -id` + LIMIT；索引少了
+   `id`，planner 会先用 channel 前缀捞出该渠道**全部** rowid 再建 TEMP B-TREE 排序，
+   实测比不加索引还慢（7.4ms → 35ms）。`RequestLogIndexPlanTests` 用
+   `EXPLAIN QUERY PLAN` 断言计划里不得出现 TEMP B-TREE——这种退化不会让任何
+   功能测试变红，只能靠计划守卫拦住。
+2. **列表查询必须 `defer` 那四个肥 JSON 列。** 列表序列化器本就不输出它们，但 ORM
+   默认 `SELECT *` 会整行读回（defer 省的是溢出页）。100 行 79.6ms → 2.1ms。
+   守卫见 `test_list_query_defers_heavy_json_columns`。
+3. **只改 `db_index` 不要用裸 `AlterField`。** SQLite 会走"建新表 → 整表拷贝 →
+   删旧表 → 改名"的重建路径（500MB 实测 25s），而本表只增不减、容器启动又自动
+   migrate，重建时间会随数据量线性恶化到分钟级。迁移 0025 用
+   `SeparateDatabaseAndState`：状态侧照常 AlterField，数据库侧只做 `DROP INDEX`，
+   0.63s 完成，`makemigrations --check` 验证状态无漂移。
+
+同时删除了被上述索引前缀覆盖的 5 条旧索引（`created_at` 单列、`(created_at,status)`
+复合、`channel_id` / `model` / `status` 单列），**净索引数与重排前持平**，写成本不升。
+
 ### system_setting
 
 带 `channel_id`；唯一约束 `(channel, key)`。即**按渠道隔离**的运行参数表

@@ -7,7 +7,7 @@ from datetime import timedelta
 from urllib.parse import urlparse
 
 from django.db import transaction
-from django.db.models import F
+from django.db.models import Count, F, Q
 from django.utils import timezone
 
 from apps.core.models import Channel, ChannelKey, ChannelKeyStatus, Proxy, ProxyGroup, ProxyStatus
@@ -18,6 +18,21 @@ logger = logging.getLogger("nvidia2api.proxy")
 SUPPORTED_PROTOCOLS = {"socks5", "socks5h", "http", "https"}
 
 
+def key_counts(channel: Channel) -> tuple[int, int]:
+    """(该渠道 Key 总数, 可调度 Key 数) —— 一条条件聚合同时拿到。
+
+    可调度口径 = 排除 DISABLED / INVALID，与 `count_schedulable_keys` 完全一致
+    （单一事实来源）。管理端点需要同时展示"共 N 个 Key"与"启用上限"，过去前端
+    为此整拉 `/api/admin/keys`（千级 Key ≈ 128KB）只为算一个 length。
+    """
+    agg = channel.keys.aggregate(
+        total=Count('id'),
+        schedulable=Count('id', filter=~Q(
+            status__in=[ChannelKeyStatus.DISABLED, ChannelKeyStatus.INVALID])),
+    )
+    return int(agg['total'] or 0), int(agg['schedulable'] or 0)
+
+
 def count_schedulable_keys(channel: Channel) -> int:
     """可用于调度竞速的 Key 数：DISABLED / INVALID 不算数。
 
@@ -25,8 +40,7 @@ def count_schedulable_keys(channel: Channel) -> int:
     高于 build_routes 实际可用 Key 数，运维侧数字失真。调度侧以 available_keys
     （排除 DISABLED/INVALID/冷却）为准，这里同步排除 INVALID。
     """
-    return channel.keys.exclude(
-        status__in=[ChannelKeyStatus.DISABLED, ChannelKeyStatus.INVALID]).count()
+    return key_counts(channel)[1]
 
 
 def max_proxies_for_channel(channel: Channel) -> int:

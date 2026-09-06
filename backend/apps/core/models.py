@@ -365,18 +365,24 @@ class UserApiKey(Timestamped):
 
 
 class RequestLog(models.Model):
+    # channel 外键**不建单列索引**：调度查询一律是"渠道内 + 某维度"，
+    # 由下方 Meta 里三条 (channel, …) 复合索引的前缀覆盖（见 Meta 注释）。
     channel = models.ForeignKey(
         Channel, on_delete=models.SET_NULL, related_name="logs",
-        null=True, blank=True, db_index=True,
+        null=True, blank=True, db_index=False,
     )
     request_id = models.CharField(max_length=40, db_index=True)
     user_api_key = models.ForeignKey(
         UserApiKey, null=True, blank=True, on_delete=models.SET_NULL, related_name="logs"
     )
-    model = models.CharField(max_length=256, db_index=True)
-    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    # model 单列索引同理去掉：唯一的 model 过滤来自日志页，恒带 channel
+    model = models.CharField(max_length=256, db_index=False)
+    # created_at 单列索引由 request_log_usage_cover 的 created_at 前缀覆盖
+    # （跨渠道的 usage / metrics / cleanup 都只按 created_at 范围过滤）
+    created_at = models.DateTimeField(auto_now_add=True, db_index=False)
     duration_ms = models.FloatField(default=0)
-    status = models.CharField(max_length=16, default="pending", db_index=True)  # success / error
+    # status 单列索引去掉：唯一的 status 过滤来自日志页，恒带 channel
+    status = models.CharField(max_length=16, default="pending", db_index=False)  # success / error
     http_status = models.IntegerField(default=0)
     error_type = models.CharField(max_length=64, blank=True, default="")
     winner_route_type = models.CharField(max_length=16, blank=True, default="")  # direct / proxy
@@ -404,7 +410,43 @@ class RequestLog(models.Model):
 
     class Meta:
         db_table = "request_log"
-        indexes = [models.Index(fields=["created_at", "status"])]
+        # 索引策略（2026-09 全面重排，实测数据与三条经验见 docs/database.md）：
+        # 本表是**每请求都写**的热表，且平均 20KB/行（routes / request_summary
+        # 等 JSON 列），所以索引既要覆盖读路径，也不能无限膨胀写路径。
+        #
+        # 关键设计：日志列表**恒 `ORDER BY -id` + LIMIT**，所以所有服务它的
+        # 渠道内索引都以 `id` 收尾——这样"定位即有序"，SQLite 直接倒着走索引
+        # 到 LIMIT 就停。若少了 id（实测教训），planner 会先用 channel 前缀捞出
+        # 该渠道**全部** rowid 再建 TEMP B-TREE 排序，12k 行下比不加索引还慢
+        # （7.4ms → 35ms）。
+        #
+        #   1. usage_cover        —— 跨渠道按时间范围的聚合（仪表盘 usage、
+        #                            metrics、cleanup）。created_at 打头 + 聚合
+        #                            所需列全带上，走 COVERING INDEX 不回表
+        #                            （7~30 天尺度 681ms -> 89ms）。
+        #   2. channel_created    —— 渠道内"今日"聚合（DashboardView 每 10s 被
+        #                            轮询）。旧实现只能二选一单列索引，
+        #                            实测 58ms -> 0.85ms。
+        #   3. channel_id         —— 日志页默认形态（渠道内按 id 倒序翻页 + COUNT）。
+        #   4. channel_status     —— 日志页按状态筛选（同上，且筛选走前缀）。
+        #   5. channel_model      —— 日志页按模型筛选（44ms -> 0.46ms）。
+        # 同时**删除**了被这些索引前缀覆盖的 5 条旧索引（created_at 单列、
+        # (created_at,status) 复合、channel_id/model/status 单列）。
+        indexes = [
+            models.Index(fields=[
+                "created_at", "status", "model", "channel", "user_api_key",
+                "prompt_tokens", "completion_tokens", "cached_tokens",
+                "total_tokens", "duration_ms", "first_token_ms",
+            ], name="request_log_usage_cover"),
+            models.Index(fields=["channel", "created_at", "status", "duration_ms"],
+                         name="request_log_channel_created"),
+            models.Index(fields=["channel", "id"],
+                         name="request_log_channel_id"),
+            models.Index(fields=["channel", "status", "id"],
+                         name="request_log_channel_status"),
+            models.Index(fields=["channel", "model", "id"],
+                         name="request_log_channel_model"),
+        ]
 
     def __str__(self):
         return self.request_id

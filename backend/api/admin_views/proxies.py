@@ -36,10 +36,13 @@ class ProxyListView(AdminRequiredMixin, APIView):
     def get(self, request):
         channel = current_channel(request)
         qs = channel.proxies.select_related('group').order_by('id')
-        n_keys = proxy_service.count_schedulable_keys(channel)
+        # 一条条件聚合同时拿到 Key 总数与可调度数：前端代理页的
+        # "共 N 个 Key / 启用上限" 不再需要整拉 /api/admin/keys（千级 Key ≈
+        # 128KB）只为算一个 length。
+        n_total_keys, n_keys = proxy_service.key_counts(channel)
         max_allowed = max(n_keys - 1, 0)
         enabled = qs.filter(enabled=True).count()
-        return Response({'results': ProxySerializer(qs, many=True).data, 'summary': {'channel': channel.slug, 'channel_id': channel.id, 'disable_proxy_unhealthy': channel.disable_proxy_unhealthy, 'nvidia_keys': n_keys, 'max_enabled_proxies': max_allowed, 'enabled_proxies': enabled, 'direct_routes': 1 if n_keys else 0, 'total_routes': enabled + (1 if n_keys else 0)}})
+        return Response({'results': ProxySerializer(qs, many=True).data, 'summary': {'channel': channel.slug, 'channel_id': channel.id, 'disable_proxy_unhealthy': channel.disable_proxy_unhealthy, 'nvidia_keys': n_keys, 'total_keys': n_total_keys, 'max_enabled_proxies': max_allowed, 'enabled_proxies': enabled, 'direct_routes': 1 if n_keys else 0, 'total_routes': enabled + (1 if n_keys else 0)}})
 
     def post(self, request):
         channel = current_channel(request)
