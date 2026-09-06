@@ -6,6 +6,15 @@ import { api, RuntimeParam } from "@/lib/api";
 import { Button, Card, Input, PageHeader, Select } from "@/components/ui";
 import { toast } from "@/components/toaster";
 
+// 隐藏不需要在控制台调整的参数；后端仍可通过 API / env 修改，
+// 功能不受影响（如 max_request_bytes 这类体积极限，默认即可）。
+// load() 和 save() 的响应回填都必须过滤——PATCH 返回的是后端全量参数。
+const HIDDEN_PARAMS = new Set(["max_request_bytes"]);
+
+function filterVisible(list: RuntimeParam[] | undefined | null): RuntimeParam[] {
+  return (Array.isArray(list) ? list : []).filter((p) => !HIDDEN_PARAMS.has(p.key));
+}
+
 export default function SettingsPage() {
   const [params, setParams] = useState<RuntimeParam[]>([]);
   const [draft, setDraft] = useState<Record<string, string>>({});
@@ -22,12 +31,7 @@ export default function SettingsPage() {
       const data = await api.get<{ channel: string; settings: RuntimeParam[] }>(
         "/api/admin/settings"
       );
-      // 隐藏不需要在控制台调整的参数；后端仍可通过 API / env 修改，
-      // 功能不受影响（如 max_request_bytes 这类体积极限，默认即可）
-      const HIDDEN = new Set(["max_request_bytes"]);
-      const list = (Array.isArray(data?.settings) ? data.settings : []).filter(
-        (p) => !HIDDEN.has(p.key)
-      );
+      const list = filterVisible(data?.settings);
       setParams(list);
       setChannel(data?.channel ?? "");
       setDraft(Object.fromEntries(list.map((p) => [p.key, String(p.value)])));
@@ -75,7 +79,7 @@ export default function SettingsPage() {
       }
       const updated = await api.patch<{ channel: string; settings: RuntimeParam[] }>(
         "/api/admin/settings", { settings });
-      const list = Array.isArray(updated?.settings) ? updated.settings : [];
+      const list = filterVisible(updated?.settings);
       setParams(list);
       setDraft(Object.fromEntries(list.map((p) => [p.key, String(p.value)])));
       toast.success("设置已保存");
