@@ -3,11 +3,11 @@ __pycache__/
 .venv/
 .env
 .env.local
-# SQLite 主库及其 WAL/SHM 伴生文件（运行期生成，勿入库）
-data/*.sqlite3
-data/*.sqlite3-shm
-data/*.sqlite3-wal
-data/*.bak*
+# 运行期数据目录整体忽略：SQLite 主库及 WAL/SHM 伴生文件、gateway.log、
+# 测试库都是运行期产物。此前只逐条忽略 *.sqlite3*，`data/gateway.log`
+# 落在规则外——一次 `git add data/` 就会把日志提交进版本库。
+# 目录本身无需入库：settings.DATA_DIR 启动时 mkdir(parents=True) 自动创建。
+data/
 # 个人工具配置（含明文 API Key），勿提交到版本库
 config.json
 # 助手工作区（会话记忆、草稿），勿提交到版本库
