@@ -54,7 +54,9 @@ def encrypt_secret(plain: str) -> str:
 def mask_secret(plain: str) -> str:
     """密文无关的展示掩码（供保存时离线计算提示位，避免列表页逐行解密）。
 
-    与 key_service.mask_key 口径一致：前 10 + 8 个* + 后 4；短串退化为前 4+****
+    **脱敏口径的单一事实来源**：前 10 + 8 个 `*` + 后 4；短串退化为前 4+****。
+    `key_service.mask_key` 委托到这里，`ChannelKey.api_key_hint` 在写入时用它
+    预计算——列表页与接口即时脱敏必须同口径，用户会拿脱敏串比对是哪把 Key。
     """
     if not plain:
         return ""

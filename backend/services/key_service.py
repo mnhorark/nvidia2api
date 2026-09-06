@@ -11,7 +11,7 @@ from django.utils import timezone
 
 from apps.core.models import AuthScheme, Channel, ChannelKey, ChannelKeyStatus
 from services import sysconfig
-from services.crypto import decrypt_secret
+from services.crypto import decrypt_secret, mask_secret
 
 logger = logging.getLogger("nvidia2api.keys")
 
@@ -23,11 +23,14 @@ NO_KEY_MARKER = "@nokey"
 
 
 def mask_key(key: str) -> str:
-    if not key:
-        return ""
-    if len(key) <= 10:
-        return key[:4] + "****"
-    return key[:10] + "*" * 8 + key[-4:]
+    """脱敏展示位。**委托 crypto.mask_secret，单一事实来源**。
+
+    历史上这里是逐字复制的第二份实现（两份连 docstring 都互相引用），
+    任何一份改动口径（比如前 10 后 4 的长度阈值）都会让"列表页 hint"
+    与"接口即时脱敏"两种展示形态不一致——而它们必须一致，用户会拿
+    脱敏串去比对到底是哪把 Key。
+    """
+    return mask_secret(key)
 
 
 def _stored_plain_keys(channel: Channel) -> set[str]:

@@ -114,13 +114,16 @@ class ToolCallStreamNormalizer:
                     # 精确重述 → 丢弃
             args = fn.get("arguments")
             if isinstance(args, str) and args:
-                if state.args is None:
-                    state.args = ""
                 delta, fresh = _merge_stream_field(state.args, args)
                 if fresh and delta:
                     out_fn["arguments"] = delta
-                    state.args = (state.args or "") + (
-                        args if not (state.args and args.startswith(state.args)) else delta)
+                    # 累计口径：incoming 是"已累计值的重述"（含前缀重述）时只补
+                    # 差量，是纯增量时整段追加。`state.args` 恒为 str
+                    # （_SlotState 初始化为 ""），不存在 None 分支。
+                    if state.args and args.startswith(state.args):
+                        state.args += delta
+                    else:
+                        state.args += args
                     emitted_any = True
                 # 精确重述 → 丢弃
             elif isinstance(args, str) and args == "" and emitted_any:

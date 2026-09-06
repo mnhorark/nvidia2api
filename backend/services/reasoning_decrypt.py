@@ -29,10 +29,12 @@ _FERNET_CACHE: dict[str, Fernet] = {}
 
 
 def _fernet_for(raw: str) -> Fernet:
-    key = base64.urlsafe_b64encode(hashlib.sha256(raw.encode("utf-8")).digest())
+    # 先查缓存再算密钥：SHA-256 + Fernet 构造在流式路径上是每 chunk 每候选键
+    # 都要跑的开销，放在命中判断之前等于缓存白给。
     cached = _FERNET_CACHE.get(raw)
     if cached is not None:
         return cached
+    key = base64.urlsafe_b64encode(hashlib.sha256(raw.encode("utf-8")).digest())
     f = Fernet(key)
     _FERNET_CACHE[raw] = f
     return f
@@ -68,7 +70,16 @@ def decrypt_token(token: str) -> str | None:
             f = _fernet_for(raw)
             plain = f.decrypt(token.encode("utf-8")).decode("utf-8")
             return plain
-        except (InvalidToken, ValueError, Exception):
+        except (InvalidToken, ValueError):
+            # 预期内失败：这把密钥解不开（上游自有密钥 / 换过密钥），或明文不是
+            # UTF-8。换下一把候选，全部失败则返回 None 由调用方原样透传密文。
+            continue
+        except Exception:  # noqa: BLE001
+            # 预期外异常（编程错误、依赖行为变化）。仍按"这把解不开"处理——
+            # 零丢失原则优先于让解密尝试把异常冒泡进请求链路；但必须留痕，
+            # 否则真 bug 会永久伪装成"上游用了我们没有的密钥"。
+            logger.debug("思考密文解密出现预期外异常（该候选密钥已跳过）",
+                         exc_info=True)
             continue
     return None
 

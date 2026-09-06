@@ -10,6 +10,7 @@ without a restart（含 max_concurrent_requests 动态并发闸门：后台修�
 """
 from __future__ import annotations
 
+import difflib
 import threading
 import time as _time
 
@@ -189,9 +190,21 @@ def get(key: str, channel=None):
     """Current effective value for a runtime param.
 
     带短 TTL 缓存：热路径（竞速每线路、闸门每请求）避免每次都打 DB。
+
+    未知参数名**保持抛错**（不静默回落默认值）：参数拼错却照常工作，
+    表现为"改了设置没反应"，比一次 500 更难查。这里做的是把那次抛错
+    变成可直接定位的抛错——给出最接近的已注册参数名。
     """
     key = _normalize_key(key)
-    type_name, default, _desc, _group = RUNTIME_PARAMS[key]
+    entry = RUNTIME_PARAMS.get(key)
+    if entry is None:
+        near = difflib.get_close_matches(key, list(RUNTIME_PARAMS), n=5,
+                                         cutoff=0.6)
+        raise KeyError(
+            f"未知运行时参数 '{key}'"
+            + (f"，最接近的已注册参数：{', '.join(near)}" if near else "")
+            + f"（共 {len(RUNTIME_PARAMS)} 个，见 services/sysconfig.RUNTIME_PARAMS）")
+    type_name, default, _desc, _group = entry
     ch = _resolve_channel(channel)
     cache_key = (key, getattr(ch, "pk", None))
     ok, value = _cache_get(cache_key)

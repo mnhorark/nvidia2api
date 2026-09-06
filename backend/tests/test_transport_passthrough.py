@@ -695,6 +695,84 @@ class ToolStreamIndexNormalizationTests(TestCase):
         self.assertTrue(out)  # 正常产出，不抛异常
 
 
+class ToolStreamArgsAccumulationTests(TestCase):
+    """arguments 累计矩阵：客户端按 index 拼接的结果必须等于最终完整 JSON。
+
+    上游可能发三种形态——纯增量、前缀重述（把已累计值再发一遍带新尾巴）、
+    整段重述。规整器的职责是无论哪种，客户端累加后都得到同一份合法 JSON。
+    2026-09-05 审查时这段累计逻辑是不可读的一行三元式，还带一个永不成立的
+    `state.args is None` 分支；重写成显式分支后必须有矩阵测试锁住语义。
+    """
+
+    FINAL = '{"city":"hz","days":2}'
+
+    def _client_view(self, frames: list[str]) -> str:
+        """喂多帧 arguments，返回客户端视角拼接出来的字符串。"""
+        from services.tool_stream import ToolCallStreamNormalizer
+        norm = ToolCallStreamNormalizer()
+        emitted: list[str] = []
+        for i, args in enumerate(frames):
+            fn: dict = {"arguments": args}
+            tc: dict = {"index": 0, "type": "function", "function": fn}
+            if i == 0:
+                fn["name"] = "get_weather"
+                tc["id"] = "call_1"
+            chunk = "data: " + json.dumps(
+                {"choices": [{"index": 0, "delta": {"tool_calls": [tc]}}]}) + "\n\n"
+            for out in norm.feed(chunk):
+                data = json.loads(out[5:].strip())
+                for entry in data["choices"][0]["delta"].get("tool_calls") or []:
+                    piece = (entry.get("function") or {}).get("arguments")
+                    if piece is not None:
+                        emitted.append(piece)
+        return "".join(emitted)
+
+    def test_pure_increments_pass_through_untouched(self):
+        # 行为良好的上游：逐段增量，规整器不得改写任何字节
+        parts = ['{"city"', ':"hz"', ',"days"', ':2}']
+        self.assertEqual(self._client_view(parts), self.FINAL)
+
+    def test_exact_restatement_is_dropped(self):
+        self.assertEqual(self._client_view([self.FINAL, self.FINAL]), self.FINAL)
+
+    def test_prefix_restatement_emits_only_delta(self):
+        self.assertEqual(
+            self._client_view(['{"city":"hz"', self.FINAL]), self.FINAL)
+
+    def test_repeated_cumulative_frames_do_not_double_arguments(self):
+        """最狠的一种：每帧都重述"到目前为止的全部"。"""
+        frames = ['{"city"', '{"city":"hz"', '{"city":"hz","days":2}']
+        self.assertEqual(self._client_view(frames), self.FINAL)
+
+    def test_mixed_increment_and_restatement(self):
+        frames = ['{"city"', ':"hz"', '{"city":"hz"', ',"days"', ':2}']
+        self.assertEqual(self._client_view(frames), self.FINAL)
+
+    def test_known_limit_duplicate_tail_delta_is_ambiguous(self):
+        """**记录已知边界，不是断言正确行为**。
+
+        连续两帧发送完全相同的"尾巴"增量（`:2}` 后又是 `:2}`）时，规整器
+        无法区分"上游真的又吐了同样几个字符"与"上一帧重传"——累计值
+        `{"city":"hz","days":2}` 既不是 incoming 的前缀、也不与之相等，
+        只能按增量追加。这不是可以单方面修的缺陷：把它当重传丢弃，就会
+        误伤 `{"a":"xx","b":"xx"}` 这类合法重复值。
+
+        实测上游畸形形态（id 交换 / 整段重述 / 名字分片 / finish 同帧）里
+        没有这一种，因此维持"按增量追加"，并用本用例把这个边界钉在文档上：
+        哪天真的遇到，改动点与代价在这里可见。
+        """
+        frames = ['{"city"', ':"hz"', '{"city":"hz"', ',"days"', ':2}', ':2}']
+        self.assertEqual(self._client_view(frames), self.FINAL + ":2}")
+
+    def test_accumulated_result_is_valid_json(self):
+        import json as _json
+        for frames in ([self.FINAL], ['{"city"', ':"hz"', ',"days"', ':2}'],
+                       ['{"city"', self.FINAL, self.FINAL]):
+            got = self._client_view(frames)
+            self.assertEqual(_json.loads(got),
+                             _json.loads(self.FINAL), frames)
+
+
 class ResponsesExitSchemaTests(TestCase):
     """/v1/responses 出口事件 schema 完整性（openai SDK 严格校验案）。
 
