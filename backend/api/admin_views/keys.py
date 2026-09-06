@@ -80,6 +80,13 @@ class ChannelKeyDetailView(AdminRequiredMixin, APIView):
         if request.query_params.get('reveal') == '1':
             from services.crypto import decrypt_secret
             data['api_key'] = decrypt_secret(rec.api_key)
+            # 明文回看是"高权限且不可撤销"的动作：管理面只有一个静态共享
+            # Token，泄漏后即可批量拉走全部上游 Key，事前拦不住就必须留下
+            # 事后可查的流水（只记动作与来源，绝不记明文本身）。
+            from services.audit_service import log_secret_access
+            from apps.core.models import SecretAccessAction
+            log_secret_access(SecretAccessAction.REVEAL_KEY,
+                              request=request, channel=rec.channel, target=rec)
         return Response(data)
 
     def patch(self, request, pk):

@@ -410,9 +410,42 @@ class RequestLog(models.Model):
         return self.request_id
 
 
+class SecretAccessAction(models.TextChoices):
+    REVEAL_KEY = "reveal_key", "回看上游 Key 明文"
+
+
+class SecretAccessLog(models.Model):
+    """敏感操作审计流水。
+
+    为什么必须有：管理面只有**一个静态共享密钥** `ADMIN_TOKEN`，没有第二因子、
+    没有身份区分——Token 一旦泄漏，持有者就能 `?reveal=1` 逐条拉走全部上游 Key。
+    事前拦不住，事后就必须能回答"什么时候、从哪个地址、看了哪把 Key"。
+    本表只记**动作与元数据**，绝不记录被回看的明文本身。
+    """
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    action = models.CharField(max_length=32, choices=SecretAccessAction.choices,
+                              db_index=True)
+    channel = models.ForeignKey(
+        Channel, on_delete=models.SET_NULL, related_name="secret_access_logs",
+        null=True, blank=True, db_index=True,
+    )
+    target_id = models.IntegerField(null=True, blank=True)
+    target_name = models.CharField(max_length=128, blank=True, default="")
+    remote_addr = models.CharField(max_length=64, blank=True, default="")
+    forwarded_for = models.CharField(max_length=256, blank=True, default="")
+    user_agent = models.CharField(max_length=256, blank=True, default="")
+
+    class Meta:
+        db_table = "secret_access_log"
+        indexes = [models.Index(fields=["created_at", "action"])]
+
+    def __str__(self):
+        return f"{self.action}:{self.target_name or self.target_id}"
+
+
 class SystemSetting(models.Model):
     """运行时参数。按渠道隔离：同一 key 在不同渠道可有不同取值。"""
-
     channel = models.ForeignKey(
         Channel, on_delete=models.CASCADE, related_name="settings",
         null=True, blank=True, db_index=True,

@@ -36,6 +36,7 @@ from .logs import (
     LogListView,
     LogDetailView,
     LogCleanView,
+    SecretAccessLogView,
 )
 from .models_admin import (
     ModelListView,

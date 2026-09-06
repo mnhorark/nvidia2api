@@ -16,7 +16,7 @@ from rest_framework.views import APIView
 
 from apps.core.models import (
     AIModel, Channel, ChannelKey, ChannelKeyStatus, Proxy, ProxyGroup, ProxyStatus,
-    RequestLog, SystemSetting, UserApiKey,
+    RequestLog, SecretAccessLog, SystemSetting, UserApiKey,
 )
 from services import (
     api_key_service, channel_service, key_service, model_registry, proxy_service,
@@ -86,3 +86,48 @@ class LogCleanView(AdminRequiredMixin, APIView):
         channel = None if all_channels else current_channel(request)
         result = cleanup.clean_old_logs(days=days, channel=channel)
         return Response(result)
+
+
+class SecretAccessLogView(AdminRequiredMixin, APIView):
+    """敏感操作审计流水（默认跨渠道）。
+
+    故意**不**按当前渠道收敛：管理面是单一角色，安全取证要看的恰恰是
+    "这个 Token 被拿去做过什么"，按渠道过滤只会让排查漏掉另一半。
+    支持 `?channel=<slug>` 与 `?action=` 主动收窄。
+    """
+
+    def get(self, request):
+        qs = SecretAccessLog.objects.select_related('channel').order_by('-id')
+        slug = request.query_params.get('channel')
+        if slug:
+            qs = qs.filter(channel__slug=slug)
+        action = request.query_params.get('action')
+        if action:
+            qs = qs.filter(action=action)
+        limit_raw = request.query_params.get('limit')
+        limit = _parse_int(limit_raw) if limit_raw not in (None, '') else 100
+        if limit is None:
+            return _bad_param('limit')
+        limit = max(1, min(limit, 500))
+        offset_raw = request.query_params.get('offset')
+        offset = _parse_int(offset_raw) if offset_raw not in (None, '') else 0
+        if offset is None:
+            return _bad_param('offset')
+        offset = max(offset, 0)
+        total = qs.count()
+        page = list(qs[offset:offset + limit])
+        return Response({
+            'results': [{
+                'id': r.id,
+                'created_at': r.created_at.isoformat(),
+                'action': r.action,
+                'channel': r.channel.slug if r.channel else None,
+                'target_id': r.target_id,
+                'target_name': r.target_name,
+                'remote_addr': r.remote_addr,
+                'forwarded_for': r.forwarded_for,
+                'user_agent': r.user_agent,
+            } for r in page],
+            'total': total, 'limit': limit, 'offset': offset,
+            'has_more': offset + len(page) < total,
+        })

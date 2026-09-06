@@ -68,6 +68,10 @@ urlpatterns = [
     path("api/admin/logs/clean", admin_views.LogCleanView.as_view()),
     path("api/admin/logs/<int:pk>", admin_views.LogDetailView.as_view()),
 
+    # 敏感操作审计（明文回看上游 Key 等），默认跨渠道
+    path("api/admin/audit/secret-access",
+         admin_views.SecretAccessLogView.as_view()),
+
     # ---- 前端静态托管（all-in-one 镜像）----
     # 必须放在最后，且用否定预查排除 API 前缀：未知 API 路径仍然要返回 404，
     # 不能被前端 index.html 吞掉（否则客户端会把 404 HTML 当成 JSON 解析失败）。
