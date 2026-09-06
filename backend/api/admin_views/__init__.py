@@ -30,6 +30,7 @@ from .keys import (
     ChannelKeyImportView,
     ChannelKeyDetailView,
     ChannelKeyTestView,
+    ChannelKeyCleanupInvalidView,
     KeyBatchView,
 )
 from .logs import (

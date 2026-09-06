@@ -129,6 +129,21 @@ class ChannelKeyTestView(AdminRequiredMixin, APIView):
         return Response(key_service.test_key(rec))
 
 
+class ChannelKeyCleanupInvalidView(AdminRequiredMixin, APIView):
+    """POST：一键清理当前渠道的失效 Key（status=invalid，即 401/403 鉴权失败）。
+
+    只删 invalid：rate_limited/error 是瞬态、disabled 是人工停用，都不属于"失效"。
+    """
+
+    def post(self, request):
+        channel = current_channel(request)
+        qs = channel.keys.filter(status=ChannelKeyStatus.INVALID)
+        deleted = qs.count()
+        if deleted:
+            qs.delete()
+        return Response({'deleted': deleted})
+
+
 class KeyBatchView(AdminRequiredMixin, APIView):
     """POST {ids: [...], action: "enable"|"disable"|"delete"|"test"|"set_rpm"}"""
 

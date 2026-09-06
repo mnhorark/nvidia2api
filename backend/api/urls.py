@@ -38,6 +38,7 @@ urlpatterns = [
     path("api/admin/keys", admin_views.ChannelKeyListView.as_view()),
     path("api/admin/keys/batch", admin_views.KeyBatchView.as_view()),
     path("api/admin/keys/import", admin_views.ChannelKeyImportView.as_view()),
+    path("api/admin/keys/cleanup-invalid", admin_views.ChannelKeyCleanupInvalidView.as_view()),
     path("api/admin/keys/<int:pk>", admin_views.ChannelKeyDetailView.as_view()),
     path("api/admin/keys/<int:pk>/test", admin_views.ChannelKeyTestView.as_view()),
     path("api/admin/nvidia-keys", admin_views.ChannelKeyListView.as_view()),

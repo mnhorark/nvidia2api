@@ -240,3 +240,49 @@ class ApiKeyHintPerfTests(TestCase):
             finally:
                 services.crypto.decrypt_secret = orig
         self.assertEqual(data["api_key"], k.api_key_hint)
+
+
+class CleanupInvalidTests(TestCase):
+    """POST /api/admin/keys/cleanup-invalid：一键清理失效 Key。"""
+
+    def setUp(self):
+        from django.conf import settings
+        self.headers = {"HTTP_AUTHORIZATION": f"Token {settings.ADMIN_TOKEN}"}
+        self.ch = channel_service.ensure_default_channel()
+        self.other = Channel.objects.create(
+            name="Other", slug="other", base_url="https://o.test/v1")
+        self.invalid = ChannelKey.objects.create(
+            channel=self.ch, name="dead", api_key="nvapi-dead",
+            status=ChannelKeyStatus.INVALID)
+        self.rate_limited = ChannelKey.objects.create(
+            channel=self.ch, name="rl", api_key="nvapi-rl",
+            status=ChannelKeyStatus.RATE_LIMITED)
+        self.disabled = ChannelKey.objects.create(
+            channel=self.ch, name="off", api_key="nvapi-off",
+            status=ChannelKeyStatus.DISABLED)
+        self.other_invalid = ChannelKey.objects.create(
+            channel=self.other, name="other-dead", api_key="nvapi-odead",
+            status=ChannelKeyStatus.INVALID)
+
+    def test_requires_auth(self):
+        res = self.client.post("/api/admin/keys/cleanup-invalid")
+        self.assertEqual(res.status_code, 401)
+        self.assertEqual(ChannelKey.objects.count(), 4)
+
+    def test_deletes_only_invalid_in_current_channel(self):
+        res = self.client.post("/api/admin/keys/cleanup-invalid", **self.headers)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["deleted"], 1)
+        self.assertFalse(ChannelKey.objects.filter(pk=self.invalid.pk).exists())
+        # 瞬态/人工停用状态不动
+        for k in (self.rate_limited, self.disabled):
+            self.assertTrue(ChannelKey.objects.filter(pk=k.pk).exists())
+        # 其他渠道的失效 Key 不受影响（渠道隔离）
+        self.assertTrue(ChannelKey.objects.filter(pk=self.other_invalid.pk).exists())
+
+    def test_idempotent_when_nothing_invalid(self):
+        ChannelKey.objects.filter(status=ChannelKeyStatus.INVALID,
+                                   channel=self.ch).delete()
+        res = self.client.post("/api/admin/keys/cleanup-invalid", **self.headers)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["deleted"], 0)

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Ban, Check, FlaskConical, Gauge, Pencil, Plus, RefreshCw, Search, Trash2, Upload, Wand2 } from "lucide-react";
+import { Ban, Check, Eraser, FlaskConical, Gauge, Pencil, Plus, RefreshCw, Search, Trash2, Upload, Wand2 } from "lucide-react";
 import { api, asList, Channel, ChannelKey } from "@/lib/api";
 import { useSubmitGuard } from "@/lib/use-submit-guard";
 import {
@@ -53,6 +53,7 @@ export default function ChannelKeysPage() {
   const [saving, submit] = useSubmitGuard();
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
+  const [cleaning, setCleaning] = useState(false);
   // 本地搜索：按名称 / 掩码后的 Key 过滤（全量数据仍在 keys 里，统计、批量选择不受影响）
   const [q, setQ] = useState("");
   // 渲染窗口大小：行内操作触发的全量 load() 不重置它，仅搜索词变化时重置
@@ -200,6 +201,24 @@ export default function ChannelKeysPage() {
     }
   }
 
+  // 失效 Key（status=invalid，401/403 鉴权失败）数量，驱动"清理失效"按钮
+  const invalidCount = keys.filter((k) => k.status === "invalid").length;
+
+  async function cleanupInvalid() {
+    if (invalidCount === 0) return;
+    if (!confirm(`确认删除 ${invalidCount} 个失效 Key？此操作不可恢复。`)) return;
+    setCleaning(true);
+    try {
+      const res = await api.post<{ deleted?: number }>("/api/admin/keys/cleanup-invalid", {});
+      toast.success(`已清理 ${res.deleted ?? 0} 个失效 Key`);
+      await load();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "清理失败");
+    } finally {
+      setCleaning(false);
+    }
+  }
+
   function toggleOne(id: number) {
     setSelected((prev) => {
       const next = new Set(prev);
@@ -278,6 +297,14 @@ export default function ChannelKeysPage() {
           <>
             <Button onClick={() => setImportOpen(true)}>
               <Upload size={14} /> 批量导入
+            </Button>
+            <Button
+              onClick={cleanupInvalid}
+              loading={cleaning}
+              disabled={invalidCount === 0}
+              title={invalidCount === 0 ? "没有失效 Key" : `删除 ${invalidCount} 个鉴权失败的 Key`}
+            >
+              <Eraser size={14} /> 清理失效{invalidCount > 0 ? ` (${invalidCount})` : ""}
             </Button>
             <Button onClick={load} loading={loading}>
               <RefreshCw size={14} /> 刷新
