@@ -334,7 +334,18 @@ def _request_summary(body: dict, tool_alias_map: dict | None) -> dict:
     return summary
 
 
-def _authorize(request):
+def _authorize(request, *, consume_quota: bool = True):
+    """数据面入口鉴权：Bearer Key 有效性 → enabled → RPM → 额度。
+
+    `consume_quota=True`（默认，生成类端点）：用 `claim_quota` **原子预占
+    1 token**，成功路径由 `record_usage(reservation=1)` 结算、失败路径显式
+    退还。预占的意义是"额度将尽时也不让 N 个并发同时越过 quota"。
+
+    `consume_quota=False`（不产生上游消耗的端点，如 count_tokens）：改用
+    只读 `check_quota` 做**同一道 402 闸门**，但绝不预占。历史缺陷：该端点
+    曾走默认分支 claim 了 1 token 却从不结算，Claude Code 类客户端每轮上下文
+    计数都永久吞掉 1 额度，且不落 RequestLog，排查时完全隐形。
+    """
     user_key = _authenticate(request)
     if user_key is None:
         return None, openai_error("Invalid API key", "invalid_api_key", 401, "authentication_error")
@@ -345,7 +356,10 @@ def _authorize(request):
         if reason == "rate_limited":
             return None, openai_error("Rate limit exceeded", "rate_limit_exceeded", 429)
         return None, openai_error("API key disabled", "key_disabled", 403, "authentication_error")
-    ok, reason = api_key_service.claim_quota(user_key)
+    if consume_quota:
+        ok, reason = api_key_service.claim_quota(user_key)
+    else:
+        ok, reason = api_key_service.check_quota(user_key)
     if not ok:
         return None, openai_error("Insufficient quota (quota exceeded)",
                                   "insufficient_quota", 402, "insufficient_quota")
@@ -628,7 +642,9 @@ def anthropic_messages(request, channel_slug: str | None = None):
 def anthropic_count_tokens(request, channel_slug: str | None = None):
     if request.method != "POST":
         return openai_error("Method not allowed", "method_not_allowed", 405)
-    user_key, err = _authorize(request)
+    # consume_quota=False：本端点是**纯本地计算**（不产生上游消耗），只过
+    # 额度闸门不预占。走默认分支会让每次计数永久吞掉 1 token 额度。
+    user_key, err = _authorize(request, consume_quota=False)
     if err:
         return err
     body, err = _parse_body(request)
