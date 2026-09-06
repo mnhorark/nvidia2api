@@ -39,6 +39,14 @@ def _is_server_process() -> bool:
     entry = Path(argv[0]).name.lower() if argv[0] else ""
     if any(marker in entry for marker in _SERVER_MARKERS):
         return True
+    # `python -m uvicorn ...`：argv[0] 是 `.../uvicorn/__main__.py`，入口名
+    # 只剩 `__main__.py`，光看它认不出来。**start.bat 的两个启动分支用的都是
+    # `python -m uvicorn`**，漏掉这条就等于 Windows 部署上守卫与自动迁移双双失效。
+    # 判据取被 `-m` 执行的模块名——即 `__main__.py` 的父目录名。
+    if entry == "__main__.py":
+        module = Path(argv[0]).parent.name.lower()
+        if any(marker in module for marker in _SERVER_MARKERS):
+            return True
     return "runserver" in argv
 
 
@@ -51,6 +59,18 @@ class CoreConfig(AppConfig):
             return
         if not _is_server_process():
             return
+        # 单进程契约：并发闸门/登录限速/运行时参数缓存都是进程内状态，
+        # 多实例共享同一 DATA_DIR 时它们会**静默**失效。必须在碰数据库之前
+        # 先拒绝第二个实例（放在 migrate 之前，避免半启动状态）。
+        from services.process_guard import AlreadyRunning, acquire_singleton_lock
+
+        try:
+            acquire_singleton_lock()
+        except AlreadyRunning as exc:
+            import logging
+
+            logging.getLogger("django").error("%s", exc)
+            raise
         from django.core.management import call_command
 
         try:
