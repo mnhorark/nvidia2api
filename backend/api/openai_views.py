@@ -246,6 +246,19 @@ def _build_upstream_body(body: dict, model_name: str, channel=None,
                     else thinking.build_upstream(body, model_name, channel))
     # 上游必须用真实模型名（别名不透传）
     upstream["model"] = model_name
+    # tool_choice 对象形态归一化（qwen3.8-flash 400 实证 req_2c34411b 案）：
+    # AI SDK 系客户端（zcode 等）发 {"type":"auto"}，部分上游 thinking 模式
+    # 只认字符串 "auto"/"none"，对象形态整包 400——且流式下错误体被上游
+    # 包装成无信息量的 openai_error（req_2c34411b 四条线路同报此错）。
+    # 字符串形态是 OpenAI 规范的权威写法，对象->字符串为无损归一化：
+    # 语义完全等价，任何 OpenAI 兼容上游都接受字符串。
+    # 带 function 的 {"type":"function",...} 是"强制调用"的唯一表达，
+    # 不在此改写——上游 thinking 模式不支持时由上游明确报错表态
+    # （对标 muse 的"静默改写不如让上游明确表态"原则）。
+    tc = upstream.get("tool_choice")
+    if isinstance(tc, dict) and "function" not in tc \
+            and tc.get("type") in ("auto", "none", "required"):
+        upstream["tool_choice"] = tc["type"]
     # 流式 usage 选项
     if body.get("stream"):
         if "stream_options" not in upstream:
@@ -322,6 +335,9 @@ def _request_summary(body: dict, tool_alias_map: dict | None) -> dict:
         "max_completion_tokens": body.get("max_completion_tokens"),
         "temperature": body.get("temperature"),
         "top_p": body.get("top_p"),
+        # tool_choice 记原始值：对象/字符串形态之争是 thinking 模型上游
+        # 400 的高频根因（req_2c34411b 案），只记键名无法区分形态
+        "tool_choice": body.get("tool_choice"),
         # 每条消息的形态摘要（不含正文）：role / content 类型 /
         # tool_calls 数 / tool_call_id——AI SDK 系客户端的数组 content、
         # null content、空 arguments 等方言在此一览无余
