@@ -545,6 +545,11 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
                 break
             except (NoRouteAvailable, AllRoutesFailed) as exc:
                 last_exc = exc
+                # 内容被拒（探针确认）是确定性失败：同样的内容重试必然
+                # 同样 400，换线无意义——直接终止重试（对标"模型不存在
+                # 不应重复竞速"，AGENTS.md §四十五）
+                if getattr(exc, "content_rejected", False):
+                    break
                 if attempt + 1 < max_attempts:
                     logger.info("request %s attempt %d failed, retrying: %s",
                                 request_id, attempt + 1, exc)
@@ -557,9 +562,22 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
             report = getattr(last_exc, "report", None) or []
             logger.warning("all routes failed after %d attempt(s): %s",
                            max_attempts, last_exc)
-            _finish_log(log, started, False, 502, "all_routes_failed", routes=report)
+            content_rejected = bool(getattr(last_exc, "content_rejected", False))
+            _finish_log(log, started, False, 502,
+                        "upstream_content_rejected" if content_rejected
+                        else "all_routes_failed", routes=report)
             api_key_service.record_result(user_key, False)
             api_key_service.record_usage(user_key, reservation=1)  # 退还预占
+            if content_rejected:
+                # req_2c34411b / req_32382 案：上游内容审核拒收请求体时
+                # 返回无信息量的通用 400，四线路全灭曾被误报为"上游暂时
+                # 不可用"，误导排查数小时。探针确认后如实分类。
+                return openai_error(
+                    "上游拒绝了请求内容：所有线路均返回 400，但同一通道的"
+                    "最小无害探针可通过——判定为请求内容命中上游内容策略/"
+                    "参数校验（并非上游故障，重试无意义）。请检查 system/"
+                    "消息内容，或更换模型/通道",
+                    "upstream_content_rejected", 502)
             return openai_error("上游服务暂时不可用，请稍后重试", "upstream_error", 502)
 
         r = result.route
@@ -701,6 +719,13 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
 
     from services.loop_offload import run_db
 
+    # 竞速/重试静默期的心跳间隔：winner 诞生之前（race_stream 首帧等待 +
+    # backoff sleep + 换线重建），客户端可能连续数分钟收不到任何字节，
+    # agent 客户端（zcode 等）的 modelStream idleTimeout 会 abort 连接
+    # （UND_ERR_SOCKET terminated）→ 生成器被 cancel → 记账收尾丢失。
+    # SSE 注释行对 OpenAI/Anthropic/Responses 客户端均不可见，纯保活。
+    race_heartbeat = heartbeat if heartbeat and heartbeat > 0 else 15.0
+
     async def settle(success: bool) -> None:
         if settled["done"]:
             return
@@ -719,6 +744,16 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
         except Exception:
             logger.exception("stream finish log save failed")
 
+    async def _backoff_with_heartbeat(seconds: float):
+        """退避等待，每 race_heartbeat 秒产一条心跳（async gen，调用方转发）。"""
+        end = time.monotonic() + seconds
+        while True:
+            remain = end - time.monotonic()
+            if remain <= 0:
+                return
+            await asyncio.sleep(min(remain, race_heartbeat))
+            yield ": keep-alive\n\n"
+
     try:
         for attempt in range(max_attempts):
             rs = routes if attempt == 0 else await run_db(
@@ -727,7 +762,8 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
             if not rs:
                 last_exc = NoRouteAvailable()
                 if attempt + 1 < max_attempts and backoff > 0:
-                    await asyncio.sleep(backoff)
+                    async for _hb in _backoff_with_heartbeat(backoff):
+                        yield _hb
                 continue
             reserved = _reserve_upstream(len(rs))
             if reserved < len(rs):
@@ -742,12 +778,32 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                 _release_upstream(reserved)
                 reserved = 0
                 if attempt + 1 < max_attempts and backoff > 0:
-                    await asyncio.sleep(backoff)
+                    async for _hb in _backoff_with_heartbeat(backoff):
+                        yield _hb
                 continue
             w = None
             tap = StreamTap()  # 整条尝试共用一个观察器（race 失败时为空态）
             try:
-                w = await race_stream(rs, upstream_body)
+                # 竞速等待包成心跳循环：race_stream 期间（首帧等待可长达
+                # stream_first_byte_timeout）客户端零字节，agent 客户端的
+                # idleTimeout 会掐连接。每 race_heartbeat 秒注入一条
+                # SSE 注释行（对所有协议客户端不可见，纯保活）。
+                race_task = asyncio.ensure_future(race_stream(rs, upstream_body))
+                try:
+                    while True:
+                        done, _pending = await asyncio.wait(
+                            {race_task}, timeout=race_heartbeat)
+                        if done:
+                            w = race_task.result()
+                            break
+                        yield ": keep-alive\n\n"
+                finally:
+                    if not race_task.done():
+                        # 客户端在心跳 yield 点断开（GeneratorExit）：
+                        # 撕掉竞速 task，race_stream_winner 的 finally
+                        # 会级联清理所有线路连接（防 fd 泄漏）
+                        race_task.cancel()
+                        await asyncio.gather(race_task, return_exceptions=True)
                 if reserved > 1:
                     _release_upstream(reserved - 1)
                     reserved = 1
@@ -902,10 +958,14 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                         if comb[1] is not None:
                             excluded_proxies.add(comb[1])
                 last_exc = exc
+                # 内容被拒（探针确认）是确定性失败：重试必然复现，直接终止
+                if getattr(exc, "content_rejected", False):
+                    break
                 logger.info("stream attempt %d failed, retrying: %s",
                             attempt + 1, exc)
                 if attempt + 1 < max_attempts and backoff > 0:
-                    await asyncio.sleep(backoff)
+                    async for _hb in _backoff_with_heartbeat(backoff):
+                        yield _hb
             except Exception as exc:
                 if tap.sent_content or tap.saw_done:
                     # 线路中途死亡（含已出部分内容后断流）：竞速时该 Key 已被
@@ -964,7 +1024,8 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                 logger.info("stream attempt %d failed before any content, retrying: %s",
                             attempt + 1, exc)
                 if attempt + 1 < max_attempts and backoff > 0:
-                    await asyncio.sleep(backoff)
+                    async for _hb in _backoff_with_heartbeat(backoff):
+                        yield _hb
             finally:
                 if w is not None:
                     try:
@@ -1004,13 +1065,26 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
             }) + "\n\n"
         else:
             report = getattr(last_exc, "report", None)
+            content_rejected = bool(getattr(last_exc, "content_rejected", False))
             await _safe_finish(holder["log"], holder["started"], False, 502,
-                        "stream_error", routes=all_reports or report or None)
+                        "upstream_content_rejected" if content_rejected
+                        else "stream_error", routes=all_reports or report or None)
             await settle(False)
-            yield "data: " + json.dumps({
-                "error": {"message": "上游服务暂时不可用，请稍后重试", "type": "api_error",
-                           "param": None, "code": "stream_error"}
-            }) + "\n\n"
+            if content_rejected:
+                # 同非流式路径：探针确认"内容被拒"后如实分类（req_32382 案）
+                yield "data: " + json.dumps({
+                    "error": {"message": "上游拒绝了请求内容：所有线路均返回 400，"
+                              "但同一通道的最小无害探针可通过——判定为请求内容命中"
+                              "上游内容策略/参数校验（并非上游故障，重试无意义）。"
+                              "请检查 system/消息内容，或更换模型/通道",
+                              "type": "api_error", "param": None,
+                              "code": "upstream_content_rejected"}
+                }) + "\n\n"
+            else:
+                yield "data: " + json.dumps({
+                    "error": {"message": "上游服务暂时不可用，请稍后重试", "type": "api_error",
+                               "param": None, "code": "stream_error"}
+                }) + "\n\n"
         yield "data: [DONE]\n\n"
     except (NoRouteAvailable, AllRoutesFailed) as exc:
         report = exc.report if isinstance(exc, AllRoutesFailed) else None
@@ -1041,6 +1115,29 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
             _release_upstream(reserved)
             reserved = 0
         _bump_active(-1)
+        # 客户端中途断开（GeneratorExit/CancelledError 穿透生成器）时，
+        # 正常收尾路径（drain 结束后的 log.save + settle）不会执行——
+        # 日志永久滞留 pending、配额预占不结算。此处强制收尾；
+        # settled 标记保证与正常路径幂等互斥（正常完成时 settle 已置位）。
+        if not settled["done"]:
+            settled["done"] = True
+            rec = holder["log"]
+            rec.status = "failed"
+            rec.error_type = rec.error_type or (
+                "stream_truncated" if winner is not None else "stream_error")
+            rec.duration_ms = round(
+                (time.monotonic() - holder["started"]) * 1000, 1)
+            rec.http_status = rec.http_status or 200
+            try:
+                await run_db(rec.save)
+                await run_db(api_key_service.record_result, user_key, False)
+                await run_db(
+                    api_key_service.record_usage,
+                    user_key, rec.prompt_tokens or 0,
+                    rec.completion_tokens or 0, rec.cached_tokens or 0,
+                    1)  # 结算入口 claim_quota 预占的 1 token
+            except Exception:
+                logger.exception("stream client-disconnect settle failed")
 
 
 async def _drain(winner, idle_timeout: float = 0,

@@ -1530,3 +1530,179 @@ class R15_DedupeToolCallIdsTests(TestCase):
         self.assertEqual(round2, {"Bash:0__dup2", "Read:1__dup2"})
         outs2 = [m["tool_call_id"] for m in body["messages"][4:6]]
         self.assertEqual(outs2, ["Bash:0__dup2", "Read:1__dup2"])
+
+
+class ToolChoiceObjectFormTests(TestCase):
+    """tool_choice 对象形态归一化（req_2c34411b 案回归守卫）。
+
+    现场：zcode 发 {"type":"auto"}（AI SDK 对象方言），qwen3.8-flash
+    thinking 模式上游只认字符串 "auto"，四条竞速线路整包 400，且流式
+    错误体被上游包装成无信息量的 openai_error。归一化规则：无 function
+    字段的对象形态折叠为等价字符串（无损）；带 function 的强制调用形态
+    原样透传（上游明确表态）。
+    """
+
+    def test_object_auto_normalized_to_string(self):
+        from api.openai_views import _build_upstream_body
+
+        out = _build_upstream_body(
+            {"tool_choice": {"type": "auto"}, "messages": []}, "m", None)
+        self.assertEqual(out["tool_choice"], "auto")
+
+    def test_object_none_normalized_to_string(self):
+        from api.openai_views import _build_upstream_body
+
+        out = _build_upstream_body(
+            {"tool_choice": {"type": "none"}, "messages": []}, "m", None)
+        self.assertEqual(out["tool_choice"], "none")
+
+    def test_object_required_normalized_to_string(self):
+        from api.openai_views import _build_upstream_body
+
+        out = _build_upstream_body(
+            {"tool_choice": {"type": "required"}, "messages": []}, "m", None)
+        self.assertEqual(out["tool_choice"], "required")
+
+    def test_forced_function_object_preserved(self):
+        """{"type":"function",...} 是强制调用的唯一表达，必须原样透传。"""
+        from api.openai_views import _build_upstream_body
+
+        tc = {"type": "function", "function": {"name": "Bash"}}
+        out = _build_upstream_body(
+            {"tool_choice": dict(tc), "messages": []}, "m", None)
+        self.assertEqual(out["tool_choice"], tc)
+
+    def test_string_forms_passthrough(self):
+        from api.openai_views import _build_upstream_body
+
+        for tc in ("auto", "none", "required"):
+            out = _build_upstream_body(
+                {"tool_choice": tc, "messages": []}, "m", None)
+            self.assertEqual(out["tool_choice"], tc)
+
+    def test_unknown_object_form_passthrough(self):
+        """未知对象形态（如 allowed_tools 方言）不发明语义，原样透传。"""
+        from api.openai_views import _build_upstream_body
+
+        tc = {"type": "allowed_tools", "mode": "auto",
+              "tools": [{"name": "Bash"}]}
+        out = _build_upstream_body(
+            {"tool_choice": dict(tc), "messages": []}, "m", None)
+        self.assertEqual(out["tool_choice"], tc)
+
+    def test_request_summary_records_tool_choice_value(self):
+        """request_summary 必须记 tool_choice 原始值——只记键名无法区分
+        对象/字符串形态，req_2c34411b 排查因此多走一轮二分。"""
+        tc = {"type": "auto"}
+        summary = openai_views._request_summary(
+            {"messages": [], "tool_choice": dict(tc)}, None)
+        self.assertEqual(summary["tool_choice"], tc)
+
+    def test_request_summary_omits_tool_choice_when_absent(self):
+        summary = openai_views._request_summary({"messages": []}, None)
+        self.assertIsNone(summary["tool_choice"])
+
+
+@pytest.mark.django_db
+class ContentRejectionProbeTests(IsolatedAsyncioTestCase):
+    """全线路 400 的探针分类（req_32382 案回归守卫）。
+
+    现场：上游（b.ai）内容审核拒收含显性内容的请求体，返回无信息量的
+    通用 400（openai_error / bad_response_status_code），四条竞速线路
+    全灭后被报成"上游暂时不可用"，误导排查数小时——实际是永久性内容
+    拒绝，重试无意义。修复：全线路均 http_400 时发最小无害探针，
+    探针 200 => content_rejected（确定性失败，不重试）。
+
+    注：IsolatedAsyncioTestCase 不走 Django TestCase 事务包裹，依赖
+    类级 django_db 标记；Channel 建一次用 settings.TESTING 的库。
+    """
+
+    _ch = None
+
+    def tearDown(self):
+        # IsolatedAsyncioTestCase + django_db 每用例回滚，但类级缓存引用
+        # 的行已随回滚消失；必须清缓存，否则下个用例误用死对象
+        ContentRejectionProbeTests._ch = None
+
+    def _channel(self):
+        if ContentRejectionProbeTests._ch is None:
+            ContentRejectionProbeTests._ch, _ = Channel.objects.get_or_create(
+                slug="cr-test", defaults=dict(
+                    name="cr-test", base_url="https://up.example/v1",
+                    chat_path="/chat/completions", auth_scheme="none",
+                    enabled=True))
+        return ContentRejectionProbeTests._ch
+
+    def _route(self):
+        from services.race_engine import Route
+        key = type("K", (), {"channel": self._channel(), "id": 1,
+                             "name": "k1", "api_key": ""})()
+        return Route(kind="direct", key=key, proxy=None)
+
+    def _report_all_400(self):
+        from services.race_engine import route_info
+        return [route_info(self._route(), "failed", 5.0, "http_400", 400)]
+
+    async def test_probe_ok_flags_content_rejected(self):
+        """探针 200 => 上游健康，拒绝的是请求内容。"""
+        from services import race_engine
+
+        def fake_acm(**kw):
+            class R:
+                status_code = 200
+            class C:
+                async def post(self, *a, **k): return R()
+            class M:
+                async def __aenter__(self): return C()
+                async def __aexit__(self, *a): return False
+            return M()
+        with patch.object(race_engine.httpx, "AsyncClient", fake_acm):
+            ok = await race_engine._classify_content_rejection(
+                [self._route()], {"model": "m"}, self._report_all_400())
+        self.assertTrue(ok)
+
+    async def test_probe_400_means_upstream_broken(self):
+        """探针也 400 => 上游连无害请求都拒，不是内容问题。"""
+        from services import race_engine
+
+        def fake_acm(**kw):
+            class R:
+                status_code = 400
+            class C:
+                async def post(self, *a, **k): return R()
+            class M:
+                async def __aenter__(self): return C()
+                async def __aexit__(self, *a): return False
+            return M()
+        with patch.object(race_engine.httpx, "AsyncClient", fake_acm):
+            ok = await race_engine._classify_content_rejection(
+                [self._route()], {"model": "m"}, self._report_all_400())
+        self.assertFalse(ok)
+
+    async def test_mixed_status_codes_skip_probe(self):
+        """非全 400（如 429 混 400）不探针——限流/鉴权问题分类无意义。"""
+        from services import race_engine
+        from services.race_engine import route_info
+
+        report = self._report_all_400()
+        report.append(route_info(self._route(), "failed", 5.0, "rate_limited", 429))
+        called = {"n": 0}
+
+        async def fake_acm(**kw):
+            called["n"] += 1
+            raise AssertionError("probe must not fire")
+
+        with patch.object(race_engine.httpx, "AsyncClient", fake_acm):
+            ok = await race_engine._classify_content_rejection(
+                [self._route()], {"model": "m"}, report)
+        self.assertFalse(ok)
+        self.assertEqual(called["n"], 0)
+
+    async def test_all_routes_failed_carries_content_rejected(self):
+        """AllRoutesFailed 上挂 content_rejected 属性（默认 False）。"""
+        from services.race_engine import AllRoutesFailed
+
+        exc = AllRoutesFailed(["a:http_400"])
+        self.assertFalse(getattr(exc, "content_rejected", False))
+        exc.content_rejected = True
+        self.assertTrue(exc.content_rejected)
