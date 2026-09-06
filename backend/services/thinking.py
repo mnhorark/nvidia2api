@@ -79,6 +79,11 @@ _EFFORT_ALIASES = {
 # 档位强序（钳制/翻译用）：max 为最高档
 _EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
+# OpenRouter reasoning.effort 完整梯度（2026-09 文档）：
+#   none / minimal / low / medium / high / xhigh / max
+# 网关分支只认这六档（none 另有独立表达路径），提为模块常量避免每次调用重建。
+_GATEWAY_EFFORT_TUPLE = ("minimal", "low", "medium", "high", "xhigh", "max")
+
 # effort -> budget_tokens 档位表（Anthropic/Gemini/OpenRouter 风格预算翻译）。
 # 参考锚点：Anthropic budget_tokens 下限 1024（extended thinking 文档）、
 # Gemini thinkingBudget 24576 上限、Claude "think a lot" ~32k、64k 为
@@ -498,7 +503,12 @@ def parse(payload) -> ThinkingSpec:
             if spec.enabled is None:
                 spec.enabled = flag
         if isinstance(raw, dict):
-            spec.raw_reasoning = raw
+            # **必须浅拷贝**：`_parse_reasoning` 返回的就是客户端 body 里那个
+            # reasoning 字典对象本身。`to_upstream` 会往 `out["reasoning"]` 上写
+            # 网关合成的 `budget_tokens`，共享引用等于**就地改写客户端请求体**——
+            # 而 build_upstream 先于审计取值执行，`client_thinking` /
+            # `request_summary` 记下的"客户端实际发了什么"会被污染。
+            spec.raw_reasoning = dict(raw)
             b = _as_int(raw.get("budget_tokens") or raw.get("reasoning_budget") or raw.get("thinking_budget"))
             if b is not None and spec.budget is None:
                 spec.budget = b
@@ -599,11 +609,13 @@ def to_upstream(spec: ThinkingSpec, model_name: str = "", channel=None) -> dict:
     # 网关格式处理（RikkaHub 风格）
     # OpenRouter reasoning.effort 完整梯度（2026-09 文档）：
     #   none / minimal / low / medium / high / xhigh / max
-    _GATEWAY_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+    _GATEWAY_EFFORTS = _GATEWAY_EFFORT_TUPLE
     if _is_reasoning_gateway(host, model_name):
-        # 优先使用原始 reasoning 对象
+        # 优先使用原始 reasoning 对象。
+        # **必须拷贝后再改**：下面要往它身上写网关合成的 budget_tokens，
+        # 直接引用会把上游参数写回客户端原始对象（就地改写请求体）。
         if spec.raw_reasoning and isinstance(spec.raw_reasoning, dict):
-            out["reasoning"] = spec.raw_reasoning
+            out["reasoning"] = dict(spec.raw_reasoning)
             if spec.budget is not None and cap.supports_budget:
                 out["reasoning"]["budget_tokens"] = spec.budget
             return out

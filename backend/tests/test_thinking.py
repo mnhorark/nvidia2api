@@ -1,4 +1,5 @@
 """思考强度参数的解析、归一化与透传。"""
+import copy
 import json
 from unittest.mock import patch
 
@@ -478,3 +479,59 @@ class Qwen38FlashVocabularyTests(TestCase):
         # 档位驱动模型（kimi-k3）开关意图仍注入默认档——不受本次修复影响
         out = to_upstream(parse({"reasoning": True}), "moonshotai/kimi-k3")
         self.assertEqual(out.get("reasoning_effort"), "max")
+
+
+class ClientBodyPurityTests(TestCase):
+    """网关合成的思考参数绝不写回客户端请求体（2026-09-05 架构审查发现）。
+
+    `to_upstream` 的网关分支会往 reasoning 对象上补 `budget_tokens`。旧实现里
+    `spec.raw_reasoning` 直接引用客户端 body 里那个字典（`_parse_reasoning`
+    原样 `return value`），于是这一步变成**就地改写客户端请求体**。危害不止
+    于"改了入参"这种洁癖问题：`build_upstream` 在视图里先于审计取值执行，
+    `client_thinking` 与 `request_summary` 记下的"客户端实际发了什么"会被
+    网关自己注入的值污染——而这套诊断数据正是用来排查上游 400 的。
+    """
+
+    def setUp(self):
+        self.channel = Channel.objects.create(
+            name="kilo-purity", slug="kilo-purity",
+            base_url="https://api.kilo.ai/api/gateway")
+        self.model = "some/gateway-model"
+
+    def test_gateway_budget_injection_does_not_mutate_client_body(self):
+        body = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "hi"}],
+            # 客户端只给档位，预算在顶层——注入值与 raw 里的值不同，
+            # 才能暴露"写回客户端对象"这条路径
+            "reasoning": {"effort": "high"},
+            "reasoning_budget": 8000,
+        }
+        snapshot = copy.deepcopy(body)
+
+        out = to_upstream(parse(body), self.model, self.channel)
+
+        # 修复不能被做成"干脆不下发"：上游确实要拿到合成的预算
+        self.assertEqual(out["reasoning"].get("budget_tokens"), 8000)
+        # 客户端 body 零改动
+        self.assertEqual(body, snapshot)
+        self.assertNotIn("budget_tokens", body["reasoning"])
+
+    def test_parse_does_not_alias_client_reasoning(self):
+        raw = {"effort": "high"}
+        spec = parse({"reasoning": raw, "reasoning_budget": 8000})
+        self.assertIsNot(spec.raw_reasoning, raw)
+        self.assertEqual(spec.raw_reasoning, raw)
+
+    def test_build_upstream_keeps_payload_untouched(self):
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning": {"effort": "medium"},
+            "thinking_budget": 12345,
+        }
+        snapshot = copy.deepcopy(payload)
+        produced = thinking.build_upstream(payload, self.model, self.channel)
+        self.assertEqual(payload, snapshot)
+        # 归一化产物只出现在返回值里，不回写
+        self.assertEqual(produced.get("reasoning", {}).get("budget_tokens"), 12345)
