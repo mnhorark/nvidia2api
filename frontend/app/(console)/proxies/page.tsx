@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Gauge, Globe, Pencil, Plus, RefreshCw, Search, Trash2, Upload } from "lucide-react";
-import { api, asList, ChannelKey, Proxy, ProxyGroup } from "@/lib/api";
+import { api, asList, Proxy, ProxyGroup } from "@/lib/api";
 import { useSubmitGuard } from "@/lib/use-submit-guard";
 import {
   Badge,
@@ -62,21 +62,23 @@ export default function ProxiesPage() {
     setLoading(true);
     setError("");
     try {
-      const [p, g, k] = await Promise.all([
-        api.get<{ results: Proxy[]; summary?: { max_enabled_proxies?: number; channel_id?: number; disable_proxy_unhealthy?: boolean } }>("/api/admin/proxies"),
+      const [p, g] = await Promise.all([
+        api.get<{ results: Proxy[]; summary?: { max_enabled_proxies?: number; total_keys?: number; nvidia_keys?: number; channel_id?: number; disable_proxy_unhealthy?: boolean } }>("/api/admin/proxies"),
         api.get("/api/admin/proxy-groups"),
-        api.get("/api/admin/keys"),
       ]);
       const proxyList = asList<Proxy>(p);
-      const keyList = asList<ChannelKey>(k);
       setProxies(proxyList);
       setSelected(new Set());
       setEnabledCount(proxyList.filter((x) => x.enabled).length);
       setGroups(asList<ProxyGroup>(g));
-      setKeyCount(keyList.length);
-      setMaxAllowed(Math.max(p.summary?.max_enabled_proxies ?? keyList.length - 1, 0));
-      setChannelId(p.summary?.channel_id ?? null);
-      setCancelUnhealthy(p.summary?.disable_proxy_unhealthy ?? false);
+      // Key 总数与启用上限都取自本接口 summary：过去这里还额外整拉
+      // /api/admin/keys（千级 Key ≈ 128KB）只为算一个 length。
+      const summary = p.summary;
+      setKeyCount(summary?.total_keys ?? summary?.nvidia_keys ?? 0);
+      setMaxAllowed(summary?.max_enabled_proxies
+        ?? Math.max((summary?.nvidia_keys ?? 1) - 1, 0));
+      setChannelId(summary?.channel_id ?? null);
+      setCancelUnhealthy(summary?.disable_proxy_unhealthy ?? false);
     } catch (e) {
       setError(e instanceof Error ? e.message : "加载失败");
     } finally {
@@ -106,11 +108,27 @@ export default function ProxiesPage() {
       );
   const visible = filtered.slice(0, windowSize);
 
+  /** 就地写入/更新一行：PATCH/POST 的响应就是权威整行序列化，
+   *  没必要为一次单行操作重拉全表（千级代理 ≈ 195KB + 后端全表扫描）。
+   *  仅"状态由服务端阈值判定、响应里拿不到"的操作（测速/批量）才走 load()。 */
+  function upsertRow(row: Proxy) {
+    setProxies((prev) => {
+      const idx = prev.findIndex((x) => x.id === row.id);
+      if (idx < 0) return [...prev, row];
+      const next = prev.slice();
+      next[idx] = row;
+      return next;
+    });
+  }
+
   async function setEnabled(p: Proxy, enabled: boolean) {
     setBusyId(p.id);
     try {
-      await api.patch(`/api/admin/proxies/${p.id}`, { enabled });
-      await load();
+      const row = await api.patch<Proxy>(`/api/admin/proxies/${p.id}`, { enabled });
+      upsertRow(row);
+      // 以本地行为基准算增量：no-op（状态未变）时不会误计
+      setEnabledCount((c) =>
+        Math.max(0, c + ((row.enabled ? 1 : 0) - (p.enabled ? 1 : 0))));
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "操作失败");
     } finally {
@@ -174,7 +192,14 @@ export default function ProxiesPage() {
     if (!confirm(`确认删除代理 ${p.name}？`)) return;
     try {
       await api.del(`/api/admin/proxies/${p.id}`);
-      load();
+      // 204 无响应体，但删除结果完全可本地推导：就地摘除，省一次全表重拉
+      setProxies((prev) => prev.filter((x) => x.id !== p.id));
+      setSelected((prev) => {
+        const next = new Set(prev);
+        next.delete(p.id);
+        return next;
+      });
+      if (p.enabled) setEnabledCount((c) => Math.max(0, c - 1));
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "删除失败");
     }
@@ -336,10 +361,13 @@ export default function ProxiesPage() {
           port: editItem.port,
           group: editItem.group ?? null,
         };
-        if (editItem.id) await api.patch(`/api/admin/proxies/${editItem.id}`, body);
-        else await api.post("/api/admin/proxies", body);
+        const row = editItem.id
+          ? await api.patch<Proxy>(`/api/admin/proxies/${editItem.id}`, body)
+          : await api.post<Proxy>("/api/admin/proxies", body);
         setEditItem(null);
-        load();
+        // 响应即权威整行，就地合并。编辑 body 不含 enabled、新建默认禁用，
+        // 故 enabledCount 无需调整。
+        upsertRow(row);
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "保存失败");
       }

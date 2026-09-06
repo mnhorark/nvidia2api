@@ -274,19 +274,48 @@ export default function DashboardPage() {
   // 界面停留在新筛选但显示旧区间的数据。
   const seqRef = useRef(0);
 
+  // usage 客户端缓存（按 range 键控，60s 内有效）：切换时间尺度是最频繁的
+  // 交互，命中即免请求直接渲染；后端指纹缓存只有 3s，挡不住“来回切”。
+  // 后端 usage 跨渠道全量汇总，与渠道无关，随 range 缓存不会串数据。
+  const usageCacheRef = useRef<Map<string, UsageResponse>>(new Map());
+  const USAGE_CACHE_TTL_MS = 60_000;
+
+  async function loadStats() {
+    const s = await api.get<DashboardStats>("/api/admin/dashboard");
+    setStats(s);
+    return s;
+  }
+
+  async function loadUsage(r: string): Promise<UsageResponse> {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone ?? "";
+    const usageQs = r === "5h"
+      ? `hours=5&tz=${encodeURIComponent(tz)}`
+      : `days=${r}&tz=${encodeURIComponent(tz)}`;
+    const u = await api.get<UsageResponse>(`/api/admin/dashboard/usage?${usageQs}`);
+    usageCacheRef.current.set(r, u);
+    return u;
+  }
+
   async function load(r = range) {
     const seq = ++seqRef.current;
     setLoading(true);
     setError("");
+    const cached = usageCacheRef.current.get(r);
+    if (cached) {
+      // 缓存命中：直接上屏，仍异步刷新 stats（运行指标实时性要求高），
+      // 并后台静默更新 usage（60s 窗口内的数据足够新鲜）。
+      setUsage(cached);
+      try {
+        await Promise.all([loadStats(), loadUsage(r)]);
+      } catch {
+        /* 缓存已上屏，后台刷新失败静默等待下一次轮询 */
+      } finally {
+        if (seq === seqRef.current) setLoading(false);
+      }
+      return;
+    }
     try {
-      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone ?? "";
-      const usageQs = r === "5h"
-        ? `hours=5&tz=${encodeURIComponent(tz)}`
-        : `days=${r}&tz=${encodeURIComponent(tz)}`;
-      const [s, u] = await Promise.all([
-        api.get<DashboardStats>("/api/admin/dashboard"),
-        api.get<UsageResponse>(`/api/admin/dashboard/usage?${usageQs}`),
-      ]);
+      const [s, u] = await Promise.all([loadStats(), loadUsage(r)]);
       if (seq !== seqRef.current) return; // 已有更新的请求发出，丢弃本次结果
       setStats(s);
       setUsage(u);
@@ -309,8 +338,7 @@ export default function DashboardPage() {
     const timer = window.setInterval(async () => {
       if (document.hidden) return;
       try {
-        const s = await api.get<DashboardStats>("/api/admin/dashboard");
-        setStats(s);
+        await loadStats();
       } catch {
         /* 静默，等待下一次轮询 */
       }

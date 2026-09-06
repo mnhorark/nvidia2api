@@ -98,6 +98,19 @@ export default function ChannelKeysPage() {
     setWindowSize(RENDER_WINDOW);
   }, [q]);
 
+  /** 就地写入/更新一行：PATCH/POST 的响应就是权威整行序列化。
+   *  单行操作重拉全表在千级 Key 下是 128KB + 全表扫描，纯浪费。
+   *  只有"服务端批量改写"（导入/批量/清理失效）才需要 load()。 */
+  function upsertRow(row: ChannelKey) {
+    setKeys((prev) => {
+      const idx = prev.findIndex((x) => x.id === row.id);
+      if (idx < 0) return [...prev, row];
+      const next = prev.slice();
+      next[idx] = row;
+      return next;
+    });
+  }
+
   async function doImport() {
     try {
       const res = await api.post<ImportResult>("/api/admin/keys/import", {
@@ -151,13 +164,11 @@ export default function ChannelKeysPage() {
       }
       if (editItem.rpm_limit != null) body.rpm_limit = editItem.rpm_limit;
       try {
-        if (editItem.id) {
-          await api.patch(`/api/admin/keys/${editItem.id}`, body);
-        } else {
-          await api.post("/api/admin/keys", body);
-        }
+        const row = editItem.id
+          ? await api.patch<ChannelKey>(`/api/admin/keys/${editItem.id}`, body)
+          : await api.post<ChannelKey>("/api/admin/keys", body);
         setEditItem(null);
-        load();
+        upsertRow(row);
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "保存失败");
       }
@@ -167,10 +178,10 @@ export default function ChannelKeysPage() {
   async function toggle(k: ChannelKey) {
     setBusyId(k.id);
     try {
-      await api.patch(`/api/admin/keys/${k.id}`, {
+      const row = await api.patch<ChannelKey>(`/api/admin/keys/${k.id}`, {
         enabled: !(k.enabled ?? k.status !== "disabled"),
       });
-      await load();
+      upsertRow(row);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "操作失败");
     } finally {
@@ -182,7 +193,13 @@ export default function ChannelKeysPage() {
     if (!confirm(`确认删除 ${k.name}？`)) return;
     try {
       await api.del(`/api/admin/keys/${k.id}`);
-      load();
+      // 204 无响应体，删除结果可本地推导：就地摘除
+      setKeys((prev) => prev.filter((x) => x.id !== k.id));
+      setSelected((prev) => {
+        const next = new Set(prev);
+        next.delete(k.id);
+        return next;
+      });
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "删除失败");
     }
@@ -193,7 +210,14 @@ export default function ChannelKeysPage() {
     try {
       await api.post(`/api/admin/keys/${k.id}/test`, {});
       toast.success(`${k.name} 测试完成`);
-      load();
+      // 测试会改写该 Key 的 status/计数（服务端判定，响应体里没有），
+      // 但影响面只有这一行：单行 GET 刷新，代替 128KB 全表重拉
+      try {
+        const fresh = await api.get<ChannelKey>(`/api/admin/keys/${k.id}`);
+        if (fresh && fresh.id) upsertRow(fresh);
+      } catch {
+        /* 单行刷新失败不影响测试结论本身，等待下一次手动刷新 */
+      }
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "测试失败");
     } finally {
