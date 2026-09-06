@@ -86,9 +86,9 @@ cp .env.example .env
 
 # 后端
 cd backend
-pip install -r requirements.txt
+pip install -r requirements.txt -r requirements-dev.txt   # 运行时与测试依赖已分离
 python manage.py migrate
-python -m pytest tests          # 337 个测试：导入/限流/代理限制/竞速/并发安全/思考强度/多渠道/额度/熔断/回归守卫/前端静态托管/心跳探测/R4 性能/R5 宽松判胜守卫/R10 上游错误详情
+python -m pytest tests          # 515 个测试：导入/限流/代理限制/竞速/并发安全/思考强度/多渠道/额度/熔断/回归守卫/前端静态托管/心跳探测/R4 性能/R5 宽松判胜守卫/R10 上游错误详情/单进程契约/错误信封/敏感操作审计
 python manage.py runserver 0.0.0.0:8000
 
 # 前端
@@ -161,6 +161,23 @@ print(resp.choices[0].message.content)
 ## 并发说明
 
 Key 的 RPM 计数使用 SQLite 条件更新（`UPDATE ... WHERE count < rpm_limit`）保证原子性，多线程下不会超限；项目预留了迁移 PostgreSQL/Redis 的结构空间。
+
+### ⚠️ 单进程契约（部署前必读）
+
+**本服务必须单进程运行**：不要 `uvicorn --workers N`，不要让多个容器实例挂同一个 `data/` 卷。
+
+原因不是"性能没优化"，而是**所有限流与保护状态都是进程内的**，多进程下它们不报错、只是静默失效：
+
+| 状态 | 多进程后果 |
+|---|---|
+| `max_concurrent_requests` 全局闸门 | 上限被乘以进程数 |
+| `max_concurrent_upstream` 上游连接阀门 | 同上，连接数保护消失 |
+| 管理端登录失败限速 | 爆破防护被稀释 |
+| `sysconfig` / `model_registry` 读缓存 | 写路径的信号失效只作用于本进程，跨进程最长陈旧 = TTL 3s |
+
+因此启动阶段会拿 `data/.gateway.lock` 的 OS 级文件锁做单实例检查，检测到第二个实例直接**拒绝启动**并在错误里给出持有者 PID。确需多进程（例如已把上述状态外置）时设置 `ALLOW_MULTI_PROCESS=true` 显式放行——后果自负，启动时会打一条警告日志。
+
+水平扩展的正确路径是：先把并发闸门与缓存搬到 Redis、SQLite 换 PostgreSQL，再谈多实例。
 
 ## 环境变量
 

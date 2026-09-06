@@ -2,13 +2,14 @@
 
 ## 定位
 
-NVIDIA2API 是面向 NVIDIA AI API 的聚合代理平台：
+NVIDIA2API 是**多通道（Channel）AI API 聚合网关**（项目名沿用自最初的 NVIDIA 单上游形态）：
 
-- 管理多个 NVIDIA API Key（40 RPM/Key 默认）、多协议代理（SOCKS5/HTTP/HTTPS）两者组成"线路池"
-
-- 对外暴露 OpenAI 兼容的 `/v1/models`、`/v1/chat/completions`
-
+- 每个渠道 = 一个 OpenAI 兼容上游端点 + 独立的 Key 池 / 代理池 / 模型表 / 运行参数
+- 管理多个上游 API Key（默认 40 RPM/Key）与多协议代理（SOCKS5/HTTP/HTTPS），两者组成"线路池"
+- 对外暴露三套兼容协议，且都支持 `/v1/*`（默认渠道）与 `/c/<slug>/v1/*`（指定渠道）双前缀：
+  OpenAI Chat Completions、OpenAI Responses、Anthropic Messages（含 `count_tokens`）
 - 核心能力：**多线路并发竞速 + 首个有效响应 Winner + 其余线路立即取消**
+- **单进程契约**：并发闸门、登录限速、运行参数缓存均为进程内状态，启动时用文件锁拒绝第二个实例（详见 README「并发说明」）
 
 ## 分层
 

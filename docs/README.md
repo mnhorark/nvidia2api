@@ -12,3 +12,4 @@
 | [frontend.md](frontend.md) | 前端页面结构、组件、状态与数据流 |
 | [deployment.md](deployment.md) | 环境变量、本地开发与 Docker 部署 |
 | [audit-2026-08.md](audit-2026-08.md) | 全面代码审查报告（2026-08）：问题分级清单、实证记录、回归测试与修复路线图 |
+| [architecture-review-2026-09.md](architecture-review-2026-09.md) | 架构全面审查（2026-09-05）：整体拓扑、逐模块评述、P0-P3 缺陷清单与建议执行顺序 |

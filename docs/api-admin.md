@@ -25,11 +25,20 @@ GET /api/admin/keys?channel=zen
 
 解析不到时回落到平台默认渠道。详见 [channels.md](channels.md)。
 
-统一错误格式（与 OpenAI 一致）：
+统一错误格式（与 OpenAI 一致，四键齐全）：
 
 ```json
-{"error": {"message": "…", "type": "api_error", "code": "…"}}
+{"error": {"message": "…", "type": "invalid_request_error", "param": "protocol", "code": "bad_request"}}
 ```
+
+自 2026-09-05 起，管理端**所有**错误都是这一种形态，包括 DRF 框架自己抛的
+序列化校验失败、405、404（此前并存 `{"detail": "…"}`、缺 `type`/`param` 的简版、
+以及 `{"error": "log_not_found"}` 这种 `error` 为字符串的离群写法）。
+`type` 由状态码推导（401→`authentication_error`、404→`not_found_error`、
+429→`rate_limit_error`、其余 4xx→`invalid_request_error`、5xx→`api_error`）。
+
+**兼容期**：经 DRF 异常处理器产生的响应会额外带一份同值的 `detail` 字段，
+供尚未更新的旧客户端读取；新代码一律读 `error.message`，该字段计划在下个大版本移除。
 
 ## 仪表盘
 
@@ -56,13 +65,25 @@ GET /api/admin/keys?channel=zen
 | GET | `/api/admin/keys` | 列表（默认脱敏） |
 | POST | `/api/admin/keys` | 新建 `{name, api_key, rpm_limit}` |
 | POST | `/api/admin/keys/import` | 批量导入 `{text}`，`name---key` 或每行一个 key |
-| GET | `/api/admin/keys/{id}?reveal=1` | 查看明文 Key |
+| GET | `/api/admin/keys/{id}?reveal=1` | 查看明文 Key（**会写敏感操作审计**，见下） |
 | PATCH | `/api/admin/keys/{id}` | `{name, rpm_limit, enabled}` |
 | DELETE | `/api/admin/keys/{id}` | 删除 |
 | POST | `/api/admin/keys/{id}/test` | 检测（走该渠道的 models 端点） |
+| POST | `/api/admin/keys/cleanup-invalid` | 批量清理 `status=invalid` 的 Key，返回删除条数 |
 
 import 返回 `{success, duplicate, invalid, failed, errors[]}`。
 旧路径 `/api/admin/nvidia-keys/*` 保留为别名。
+
+## 敏感操作审计
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/admin/audit/secret-access` | 明文回看等高权限动作的流水。默认**跨渠道**（安全取证要看全貌），支持 `?channel=<slug>`、`?action=reveal_key`、`?limit`（≤500）、`?offset` |
+
+返回 `{results:[{id, created_at, action, channel, target_id, target_name, remote_addr, forwarded_for, user_agent}], total, limit, offset, has_more}`。
+
+审计表只记**动作与来源**，绝不记录被回看的明文；写失败不影响本次请求（安全功能不得变成可用性故障）。
+之所以存在：管理面只有一个静态共享 `ADMIN_TOKEN`，无第二因子、无身份区分，事前拦不住泄漏，事后就必须能回答"什么时候、从哪个地址、看了哪把 Key"。
 
 ## 代理
 

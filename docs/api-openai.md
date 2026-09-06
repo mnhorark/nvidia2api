@@ -120,16 +120,25 @@ r = client.chat.completions.create(
 {"error": {"message": "…", "type": "api_error", "param": null, "code": "invalid_request"}}
 ```
 
-| HTTP | code |
-|---|---|
-| 400 | `invalid_request` |
-| 401 | `invalid_api_key` |
-| 402 | `insufficient_quota`（用户 Key 额度耗尽） |
-| 403 | `key_disabled` |
-| 404 | `model_not_found` |
-| 429 | `rate_limit_exceeded` / `server_overloaded` |
-| 502 | `upstream_error` |
-| 503 | `no_available_route` |
+| HTTP | code | 说明 |
+|---|---|---|
+| 400 | `invalid_request` | 缺 model/messages、JSON 非法、body 不是对象 |
+| 401 | `invalid_api_key` | 用户 Key 缺失或无效 |
+| 402 | `insufficient_quota` | 用户 Key token 额度耗尽 |
+| 403 | `key_disabled` | 用户 Key 被禁用 |
+| 404 | `model_not_found` | 模型不存在或未启用 |
+| 404 | `channel_not_found` | `/c/<slug>/` 指定了未知或已禁用的渠道 |
+| 405 | `method_not_allowed` | 非 POST |
+| 413 | `payload_too_large` | 请求体超过 `max_request_bytes` |
+| 429 | `rate_limit_exceeded` | 用户 Key 每分钟限流 |
+| 429 | `server_overloaded` | 触达全局 `max_concurrent_requests` |
+| 502 | `upstream_error` | 所有线路失败（上游故障形态） |
+| 502 | `upstream_content_rejected` | 全线路 400 但同通道最小无害探针可通过 → 判定为**请求内容命中上游内容策略/参数校验**，重试无意义 |
+| 503 | `no_available_route` | 该渠道没有可用 Key |
+
+流式请求无法用 HTTP 状态表达错误，改为在 SSE 流内下发一帧 `data: {"error": {...}}` 再跟 `data: [DONE]`。可能的 `code`：`no_available_route`、`stream_error`、`stream_truncated`（已出内容后中途断线）、`upstream_truncated`（未收到 `finish_reason`/`[DONE]` 的静默掐断）、`upstream_content_rejected`。
+
+**网关绝不伪造 `[DONE]` 把不完整响应伪装成成功**：截断一律显式报错，客户端（agent）据此判断是否需要整体重试。
 
 ## 调用示例
 
