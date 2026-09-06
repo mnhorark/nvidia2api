@@ -4,7 +4,7 @@ from django.test import TestCase
 from django.utils import timezone
 
 from apps.core.models import Channel, ChannelKey, Proxy, ProxyStatus
-from services import channel_service, proxy_service
+from services import channel_service, crypto, proxy_service
 
 
 def make_channel(slug="nvidia"):
@@ -262,3 +262,62 @@ class ProxyCheckerDecouplingTests(
         self.assertEqual(res["ip"], "1.2.3.4")
         p.refresh_from_db()
         self.assertEqual(p.public_ip, "1.2.3.4")
+
+
+class ProxySecretStorageTests(TestCase):
+    """代理密码必须加密落库（2026-09-05 审查发现的覆盖盲区）。
+
+    ChannelKey 侧早有等价守卫（test_regressions.Low4 + test_keys 的 hint 用例），
+    代理侧一直没人测：`Proxy.save()` 的加密、`encrypt_secret` 的幂等、
+    以及密文长度是否被列宽截断，全部处于未验证状态。
+    """
+
+    def _proxy(self, password="s3cret-pass", **kw):
+        ch = kw.pop("channel", None) or make_channel()
+        return Proxy.objects.create(channel=ch, name="p", protocol="socks5",
+                                    host="1.2.3.4", port=1080,
+                                    username="u", password=password, **kw)
+
+    def _raw(self, p):
+        """绕过实例属性，直接读库里的列。"""
+        return Proxy.objects.filter(pk=p.pk).values_list("password", flat=True).first()
+
+    def test_password_encrypted_at_rest(self):
+        p = self._proxy()
+        raw = self._raw(p)
+        self.assertTrue(raw.startswith("enc:v1:"))
+        self.assertNotIn("s3cret-pass", raw)
+        self.assertEqual(crypto.decrypt_secret(raw), "s3cret-pass")
+
+    def test_second_save_does_not_double_encrypt(self):
+        """幂等：从库里读出的实例（password 已是密文）再 save() 不得套第二层。
+
+        管理端 PATCH 就是这个形态——get() 出来改两个字段再 save()。
+        若密文被二次加密，代理鉴权会静默坏掉（解密得到的是内层密文）。
+        """
+        p = self._proxy()
+        p.name = "renamed"
+        p.save()
+        self.assertEqual(crypto.decrypt_secret(self._raw(p)), "s3cret-pass")
+
+    def test_long_password_survives_column_width(self):
+        """TextField 迁移（0022）的守卫：明文 270 字符 → 密文远超旧的 128 上限。
+
+        SQLite 不校验长度，所以这条在 SQLite 上恒绿；它真正守的是
+        PostgreSQL 迁移路径（AGENTS.md 第六十二节要求预留的结构）。
+        """
+        long_pw = "p@ssw0rd-" * 30
+        p = self._proxy(password=long_pw)
+        raw = self._raw(p)
+        self.assertGreater(len(raw), 128, "密文应远超旧 CharField 的 128 上限")
+        self.assertEqual(crypto.decrypt_secret(raw), long_pw)
+
+    def test_proxy_url_carries_decrypted_credentials(self):
+        p = self._proxy()
+        self.assertEqual(p.url, "socks5://u:s3cret-pass@1.2.3.4:1080")
+
+    def test_serializer_never_emits_real_password(self):
+        from api.serializers import ProxySerializer
+        data = ProxySerializer(self._proxy()).data
+        self.assertNotIn("s3cret-pass", str(dict(data)))
+        self.assertEqual(data["password"], "••••••")

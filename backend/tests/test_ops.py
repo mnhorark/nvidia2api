@@ -2,8 +2,10 @@
 import json
 import unittest
 from datetime import timedelta
+from io import StringIO
 from unittest.mock import patch
 
+from django.core.management import call_command
 from django.conf import settings
 from django.test import RequestFactory, TestCase
 from django.utils import timezone
@@ -621,3 +623,82 @@ class UpstreamBodyAndTokenTests(TestCase):
         msgs = [{"role": "user", "content": "hello world"}]
         self.assertGreater(tokenizer.estimate_messages_tokens(msgs),
                            tokenizer.estimate_tokens("hello world"))
+
+
+class EncryptSecretsBackfillTests(TestCase):
+    """存量明文敏感字段的补加密命令（manage.py encrypt_secrets）。
+
+    加密写在 save() 里，意味着**功能上线前的历史行永远是明文**，而读路径有
+    明文回落所以看不出问题——"敏感字段加密保存"因此是部分失效且无人察觉。
+    本组测试守的是补数路径本身。
+    """
+
+    def setUp(self):
+        from apps.core.models import ChannelKey, Proxy
+        self.Proxy = Proxy
+        self.ChannelKey = ChannelKey
+        self.a = Channel.objects.create(name="EA", slug="ea",
+                                        base_url="https://ea.test/v1")
+        self.b = Channel.objects.create(name="EB", slug="eb",
+                                        base_url="https://eb.test/v1")
+        # 明文行（模拟加密功能上线前的历史数据：直接绕过 save() 写库）
+        self.plain_key = ChannelKey.objects.create(
+            channel=self.a, name="legacy-key", api_key="nvapi-PLAINTEXT-1")
+        self.plain_proxy = Proxy.objects.create(
+            channel=self.a, name="legacy-proxy", protocol="socks5",
+            host="1.1.1.1", port=1080, username="u", password="plain-pass")
+        ChannelKey.objects.filter(pk=self.plain_key.pk).update(
+            api_key="nvapi-PLAINTEXT-1")
+        Proxy.objects.filter(pk=self.plain_proxy.pk).update(
+            password="plain-pass")
+        # 已是密文的行
+        self.enc_key = ChannelKey.objects.create(
+            channel=self.b, name="new-key", api_key="nvapi-ENCRYPTED-1")
+
+    def _raw(self, obj, field):
+        return type(obj).objects.filter(pk=obj.pk).values_list(
+            field, flat=True).first()
+
+    def _run(self, *args):
+        out = StringIO()
+        call_command("encrypt_secrets", *args, stdout=out)
+        return out.getvalue()
+
+    def test_dry_run_does_not_modify(self):
+        text = self._run()
+        self.assertIn("ChannelKey 1", text)
+        self.assertIn("Proxy.password 1", text)
+        self.assertFalse(self._raw(self.plain_key, "api_key").startswith("enc:v1:"))
+        self.assertFalse(self._raw(self.plain_proxy, "password").startswith("enc:v1:"))
+
+    def test_apply_encrypts_and_roundtrips(self):
+        self._run("--apply")
+        from services import crypto
+        key_raw = self._raw(self.plain_key, "api_key")
+        pw_raw = self._raw(self.plain_proxy, "password")
+        self.assertTrue(key_raw.startswith("enc:v1:"), key_raw[:12])
+        self.assertTrue(pw_raw.startswith("enc:v1:"), pw_raw[:12])
+        self.assertNotIn("nvapi-PLAINTEXT-1", key_raw)
+        self.assertEqual(crypto.decrypt_secret(key_raw), "nvapi-PLAINTEXT-1")
+        self.assertEqual(crypto.decrypt_secret(pw_raw), "plain-pass")
+
+    def test_already_encrypted_rows_untouched(self):
+        before = self._raw(self.enc_key, "api_key")
+        self._run("--apply")
+        self.assertEqual(self._raw(self.enc_key, "api_key"), before)
+
+    def test_idempotent_second_run_has_nothing_to_do(self):
+        self._run("--apply")
+        text = self._run()
+        self.assertIn("ChannelKey 0", text)
+        self.assertIn("Proxy.password 0", text)
+
+    def test_channel_scoping(self):
+        self._run("--apply", "--channel", "eb")
+        # 只处理 eb：ea 的明文行必须仍是明文
+        self.assertFalse(self._raw(self.plain_key, "api_key").startswith("enc:v1:"))
+
+    def test_unknown_channel_errors(self):
+        from django.core.management.base import CommandError
+        with self.assertRaises(CommandError):
+            self._run("--channel", "nope")

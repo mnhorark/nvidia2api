@@ -239,7 +239,11 @@ class Proxy(Timestamped):
     host = models.CharField(max_length=255)
     port = models.IntegerField()
     username = models.CharField(max_length=128, blank=True, default="")
-    password = models.CharField(max_length=128, blank=True, default="")
+    # **TextField 而非 CharField(max_length=128)**：本列存的是 Fernet 密文
+    # （≈明文 1.4× 再 base64 膨胀 + `enc:v1:` 前缀），128 上限对密文没有意义。
+    # SQLite 不校验长度所以现在无害，但同类问题在 ChannelKey.api_key 上已经
+    # 修过（迁移 0017），代理这条是漏的：迁到 PostgreSQL 会直接写入失败。
+    password = models.TextField(blank=True, default="")
     group = models.ForeignKey(
         ProxyGroup, null=True, blank=True, on_delete=models.SET_NULL, related_name="proxies"
     )
