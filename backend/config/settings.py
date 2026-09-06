@@ -134,6 +134,10 @@ DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+    # 管理端错误统一走 {"error": {message, type, param, code}} 信封
+    # （见 api/errors.py）。DRF 自身抛的校验/405/404 也经此转换，
+    # 否则同一个接口会混出 detail 与 error 两种形态，客户端无法稳定读消息。
+    "EXCEPTION_HANDLER": "api.errors.admin_exception_handler",
 }
 
 # all-in-one 镜像下前端由 Django 同源托管，本不需要 CORS。仅当外部站点需要

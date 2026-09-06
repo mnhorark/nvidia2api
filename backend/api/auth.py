@@ -2,14 +2,10 @@ import functools
 import hmac
 
 from django.conf import settings
-from django.http import JsonResponse
 
-
-def openai_error(message, code, status, type_="api_error"):
-    return JsonResponse(
-        {"error": {"message": message, "type": type_, "param": None, "code": code}},
-        status=status,
-    )
+# `openai_error` 的实现已并入 api/errors.py（统一错误信封）。这里保留同名
+# 导出，历史调用方 `from .auth import openai_error` 与既有测试无需改动。
+from .errors import openai_error  # noqa: F401  (re-export)
 
 
 def valid_admin_tokens() -> tuple[str, ...]:
@@ -37,7 +33,11 @@ def admin_required(view):
         auth = request.headers.get("Authorization", "")
         token = auth[6:].strip() if auth.lower().startswith("token ") else ""
         if not admin_token_matches(token):
-            return JsonResponse({"detail": "Authentication credentials were not provided."}, status=401)
+            # 与 DRF 侧同信封（api/errors.py）：本装饰器是纯 Django 层，
+            # 走不到 DRF 的 EXCEPTION_HANDLER，所以这里自己发信封。
+            return openai_error(
+                "Authentication credentials were not provided.",
+                "not_authenticated", 401, "authentication_error")
         return view(request, *args, **kwargs)
     return wrapper
 

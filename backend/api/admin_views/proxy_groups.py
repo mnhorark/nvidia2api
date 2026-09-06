@@ -42,9 +42,9 @@ class ProxyGroupListView(AdminRequiredMixin, APIView):
         channel = current_channel(request)
         name = (request.data.get('name') or '').strip()
         if not name:
-            return Response({'error': {'message': 'name required', 'code': 'bad_request'}}, status=400)
+            return admin_error('name required', 'bad_request', 400)
         if channel.proxy_groups.filter(name=name).exists():
-            return Response({'error': {'message': 'duplicate group', 'code': 'duplicate'}}, status=400)
+            return admin_error('duplicate group', 'duplicate', 400)
         g = ProxyGroup.objects.create(channel=channel, name=name, description=request.data.get('description', ''), country=request.data.get('country', ''), enabled=request.data.get('enabled', True))
         data = ProxyGroupSerializer(g).data
         data['proxy_count'] = 0
@@ -62,7 +62,7 @@ class ProxyGroupDetailView(AdminRequiredMixin, APIView):
     def patch(self, request, pk):
         g = self._get(pk)
         if not g:
-            return Response({'detail': 'not found'}, status=404)
+            return admin_error('not found', 'not_found', 404, 'not_found_error')
         for f in ('name', 'description', 'country', 'enabled'):
             if f in request.data:
                 setattr(g, f, request.data[f])
@@ -74,7 +74,7 @@ class ProxyGroupDetailView(AdminRequiredMixin, APIView):
     def delete(self, request, pk):
         g = self._get(pk)
         if not g:
-            return Response({'detail': 'not found'}, status=404)
+            return admin_error('not found', 'not_found', 404, 'not_found_error')
         Proxy.objects.filter(group=g).update(group=None)
         g.delete()
         return Response(status=204)

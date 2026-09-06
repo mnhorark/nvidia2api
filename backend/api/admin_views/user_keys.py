@@ -40,7 +40,7 @@ class UserApiKeyListView(AdminRequiredMixin, APIView):
     def post(self, request):
         name = (request.data.get('name') or '').strip()
         if not name:
-            return Response({'error': {'message': 'name required', 'code': 'bad_request'}}, status=400)
+            return admin_error('name required', 'bad_request', 400)
         rl_raw = request.data.get('rate_limit')
         rate_limit = _parse_int(rl_raw) if rl_raw not in (None, '') else 0
         if rate_limit is None:
@@ -66,7 +66,7 @@ class UserApiKeyDetailView(AdminRequiredMixin, APIView):
     def patch(self, request, pk):
         rec = self._get(pk)
         if not rec:
-            return Response({'detail': 'not found'}, status=404)
+            return admin_error('not found', 'not_found', 404, 'not_found_error')
         err = _apply_bool(request.data, 'enabled', rec)
         if err is not None:
             return err
@@ -88,6 +88,6 @@ class UserApiKeyDetailView(AdminRequiredMixin, APIView):
     def delete(self, request, pk):
         rec = self._get(pk)
         if not rec:
-            return Response({'detail': 'not found'}, status=404)
+            return admin_error('not found', 'not_found', 404, 'not_found_error')
         rec.delete()
         return Response(status=204)

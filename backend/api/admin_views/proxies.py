@@ -49,7 +49,7 @@ class ProxyListView(AdminRequiredMixin, APIView):
             ser.validated_data['name'] = f'代理 {channel.proxies.count() + 1:03d}'
         group = ser.validated_data.get('group')
         if group is not None and group.channel_id != channel.id:
-            return Response({'error': {'message': '分组不属于当前渠道', 'code': 'bad_request'}}, status=400)
+            return admin_error('分组不属于当前渠道', 'bad_request', 400)
         p = Proxy.objects.create(channel=channel, **ser.validated_data)
         return Response(ProxySerializer(p).data, status=201)
 
@@ -59,7 +59,7 @@ class ProxyImportView(AdminRequiredMixin, APIView):
     def post(self, request):
         text = request.data.get('text', '')
         if not text.strip():
-            return Response({'error': {'message': 'text required', 'code': 'bad_request'}}, status=400)
+            return admin_error('text required', 'bad_request', 400)
         return Response(proxy_service.bulk_import_proxies(text, current_channel(request)))
 
 
@@ -74,14 +74,14 @@ class ProxyDetailView(AdminRequiredMixin, APIView):
     def patch(self, request, pk):
         p = self._get(pk)
         if not p:
-            return Response({'detail': 'not found'}, status=404)
+            return admin_error('not found', 'not_found', 404, 'not_found_error')
         enabled, err = _require_bool(request.data, 'enabled')
         if err is not None:
             return err
         if enabled is not None:
             ok, msg = proxy_service.set_enabled(p, enabled)
             if not ok:
-                return Response({'error': {'message': msg, 'code': 'proxy_limit_exceeded'}}, status=400)
+                return admin_error(msg, 'proxy_limit_exceeded', 400)
         if 'group' in request.data:
             gid = request.data['group']
             if gid in (None, ''):
@@ -89,9 +89,9 @@ class ProxyDetailView(AdminRequiredMixin, APIView):
             else:
                 g = ProxyGroup.objects.filter(pk=gid).first()
                 if g is None:
-                    return Response({'error': {'message': '分组不存在', 'code': 'bad_request'}}, status=400)
+                    return admin_error('分组不存在', 'bad_request', 400)
                 if g.channel_id != p.channel_id:
-                    return Response({'error': {'message': '分组不属于该代理所在渠道', 'code': 'bad_request'}}, status=400)
+                    return admin_error('分组不属于该代理所在渠道', 'bad_request', 400)
                 p.group = g
         if 'port' in request.data:
             port, err = _require_int(request.data, 'port', minimum=1, maximum=65535)
@@ -107,7 +107,7 @@ class ProxyDetailView(AdminRequiredMixin, APIView):
     def delete(self, request, pk):
         p = self._get(pk)
         if not p:
-            return Response({'detail': 'not found'}, status=404)
+            return admin_error('not found', 'not_found', 404, 'not_found_error')
         p.delete()
         return Response(status=204)
 
@@ -118,7 +118,7 @@ class ProxyTestView(AdminRequiredMixin, APIView):
         try:
             p = Proxy.objects.get(pk=pk)
         except Proxy.DoesNotExist:
-            return Response({'detail': 'not found'}, status=404)
+            return admin_error('not found', 'not_found', 404, 'not_found_error')
         return Response(proxy_service.run_async(check_proxy(p)))
 
 
@@ -141,7 +141,7 @@ class ProxyBatchView(AdminRequiredMixin, APIView):
         ids = _parse_ids(request)
         action = request.data.get('action')
         if not ids or action not in ('enable', 'disable', 'delete', 'test', 'group'):
-            return Response({'error': {'message': 'ids 与合法 action 必填', 'code': 'bad_request'}}, status=400)
+            return admin_error('ids 与合法 action 必填', 'bad_request', 400)
         qs = list(channel.proxies.filter(id__in=ids))
         if action == 'delete':
             channel.proxies.filter(id__in=ids).delete()
@@ -157,10 +157,10 @@ class ProxyBatchView(AdminRequiredMixin, APIView):
             try:
                 gid = int(gid)
             except (TypeError, ValueError):
-                return Response({'error': {'message': 'group_id 非法', 'code': 'bad_request'}}, status=400)
+                return admin_error('group_id 非法', 'bad_request', 400)
             group = channel.proxy_groups.filter(pk=gid).first()
             if not group:
-                return Response({'error': {'message': '分组不存在', 'code': 'not_found'}}, status=404)
+                return admin_error('分组不存在', 'not_found', 404)
             channel.proxies.filter(id__in=ids).update(group=group)
             return Response({'matched': len(qs), 'action': action, 'succeeded': len(qs), 'group_id': gid})
         done, skipped = (0, [])

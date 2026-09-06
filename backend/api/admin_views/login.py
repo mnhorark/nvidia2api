@@ -47,5 +47,7 @@ class LoginView(APIView):
             tokens = valid_admin_tokens()
             return Response({'token': tokens[0] if tokens else ''})
         if _login_fail_exceeded(_login_client_key(request)):
-            return Response({'detail': 'Too many failed attempts, try again later'}, status=429)
-        return Response({'detail': 'Invalid credentials'}, status=401)
+            return admin_error('Too many failed attempts, try again later', 'too_many_login_attempts',
+                  429, 'rate_limit_error')
+        return admin_error('Invalid credentials', 'invalid_credentials', 401,
+              'authentication_error')

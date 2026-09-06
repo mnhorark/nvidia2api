@@ -50,10 +50,10 @@ class AdminChatView(AdminRequiredMixin, APIView):
         if prompt and (not messages):
             messages = [{'role': 'user', 'content': str(prompt)}]
         if not model or not messages:
-            return Response({'error': {'message': 'model and prompt/messages required', 'code': 'bad_request'}}, status=400)
+            return admin_error('model and prompt/messages required', 'bad_request', 400)
         model_rec = channel.models.filter(model_name=model).first()
         if not model_rec or not model_rec.enabled:
-            return Response({'error': {'message': f'模型 {model} 不存在或未启用', 'code': 'model_not_found'}}, status=404)
+            return admin_error(f'模型 {model} 不存在或未启用', 'model_not_found', 404)
         body = {k: v for k, v in request.data.items() if k in self.ALLOWED and k not in thinking.THINKING_PARAM_KEYS and (v is not None)}
         body['model'] = model
         body['messages'] = messages
@@ -74,7 +74,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
         if not routes:
             log.status, log.http_status, log.error_type = ('failed', 503, 'no_available_route')
             log.save()
-            return Response({'error': {'message': '当前没有可用线路（没有可用的渠道 Key）', 'code': 'no_available_route'}}, status=503)
+            return admin_error('当前没有可用线路（没有可用的渠道 Key）', 'no_available_route', 503)
         import time
         t0 = time.monotonic()
         try:
@@ -84,12 +84,15 @@ class AdminChatView(AdminRequiredMixin, APIView):
             log.http_status = 502
             log.routes = exc.report
             log.save()
-            return Response({'error': {'message': f'所有线路均失败: {exc}', 'code': 'upstream_error'}, 'routes': exc.report}, status=502)
+            # 竞速明细是 playground 的展示数据，挂在信封同级（error 之外）
+            resp = admin_error(f'所有线路均失败: {exc}', 'upstream_error', 502)
+            resp.data['routes'] = exc.report
+            return resp
         except NoRouteAvailable:
             log.status, log.error_type = ('failed', 'no_available_route')
             log.http_status = 503
             log.save()
-            return Response({'error': {'message': '当前没有可用线路', 'code': 'no_available_route'}}, status=503)
+            return admin_error('当前没有可用线路', 'no_available_route', 503)
         duration = round((time.monotonic() - t0) * 1000, 1)
         r = result.route
         usage = (result.payload or {}).get('usage') or {}
@@ -142,7 +145,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
         if not routes:
             log.status, log.http_status, log.error_type = ('failed', 503, 'no_available_route')
             log.save()
-            return Response({'error': {'message': '当前没有可用线路', 'code': 'no_available_route'}}, status=503)
+            return admin_error('当前没有可用线路', 'no_available_route', 503)
         import time as _time
         started = _time.monotonic()
         idle_timeout = float(sysconfig.get('stream_idle_timeout', channel) or 0)

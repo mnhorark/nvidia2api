@@ -63,16 +63,16 @@ class ChannelListView(AdminRequiredMixin, APIView):
     def post(self, request):
         name = (request.data.get('name') or '').strip()
         if not name:
-            return Response({'error': {'message': 'name required', 'code': 'bad_request'}}, status=400)
+            return admin_error('name required', 'bad_request', 400)
         rpm, err = _require_int(request.data, 'default_rpm', minimum=0)
         if err:
             return err
         slug = (request.data.get('slug') or '').strip() or _slugify(name)
         if Channel.objects.filter(slug=slug).exists():
-            return Response({'error': {'message': f'渠道标识 {slug} 已存在', 'code': 'duplicate'}}, status=400)
+            return admin_error(f'渠道标识 {slug} 已存在', 'duplicate', 400)
         base_url = (request.data.get('base_url') or '').strip()
         if not base_url:
-            return Response({'error': {'message': 'base_url required', 'code': 'bad_request'}}, status=400)
+            return admin_error('base_url required', 'bad_request', 400)
         make_default, err = _require_bool(request.data, 'is_default')
         if err:
             return err
@@ -105,7 +105,7 @@ class ChannelDetailView(AdminRequiredMixin, APIView):
     def patch(self, request, pk):
         channel = self._get(pk)
         if not channel:
-            return Response({'detail': 'not found'}, status=404)
+            return admin_error('not found', 'not_found', 404, 'not_found_error')
         for f in ('name', 'base_url', 'chat_path', 'models_path', 'key_prefix', 'auth_scheme', 'notes'):
             if f in request.data:
                 setattr(channel, f, (request.data[f] or '').strip() if isinstance(request.data[f], str) else request.data[f])
@@ -137,9 +137,9 @@ class ChannelDetailView(AdminRequiredMixin, APIView):
     def delete(self, request, pk):
         channel = self._get(pk)
         if not channel:
-            return Response({'detail': 'not found'}, status=404)
+            return admin_error('not found', 'not_found', 404, 'not_found_error')
         if channel.is_default and Channel.objects.count() == 1:
-            return Response({'error': {'message': '至少保留一个渠道', 'code': 'last_channel'}}, status=400)
+            return admin_error('至少保留一个渠道', 'last_channel', 400)
         channel.delete()
         channel_service.ensure_default_channel()
         return Response(status=204)
@@ -151,5 +151,5 @@ class ChannelTestView(AdminRequiredMixin, APIView):
         try:
             channel = Channel.objects.get(pk=pk)
         except Channel.DoesNotExist:
-            return Response({'detail': 'not found'}, status=404)
+            return admin_error('not found', 'not_found', 404, 'not_found_error')
         return Response(channel_service.test_channel(channel))

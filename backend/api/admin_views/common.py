@@ -26,6 +26,7 @@ from services import (
 from services.proxy_checker import check_all, check_proxy
 
 from ..auth import AdminRequiredMixin
+from ..errors import admin_error
 
 def current_channel(request) -> Channel:
     return channel_service.resolve_from_request(request)
@@ -42,10 +43,12 @@ def _parse_int(value):
         return None
 
 def _bad_param(name: str) -> Response:
-    return Response({'error': {'message': f'参数 {name} 必须是整数', 'code': 'bad_request'}}, status=400)
+    return admin_error(f'参数 {name} 必须是整数', 'bad_request', 400,
+                       'invalid_request_error', param=name)
 
 def _bad_bool(name: str) -> Response:
-    return Response({'error': {'message': f'参数 {name} 必须是布尔值', 'code': 'bad_request'}}, status=400)
+    return admin_error(f'参数 {name} 必须是布尔值', 'bad_request', 400,
+                       'invalid_request_error', param=name)
 
 _TRUE_LITERALS = {'1', 'true', 'yes', 'on'}
 
@@ -96,9 +99,9 @@ def _require_int(data: dict, name: str, *, minimum: int | None=None, maximum: in
     if parsed is None:
         return (None, _bad_param(name))
     if minimum is not None and parsed < minimum:
-        return (None, Response({'error': {'message': f'参数 {name} 不能小于 {minimum}', 'code': 'bad_request'}}, status=400))
+        return (None, admin_error(f'参数 {name} 不能小于 {minimum}', 'bad_request', 400))
     if maximum is not None and parsed > maximum:
-        return (None, Response({'error': {'message': f'参数 {name} 不能大于 {maximum}', 'code': 'bad_request'}}, status=400))
+        return (None, admin_error(f'参数 {name} 不能大于 {maximum}', 'bad_request', 400))
     return (parsed, None)
 
 _LOGIN_FAIL_LIMIT = 10
@@ -162,6 +165,9 @@ def _normalize_aliases(value) -> list[str]:
 
 __all__ = [
     'current_channel',
+    # 统一错误信封：各资源视图靠 `from .common import *` 拿到它，
+    # 必须显式列进 __all__（本模块有 __all__，star import 只认这里列的）
+    'admin_error',
     '_parse_int',
     '_bad_param',
     '_bad_bool',

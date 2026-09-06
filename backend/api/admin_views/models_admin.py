@@ -45,7 +45,7 @@ class ModelListView(AdminRequiredMixin, APIView):
         channel = current_channel(request)
         name = (request.data.get('model_name') or '').strip()
         if not name:
-            return Response({'error': {'message': 'model_name required', 'code': 'bad_request'}}, status=400)
+            return admin_error('model_name required', 'bad_request', 400)
         enabled = _parse_bool(request.data.get('enabled', False))
         if enabled is None:
             return _bad_bool('enabled')
@@ -89,7 +89,7 @@ class ModelSyncView(AdminRequiredMixin, APIView):
             msg = str(exc)
             code = 'no_available_key' if msg == 'no_available_key' else 'upstream_error'
             status = 503 if code == 'no_available_key' else 502
-            return Response({'error': {'message': msg, 'code': code}}, status=status)
+            return admin_error(msg, code, status)
 
 
 class ModelDetailView(AdminRequiredMixin, APIView):
@@ -103,7 +103,7 @@ class ModelDetailView(AdminRequiredMixin, APIView):
     def patch(self, request, pk):
         rec = self._get(pk)
         if not rec:
-            return Response({'detail': 'not found'}, status=404)
+            return admin_error('not found', 'not_found', 404, 'not_found_error')
         if 'aliases' in request.data:
             rec.aliases = _normalize_aliases(request.data['aliases'])
         if 'route_priority' in request.data:
@@ -136,7 +136,7 @@ class ModelDetailView(AdminRequiredMixin, APIView):
     def delete(self, request, pk):
         rec = self._get(pk)
         if not rec:
-            return Response({'detail': 'not found'}, status=404)
+            return admin_error('not found', 'not_found', 404, 'not_found_error')
         rec.delete()
         return Response(status=204)
 
@@ -149,7 +149,7 @@ class ModelBatchView(AdminRequiredMixin, APIView):
         ids = _parse_ids(request)
         action = request.data.get('action')
         if not ids or action not in ('enable', 'disable', 'delete'):
-            return Response({'error': {'message': 'ids 与合法 action 必填', 'code': 'bad_request'}}, status=400)
+            return admin_error('ids 与合法 action 必填', 'bad_request', 400)
         qs = channel.models.filter(id__in=ids)
         matched = qs.count()
         if action == 'delete':

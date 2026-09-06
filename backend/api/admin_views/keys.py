@@ -50,7 +50,7 @@ class ChannelKeyListView(AdminRequiredMixin, APIView):
             name = f'{channel.name} Key {channel.keys.count() + 1:03d}'
         allow_dup = bool(getattr(channel, 'allow_duplicate_keys', False))
         if key and (not allow_dup) and key_service._key_stored_in_channel(channel, key):
-            return Response({'error': {'message': 'duplicate key', 'code': 'duplicate'}}, status=400)
+            return admin_error('duplicate key', 'duplicate', 400)
         rec = ChannelKey.objects.create(channel=channel, name=name, api_key=key, rpm_limit=rpm)
         return Response(ChannelKeySerializer(rec).data, status=201)
 
@@ -60,7 +60,7 @@ class ChannelKeyImportView(AdminRequiredMixin, APIView):
     def post(self, request):
         text = request.data.get('text', '')
         if not text.strip():
-            return Response({'error': {'message': 'text required', 'code': 'bad_request'}}, status=400)
+            return admin_error('text required', 'bad_request', 400)
         return Response(key_service.bulk_import_keys(text, current_channel(request)))
 
 
@@ -75,7 +75,7 @@ class ChannelKeyDetailView(AdminRequiredMixin, APIView):
     def get(self, request, pk):
         rec = self._get(pk)
         if not rec:
-            return Response({'detail': 'not found'}, status=404)
+            return admin_error('not found', 'not_found', 404, 'not_found_error')
         data = ChannelKeySerializer(rec).data
         if request.query_params.get('reveal') == '1':
             from services.crypto import decrypt_secret
@@ -85,7 +85,7 @@ class ChannelKeyDetailView(AdminRequiredMixin, APIView):
     def patch(self, request, pk):
         rec = self._get(pk)
         if not rec:
-            return Response({'detail': 'not found'}, status=404)
+            return admin_error('not found', 'not_found', 404, 'not_found_error')
         name = request.data.get('name')
         if name:
             rec.name = name.strip()
@@ -107,7 +107,7 @@ class ChannelKeyDetailView(AdminRequiredMixin, APIView):
     def delete(self, request, pk):
         rec = self._get(pk)
         if not rec:
-            return Response({'detail': 'not found'}, status=404)
+            return admin_error('not found', 'not_found', 404, 'not_found_error')
         rec.delete()
         return Response(status=204)
 
@@ -118,7 +118,7 @@ class ChannelKeyTestView(AdminRequiredMixin, APIView):
         try:
             rec = ChannelKey.objects.get(pk=pk)
         except ChannelKey.DoesNotExist:
-            return Response({'detail': 'not found'}, status=404)
+            return admin_error('not found', 'not_found', 404, 'not_found_error')
         return Response(key_service.test_key(rec))
 
 
@@ -130,7 +130,7 @@ class KeyBatchView(AdminRequiredMixin, APIView):
         ids = _parse_ids(request)
         action = request.data.get('action')
         if not ids or action not in ('enable', 'disable', 'delete', 'test', 'set_rpm'):
-            return Response({'error': {'message': 'ids 与合法 action 必填', 'code': 'bad_request'}}, status=400)
+            return admin_error('ids 与合法 action 必填', 'bad_request', 400)
         qs = list(channel.keys.filter(id__in=ids))
         if action == 'delete':
             channel.keys.filter(id__in=ids).delete()

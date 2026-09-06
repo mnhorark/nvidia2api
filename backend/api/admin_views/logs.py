@@ -66,7 +66,7 @@ class LogDetailView(AdminRequiredMixin, APIView):
         channel = current_channel(request)
         log = channel.logs.filter(pk=pk).first()
         if log is None:
-            return Response({'error': 'log_not_found'}, status=404)
+            return admin_error('log not found', 'log_not_found', 404, 'not_found_error')
         return Response(RequestLogSerializer(log).data)
 
 

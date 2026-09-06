@@ -45,7 +45,8 @@ class SettingsView(AdminRequiredMixin, APIView):
         if not isinstance(updates, dict):
             key = request.data.get('key')
             if not key:
-                return Response({'detail': 'settings or key required'}, status=400)
+                return admin_error('settings or key required', 'bad_request', 400,
+                           'invalid_request_error')
             updates = {key: request.data.get('value')}
         sysconfig.set_params(updates, channel)
         return Response({'channel': channel.slug, 'settings': sysconfig.all_params(channel)})
