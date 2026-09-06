@@ -1,13 +1,33 @@
-Django>=5.0
-djangorestframework>=3.15
-django-cors-headers>=4.0
-django-filter>=24.0
-httpx[socks]>=0.27
-httpx-socks>=0.10
-curl-cffi>=0.10
-socksio>=1.0
-cryptography>=42.0
-pydantic>=2.0
-uvicorn>=0.29
-pytest>=8.0
-pytest-django>=4.7
+# nvidia2api 运行时依赖
+#
+# 为什么每个包都带**上界**：本项目对依赖的敏感度远高于一般 Web 应用——
+#   cryptography  决定 Fernet 密文格式。`ChannelKey.api_key` / `Proxy.password`
+#                 的存量密文一旦因大版本行为变化无法解密，等于上游 Key 全丢；
+#   httpx         决定流式读取与代理连接语义（race_engine 的 read=None、
+#                 AsyncClient 手工 __aenter__/__aexit__ 生命周期全押在它上面）；
+#   Django        决定 ORM 条件 UPDATE、信号失效路径与 ASGI 线程池行为。
+# 全 `>=` 意味着任何一次 `docker build` 都可能拉到未验证的新版本，
+# 生产构建不可复现。上界按"当前实测通过版本所在大版本"设定；
+# 升级时显式放开并跑全量测试（`cd backend && python -m pytest -q`）。
+#
+# 下界保持历史值（不破坏既有部署），上界收敛到实测大版本。
+# 实测通过：Windows / Python 3.14 与 CI / Python 3.12。
+#
+# 测试依赖（pytest / pytest-django）已移到 requirements-dev.txt——
+# 它们原先混在这里，被 Dockerfile 一并装进了生产镜像。
+
+Django>=5.0,<7.0                 # 实测 6.1
+djangorestframework>=3.15,<4.0   # 实测 3.18.0
+django-cors-headers>=4.0,<5.0    # 实测 4.9.0
+django-filter>=24.0,<27.0        # 实测 26.1
+httpx[socks]>=0.27,<0.29         # 实测 0.28.1（0.28 改过 proxy 参数语义）
+httpx-socks>=0.10,<0.14          # 实测 0.13.1（SOCKS5 支持）
+curl-cffi>=0.10,<0.15            # 实测 0.14.0（Cloudflare/TLS 指纹回落）
+socksio>=1.0,<2.0                # 实测 1.0.0
+cryptography>=42.0,<49.0         # 实测 48.0.1（Fernet 存量密文兼容性）
+pydantic>=2.0,<3.0               # 实测 2.12.5
+uvicorn>=0.29,<0.43              # 实测 0.42.0（ASGI，单进程假设见 README）
+# Token 估算兜底：上游省略 usage 时用于记账与额度结算。未安装时
+# services/tokenizer.py 回落启发式估算（CJK 1/字、ascii /4），但估算口径
+# 与真实分词的系统性偏差直接影响额度公平性，因此从"隐式可选"提为正式依赖。
+tiktoken>=0.12,<0.14             # 实测 0.13.0

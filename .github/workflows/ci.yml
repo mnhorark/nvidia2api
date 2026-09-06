@@ -24,8 +24,11 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: backend/requirements.txt
-      - run: pip install -r requirements.txt
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+      # 测试依赖独立成 requirements-dev.txt：生产镜像只装运行时依赖
+      - run: pip install -r requirements.txt -r requirements-dev.txt
       # 测试库走 --keepdb 之外的路径：这里始终从零建库，避免本地残留掩盖迁移问题
       - run: python manage.py migrate
       - run: python -m pytest tests -q

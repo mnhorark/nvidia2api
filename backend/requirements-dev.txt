@@ -1,0 +1,11 @@
+# 开发/测试依赖（不进生产镜像）
+#
+# 原先 pytest / pytest-django 写在 requirements.txt 里，被 Dockerfile 一并
+# 装进了生产运行时——测试工具不应存在于生产镜像（多一层攻击面与升级面）。
+# 安装：pip install -r requirements.txt -r requirements-dev.txt
+# CI 与本地开发用这个；生产镜像只装 requirements.txt。
+
+-r requirements.txt
+
+pytest>=8.0,<9.0          # 实测 8.4.2
+pytest-django>=4.7,<5.0   # 实测 4.14.0
