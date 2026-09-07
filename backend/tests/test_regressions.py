@@ -1845,3 +1845,439 @@ class ContentRejectionProbeTests(IsolatedAsyncioTestCase):
         self.assertFalse(getattr(exc, "content_rejected", False))
         exc.content_rejected = True
         self.assertTrue(exc.content_rejected)
+
+
+class R14_RpmClaimUnavailableTests(TestCase):
+    """B6：RPM 领取的"数据库判不出来"绝不能伪装成"这个 Key 配额耗尽"。
+
+    旧实现 `except Exception: return False`，于是 SQLite 写争用期间
+    `build_routes` 看每一把 Key 都像被限流，整批 continue 后返回空线路
+    → `no_available_route` → 503，而日志里与真实限流一模一样，
+    排查会被引向"配额配错了"。（实测：在跑着网关的库上并发写即触发。）
+    """
+
+    def setUp(self):
+        self.ch = Channel.objects.create(name="r14", slug="r14",
+                                         base_url="https://up.test/v1")
+        self.keys = [ChannelKey.objects.create(
+            channel=self.ch, name=f"k{i}", api_key=f"nvapi-{i}", rpm_limit=40)
+            for i in range(3)]
+
+    def test_db_error_raises_instead_of_faking_exhaustion(self):
+        from unittest.mock import patch
+
+        from services import key_service
+        from services.key_service import RpmClaimUnavailable
+
+        with patch("services.key_service.ChannelKey.objects") as objs:
+            objs.filter.side_effect = Exception("database is locked")
+            with self.assertRaises(RpmClaimUnavailable):
+                key_service.claim_rpm_slot(self.keys[0].id)
+
+    def test_genuine_exhaustion_still_returns_false_not_raises(self):
+        """反向守卫：真的耗尽必须仍是 False，不能把所有拒绝都升级成异常。"""
+        from services import key_service
+
+        for _ in range(40):
+            self.assertTrue(key_service.claim_rpm_slot(self.keys[0].id))
+        self.assertFalse(key_service.claim_rpm_slot(self.keys[0].id))
+
+    def test_build_routes_stops_instead_of_masking_as_no_keys(self):
+        """DB 争用时 build_routes 提前结束并留痕，而不是静默返回空列表。"""
+        from unittest.mock import patch
+
+        from services import key_service, load_balancer
+        from services.key_service import RpmClaimUnavailable
+
+        def boom(key_id):
+            raise RpmClaimUnavailable("database is locked")
+
+        with patch.object(key_service, "claim_rpm_slot", side_effect=boom), \
+                patch.object(load_balancer, "logger") as lg:
+            routes = load_balancer.build_routes(self.ch)
+
+        self.assertEqual(routes, [])
+        self.assertTrue(
+            any("数据库争用" in str(c.args) for c in lg.warning.call_args_list),
+            "DB 争用必须留下可区分于'配额耗尽'的日志")
+
+
+class R16_NonStreamRetryExcludesDeadRoutes(TestCase):
+    """B2：非流式重试必须排除上一轮判死的 Key+代理组合。
+
+    流式路径一直传 `exclude` / `exclude_proxies`，非流式路径此前**没传**——
+    于是 `retry_count>0` 时第二轮 `build_routes` 很可能又抽回同一条死线路，
+    重试等于白跑一轮，还多烧一次 RPM。`load_balancer.build_routes` 的
+    docstring 明说这两个参数就是为此存在的。
+    """
+
+    def setUp(self):
+        self.ch = Channel.objects.create(name="r16", slug="r16",
+                                         base_url="https://up.test/v1")
+        self.key = ChannelKey.objects.create(channel=self.ch, name="k0",
+                                             api_key="nvapi-r16", rpm_limit=40)
+        AIModel.objects.create(channel=self.ch, model_name="m", enabled=True)
+        self.user_key, self.raw = api_key_service.create_key("r16-user")
+
+    def test_second_attempt_receives_exclusion_sets(self):
+        from unittest.mock import patch
+
+        from api import openai_views
+        from services.load_balancer import Route
+        from services.race_engine import AllRoutesFailed
+
+        route = Route(kind="direct", key=self.key, claimed=True)
+        calls: list[dict] = []
+
+        def fake_build(channel=None, **kw):
+            calls.append(kw)
+            return [route]
+
+        def fake_race(routes, body):
+            raise AllRoutesFailed(["k0:boom"], [
+                {"name": route.name, "status": "failed", "error": "boom"}])
+
+        original_get = openai_views.sysconfig.get
+
+        def fake_get(key, channel=None):
+            if key == "retry_count":
+                return 1
+            return original_get(key, channel)
+
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        with patch.object(openai_views, "build_routes", side_effect=fake_build), \
+                patch.object(openai_views, "race_chat", side_effect=fake_race), \
+                patch.object(openai_views.sysconfig, "get", fake_get):
+            resp = openai_views._run_authed(self.user_key, body, "r16", "chat")
+
+        self.assertEqual(resp.status_code, 502)
+        self.assertEqual(len(calls), 2, f"应重试一次，实际 build_routes 调用 {len(calls)} 次")
+        # 首轮无排除；第二轮必须带上首轮判死的那个组合
+        self.assertIsNone(calls[0].get("exclude"))
+        second = calls[1]
+        self.assertEqual(second.get("exclude"), {(self.key.id, None)},
+                         "非流式重试没把上一轮死线路传进 exclude —— B2 回归")
+
+    def test_content_rejected_still_short_circuits(self):
+        """反向守卫：内容被拒是确定性失败，加了排除集也不该重试。"""
+        from unittest.mock import patch
+
+        from api import openai_views
+        from services.load_balancer import Route
+        from services.race_engine import AllRoutesFailed
+
+        route = Route(kind="direct", key=self.key, claimed=True)
+        calls: list[dict] = []
+
+        def fake_build(channel=None, **kw):
+            calls.append(kw)
+            return [route]
+
+        def fake_race(routes, body):
+            exc = AllRoutesFailed(["k0:400"], [
+                {"name": route.name, "status": "failed", "error": "http_400"}])
+            exc.content_rejected = True
+            raise exc
+
+        original_get = openai_views.sysconfig.get
+
+        def fake_get(key, channel=None):
+            if key == "retry_count":
+                return 1
+            return original_get(key, channel)
+
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        with patch.object(openai_views, "build_routes", side_effect=fake_build), \
+                patch.object(openai_views, "race_chat", side_effect=fake_race), \
+                patch.object(openai_views.sysconfig, "get", fake_get):
+            resp = openai_views._run_authed(self.user_key, body, "r16", "chat")
+
+        self.assertEqual(len(calls), 1, "内容被拒不该再重试一轮")
+        self.assertEqual(json.loads(resp.content)["error"]["code"],
+                         "upstream_content_rejected")
+
+
+class R17_NonStreamForceSettleTests(TestCase):
+    """B5：非流式路径的异常逃逸绝不能留下 pending 行与悬空额度预占。
+
+    流式的 finally 会强制 settle，非流式此前只释放信号量与上游额度。
+    于是 `RequestLog.objects.create` 之后、`_finish_log` 之前抛出的任何未捕获
+    异常都会同时留下：一行永久 pending 的日志（实测库里 630 条、最早 9 天前，
+    而成功率与平均延迟的分母都含 pending），和一份永久悬空的 claim_quota
+    预占（used_quota 白 +1）。
+    """
+
+    def setUp(self):
+        self.factory = RequestFactory()
+        self.ch = Channel.objects.create(name="r17", slug="r17",
+                                         base_url="https://up.test/v1")
+        self.key = ChannelKey.objects.create(channel=self.ch, name="k0",
+                                             api_key="nvapi-r17", rpm_limit=40)
+        AIModel.objects.create(channel=self.ch, model_name="m", enabled=True)
+        self.user_key, self.raw = api_key_service.create_key("r17-user", quota=1000)
+
+    def _post_with_boom(self):
+        """走**视图**而不是直接调 `_run_authed`：额度预占现在发生在视图里的
+        `_reserve_quota`，绕过视图就等于绕过被测的预占本身，断言会空转。"""
+        from unittest.mock import patch
+
+        from api import openai_views
+
+        def boom(*a, **kw):
+            raise RuntimeError("模拟未捕获异常（例如数据面改 async 后 asyncio.run 必抛）")
+
+        with patch.object(openai_views, "race_chat", side_effect=boom):
+            with self.assertRaises(RuntimeError):
+                openai_views.chat_completions(
+                    self.factory.post("/v1/chat/completions",
+                                      data=json.dumps({"model": "m", "messages": [
+                                          {"role": "user", "content": "hi"}]}),
+                                      content_type="application/json",
+                                      HTTP_AUTHORIZATION=f"Bearer {self.raw}"))
+
+    def test_unhandled_exception_leaves_no_pending_row(self):
+        self._post_with_boom()
+        rows = list(RequestLog.objects.filter(channel=self.ch))
+        self.assertEqual(len(rows), 1, f"应恰好一条日志，实际 {len(rows)}")
+        self.assertEqual(
+            rows[0].status, "failed",
+            "异常逃逸留下了永久 pending 行 —— B5 回归")
+        self.assertEqual(rows[0].error_type, "unhandled_error")
+
+    def test_unhandled_exception_refunds_reservation(self):
+        # 前置断言：预占确实发生过，否则这条守卫会空转
+        self.user_key.refresh_from_db()
+        self._post_with_boom()
+        self.user_key.refresh_from_db()
+        self.assertEqual(
+            self.user_key.used_quota, 0,
+            f"额度预占未退还（used_quota={self.user_key.used_quota}）—— B5 回归")
+
+    def test_normal_failure_path_is_not_double_refunded(self):
+        """反向守卫：兜底不得在已结算的正常路径上重复退款/重复写日志。"""
+        from unittest.mock import patch
+
+        from api import openai_views
+        from services.race_engine import AllRoutesFailed
+
+        def fail(routes, body):
+            raise AllRoutesFailed(["k0:boom"], [{"name": "direct:k0",
+                                                 "status": "failed"}])
+
+        with patch.object(openai_views, "race_chat", side_effect=fail):
+            resp = openai_views.chat_completions(
+                self.factory.post("/v1/chat/completions",
+                                  data=json.dumps({"model": "m", "messages": [
+                                      {"role": "user", "content": "hi"}]}),
+                                  content_type="application/json",
+                                  HTTP_AUTHORIZATION=f"Bearer {self.raw}"))
+
+        self.assertEqual(resp.status_code, 502)
+        # 预占确实发生过（否则"没重复退款"这个断言是空的）
+        self.user_key.refresh_from_db()
+        self.assertEqual(self.user_key.used_quota, 0)
+        self.user_key.refresh_from_db()
+        self.assertEqual(self.user_key.used_quota, 0)
+        rows = list(RequestLog.objects.filter(channel=self.ch))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, "failed")
+        # record_result 只该记一次（成功+失败计数总和 == 1）
+        self.assertEqual(self.user_key.failed_requests, 1)
+        self.assertEqual(self.user_key.success_requests, 0)
+
+
+class R18_FallbackSettleBeforeLogTests(TestCase):
+    """F1（code-review I1）：兜底结算绝不能因引用未绑定的 `started` 而自爆。
+
+    `_run_authed` 的 finally 无条件读 `started`，而它原本只在
+    `RequestLog.objects.create` 之后才绑定。任何发生在其前的异常逃逸
+    （build_routes 撞写锁、thinking/协议构造抛错、建日志本身失败）都会让
+    finally 先抛 UnboundLocalError —— 既掩盖原始异常，又让退款完全不执行，
+    即兜底在它声称要覆盖的那一类场景下彻底失效。
+    """
+
+    def setUp(self):
+        self.factory = RequestFactory()
+        self.ch = Channel.objects.create(name="r18", slug="r18",
+                                         base_url="https://up.test/v1")
+        ChannelKey.objects.create(channel=self.ch, name="k0",
+                                  api_key="nvapi-r18", rpm_limit=40)
+        AIModel.objects.create(channel=self.ch, model_name="m", enabled=True)
+        self.user_key, self.raw = api_key_service.create_key("r18-user", quota=1000)
+
+    def _post(self):
+        from unittest.mock import patch
+
+        from api import openai_views
+
+        def boom(*a, **kw):
+            raise RuntimeError("build_routes 撞 SQLite 写锁")
+
+        with patch.object(openai_views, "build_routes", side_effect=boom):
+            return openai_views.chat_completions(
+                self.factory.post("/v1/chat/completions",
+                                  data=json.dumps({"model": "m", "messages": [
+                                      {"role": "user", "content": "hi"}]}),
+                                  content_type="application/json",
+                                  HTTP_AUTHORIZATION=f"Bearer {self.raw}"))
+
+    def test_original_exception_is_not_masked(self):
+        """异常必须原样上抛，不能被 finally 的 UnboundLocalError 顶掉。"""
+        with self.assertRaises(RuntimeError) as ctx:
+            self._post()
+        self.assertNotIsInstance(ctx.exception, UnboundLocalError)
+        self.assertIn("写锁", str(ctx.exception))
+
+    def test_reservation_refunded_even_when_log_never_created(self):
+        """日志还没建就炸：额度预占仍必须退还。"""
+        with self.assertRaises(RuntimeError):
+            self._post()
+        self.user_key.refresh_from_db()
+        self.assertEqual(
+            self.user_key.used_quota, 0,
+            f"预占未退还（used_quota={self.user_key.used_quota}）—— "
+            "兜底因 started 未绑定而自爆")
+        self.assertEqual(
+            RequestLog.objects.filter(channel=self.ch).count(), 0,
+            "build_routes 失败发生在建日志之前，不该留下半截日志")
+
+
+class R19_ReloaderChildGuardExemptionTests(TestCase):
+    """F2（code-review I7）：Django autoreloader 的子进程必须跳过单实例锁。
+
+    `manage.py runserver` 的父进程（监视器）也会 django.setup() → ready() →
+    **先持有** data/.gateway.lock；子进程 argv 仍是 runserver、只靠 RUN_MAIN
+    区分。若子进程也去抢锁 → AlreadyRunning → 子进程崩 → runserver 不再服务
+    （README 与 docs/deployment.md 的文档化本地启动路径直接失效）。
+
+    旧实现里这条豁免是间接存在的（父进程把 AUTO_MIGRATE 置 0，子进程继承后
+    _is_server_process() 返回 False，连守卫一起跳过）。把守卫与迁移开关解耦时
+    必须显式补回来。
+    """
+
+    def _should(self, argv, env):
+        import os
+        from unittest.mock import patch
+
+        from apps.core import apps
+        # 只控制这两个开关，其余环境保持原样：clear=False + 显式 pop 再覆盖
+        with patch("sys.argv", argv), patch.dict(os.environ, env, clear=False):
+            saved = {k: os.environ.pop(k, None) for k in ("AUTO_MIGRATE", "RUN_MAIN")}
+            try:
+                os.environ.update(env)
+                return apps._should_acquire_singleton_lock()
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+
+    def test_reloader_child_skips_the_lock(self):
+        self.assertFalse(
+            self._should(["manage.py", "runserver", "0.0.0.0:8000"],
+                         {"RUN_MAIN": "true"}),
+            "autoreloader 子进程去抢父进程已持有的锁 —— runserver 将不再服务")
+
+    def test_reloader_parent_still_acquires(self):
+        self.assertTrue(
+            self._should(["manage.py", "runserver", "0.0.0.0:8000"], {}))
+
+    def test_second_independent_instance_still_refused(self):
+        """豁免不得削弱契约：没有 RUN_MAIN 的第二个实例照常抢锁并被拒。"""
+        self.assertTrue(self._should(["uvicorn", "config.asgi:application"], {}))
+
+    def test_one_off_commands_never_acquire(self):
+        for argv in (["manage.py", "migrate"], ["manage.py", "shell"],
+                     ["python", "-m", "pytest", "tests"]):
+            with self.subTest(argv=argv):
+                self.assertFalse(self._should(argv, {}))
+
+    def test_uvicorn_reload_child_needs_no_exemption(self):
+        """uvicorn 的 supervisor 不 import 应用，只有子进程跑 ready() → 正常抢锁。"""
+        self.assertTrue(self._should(
+            ["C:/py/lib/site-packages/uvicorn/__main__.py",
+             "config.asgi:application", "--reload"], {}))
+
+
+class R20_TotalTimeoutAccountsHealth(TestCase):
+    """F3（code-review I9）：总墙钟判死必须与 first_byte_timeout 走同一套记账。
+
+    只写 report 不调 `_mark_failure` 的话，挂满一小时的线路在调度打分上完全隐身：
+    `_score` 按 (failure_count, lru) 升序选 Key，它的 failure_count 纹丝不动、
+    last_used_at 又停在 1 小时前，于是**同一条僵尸线路会被每轮优先抽到**。
+    这正是 61fdb4a（死线 Key 统计）与 911393c 立的不变量。
+    """
+
+    def test_timed_out_routes_are_marked_failed(self):
+        import asyncio
+        from unittest.mock import patch
+
+        from services import race_engine
+
+        async def hang(route, body, t0):
+            await asyncio.Event().wait()
+
+        original_get = race_engine.sysconfig.get
+
+        def fake_get(key, channel=None):
+            if key == "upstream_total_timeout":
+                return 0.15
+            return original_get(key, channel)
+
+        from services.load_balancer import Route
+
+        def mk(name):
+            ch = Channel.objects.create(name=f"r20-{name}", slug=f"r20-{name}",
+                                        base_url="https://up.test/v1")
+            key = ChannelKey(channel=ch, name=f"key-{name}",
+                             api_key=f"nvapi-{name}")
+            return Route(kind="direct", key=key)
+
+        routes = [mk(f"t{i}") for i in range(2)]
+        with patch.object(race_engine.sysconfig, "get", fake_get), \
+                patch.object(race_engine, "_do_request", hang), \
+                patch.object(race_engine, "_mark_failure") as mf:
+            mf.return_value = None
+            from services.race_engine import AllRoutesFailed
+            with self.assertRaises(AllRoutesFailed):
+                asyncio.run(race_engine._race(routes, {}))
+
+        self.assertEqual(mf.await_count, 2,
+                         "总墙钟判死的线路没有被记账 —— 下轮仍会被优先抽到")
+        for call in mf.await_args_list:
+            self.assertEqual(call.args[1], "total_timeout")
+            self.assertEqual(call.args[2], 0,
+                             "http_status 必须为 0，否则代理不会被一起记账")
+
+
+class R21_ServerOverloadedRefundsTests(TestCase):
+    """I2：429 server_overloaded 出口不得吞掉额度预占。
+
+    视图在 `_run_authed` 之前就已 `_reserve_quota`，而这个出口位于 `try` 之外、
+    走不到 finally 的兜底。拥塞期（并发逼近 max_concurrent_requests）每个被拒
+    的请求都会永久吞 1 token 且不落 RequestLog —— 恰是最不该计费出错的时刻。
+    """
+
+    def setUp(self):
+        self.factory = RequestFactory()
+        self.user_key, self.raw = api_key_service.create_key("r21", quota=1000)
+
+    def test_429_refunds_the_reservation(self):
+        from unittest.mock import patch
+
+        from api import openai_views
+
+        with patch.object(openai_views, "_try_acquire_request", return_value=False):
+            resp = openai_views.chat_completions(
+                self.factory.post("/v1/chat/completions",
+                                  data=json.dumps({"model": "m", "messages": [
+                                      {"role": "user", "content": "hi"}]}),
+                                  content_type="application/json",
+                                  HTTP_AUTHORIZATION=f"Bearer {self.raw}"))
+
+        self.assertEqual(resp.status_code, 429)
+        self.user_key.refresh_from_db()
+        self.assertEqual(
+            self.user_key.used_quota, 0,
+            f"429 出口吞掉了额度预占（used_quota={self.user_key.used_quota}）")
