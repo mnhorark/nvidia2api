@@ -530,3 +530,87 @@ neutralize 时分别命中 2 / 1 / 1 个失败，F5 命中 1 个。
 `I14` 前端 §3.1+§3.3 叠加后 `selected` 可含 `filtered` 之外的 id。
 
 **全量回归 597 passed / 0 failed**（587 → +10），`check` 无问题，`makemigrations --check` 无待生成。
+
+---
+
+## 十二、性能优化执行记录（2026-09-07）
+
+目标：全面优化前后端性能与 WebUI 流畅度。做法是先测再改 —— 所有数字都是
+在 `data/db.sqlite3` 的**临时副本**上跑出来的（生产库正在被运行中的实例持有写锁，
+上一轮我拿它试探针已经出过一次事故）。
+
+### 12.1 基线（改前）
+
+一个 `/v1` 请求的**同步视图体**要占住 asgiref 唯一那条 thread-sensitive 线程
+115.6 ms。因为本项目每个入口都是同步视图（§2.2），这就是整站的吞吐上限：
+
+```
+理论上限 ≈ 9 req/s      ← 与上游快慢完全无关，上限是这条线程
+```
+
+`build_routes` 的成本分解（openrouter：339 Key / 300 启用代理 / max_routes=100）：
+
+| 段 | 耗时 | SQL 条数 |
+|---|---|---|
+| `claim_rpm_slot × 100` | **123.6 ms** | **300** |
+| `available_keys` | 6.3 ms | 1 |
+| `schedulable_proxies` | 6.6 ms | 1 |
+
+96% 在 RPM 领取上。另外实测把 100 次 claim 包进单个 `atomic()` 只从 128.9 降到
+123.5 ms —— 说明瓶颈是**每条语句的固定开销**，不是事务提交，所以必须减语句数。
+`defer(api_key)` 也无效甚至更慢：成本在 ORM 建行而非列宽，所以真正的解法是少取行。
+
+### 12.2 改后
+
+```
+build_routes            111.5 →   9.34 ms  (p95 22.6)
+resolve_in_channel        1.47 →   0.00 ms  (渠道级解析表缓存)
+每请求同步视图体合计     115.6 →  10.47 ms
+理论吞吐上限                9 →     96 req/s   (≈11×)
+```
+
+| 提交 | 改动 |
+|---|---|
+| `perf(scheduler)` | RPM 领取批量化：按「窗口过期重置」/「窗口内递增」各一条批量条件 UPDATE，用 `last_used_at == now` 作为本次领取标记回读精确身份（rowcount 只给数量）。100 把 Key 从 300 条语句降到 4 条。`available_keys` / `schedulable_proxies` 过滤排序下推 SQL 并支持 limit（代理侧 1:1 消耗可精确截断，Key 侧留 8 条余量）；去掉调度路径不需要的 `select_related("group")`；给每行挂上已知 channel，省掉 race_engine 读 `key.channel` 的惰性外键查询 |
+| `perf(registry)` | `resolve_in_channel` 改渠道级解析表缓存，沿用信号失效 + 3s TTL；语义与旧的「alias/上游名 SQL 匹配 + 附加别名 Python 扫」逐条对应 |
+| `perf(api)` | 列表专用序列化器裁掉列表页根本不渲染的字段：keys 143→99 KB（-31%）、proxies 180→97 KB（-46%）。前端类型同步改可选，否则声明必有、实际 undefined，tsc 一声不响 |
+| `perf(frontend)` | 行组件 memo 化（keys/proxies）：12 列 × 200 行 ≈ 6000 元素，此前任何 setState 都整片重渲染，是"点一下卡一下"的直接来源；过滤与切片 useMemo；表头 sticky；加载态从 spinner 改骨架行；colSpan 魔法数改按列数计算 |
+| `perf(frontend)` | 日志页自动刷新改静默增量：不再每 5 秒把整张表换成骨架行（看着像坏了），且"加载更多"到 1000 行后不再每 5 秒重传重渲染 1000 行 |
+| `perf(admin)` | `sync_models` 的 N+1（每上游模型一次 get_or_create）与 `bulk_import_proxies` 的逐行 `exists()` 改为集合式；`check_all` 的存量查询移出事件循环 |
+
+### 12.3 过程中被实测挡住的两个坑
+
+1. **`bulk_create` 会绕过 `Proxy.save()` 的密码加密** —— 代理导入本来可以顺手
+   也改成 bulk_create，但 `Proxy.save()` 负责 `encrypt_secret`，bulk_create 会把
+   **明文密码写进库**，而 `decrypt_secret` 有明文回落所以运行期看不出问题。
+   所以代理写入仍是逐行 create，守卫只断言 **SELECT** 条数而非总条数，
+   并在测试里写明为什么。
+2. **`bulk_create(ignore_conflict=)` 参数名写错** —— 正确是 `ignore_conflicts`。
+   这个 typo 会在第一次真实同步时 TypeError，是写守卫用例时被抓到的。
+   又一次说明：守卫要证明"没有它时会红"。
+
+另外 tsc 直接抓住一处：`load` 加了 `silent` 形参后，`onClick={load}` 会把
+MouseEvent 当成 `silent`（真值），手动刷新再也不显示加载态。
+
+### 12.4 新增守卫
+
+`NoNPlusOneOnBulkAdminPaths` 4 例（用 SQL 条数断言，CI 上耗时噪声太大）、
+`test_concurrent_bulk_claims_do_not_exceed_rpm`（20 线程抢 rpm_limit=7，断言总领取
+恰好 7）、`test_bulk_claims_respect_per_key_limits`、
+`test_build_routes_uses_the_bulk_claim`（改回逐条不会让任何功能测试变红，单独钉一条）。
+R14 的 DB 争用守卫改为同时 patch 两个领取入口 —— 只 patch 未被使用的那个会空转。
+
+**全量回归 603 passed / 0 failed**，`manage.py check` 无问题，
+`makemigrations --check` 无待生成迁移，`tsc --noEmit` 干净，`next build` 13 路由预渲染。
+
+### 12.5 未做（需要决策或前置测试）
+
+- **数据面视图改 async + 去掉 `race_chat` 的 `asyncio.run`**：这是 §2.2 那条结构性
+  约束的唯一根治，能把"一条线程串行所有请求"变成真正的并发。本轮把那条线程上的
+  单位工作压到 1/11，但**约束本身还在**。它必须先补竞速心跳注入与客户端断开强制
+  结算的专属测试（§六 第 12 项），否则会把"冻结一条线程"换成"每个非流式请求
+  泄漏 max_routes 个 RPM 槽位"。
+- **`max_routes_per_request` 的按渠道覆盖值仍是 40/50/60/100**：代码默认已降到 8，
+  但 SystemSetting 里的覆盖优先。100 条线路对竞速没有额外收益（§A2 论证过
+  竞速冗余在这个倍数下是自伤），压到 8 还能再省 ~7 ms/请求。这是运维取值决策。
+- 列表接口真分页、`/healthz` 与 DB 解耦、周期 housekeeping：维持原分级。
