@@ -106,10 +106,21 @@ async def check_proxy(proxy: Proxy, timeout: float | None = None) -> dict:
 
 async def check_all(channel=None, timeout: float | None = None,
                     ids: list[int] | None = None) -> dict:
-    qs = Proxy.objects.all() if channel is None else channel.proxies.all()
-    if ids:
-        qs = qs.filter(id__in=ids)
-    proxies = list(qs)
+    from services.loop_offload import run_db
+
+    def _load():
+        qs = Proxy.objects.all() if channel is None else channel.proxies.all()
+        if ids:
+            qs = qs.filter(id__in=ids)
+        # list() 在这里就把查询集完全求值，交回的是不持有数据库连接的普通对象，
+        # 换线程后可以安全使用。
+        return list(qs)
+
+    # 此前是 async 函数里直接 `list(qs)`——同步 ORM 落在事件循环线程上。
+    # 现在 check_all 只被同步视图经 run_async 调用（本来就在那条线程上），
+    # 所以不是当下的故障；但一旦有 async 视图 await 它就会阻塞事件循环，
+    # 而 DJANGO_ALLOW_ASYNC_UNSAFE=true 让这类违规永远不会被框架抓到。
+    proxies = await run_db(_load)
     sem = asyncio.Semaphore(20)
 
     async def one(p):
