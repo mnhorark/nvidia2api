@@ -15,18 +15,27 @@ DATA_DIR=./data
 DATABASE_PATH=./data/db.sqlite3
 
 # 管理后台账号 / token
+# ⚠ 下面三个值是**占位符，不是可用配置**：DEBUG=false 时若沿用它们，
+# 启动期凭据门禁会直接抛 RuntimeError（settings.py 的默认凭据检查）。
+# 照抄本文档部署会起不来——必须换成自己的强口令与随机 token。
 ADMIN_USERNAME=admin
-ADMIN_PASSWORD=admin123
-ADMIN_TOKEN=dev-admin-token
+ADMIN_PASSWORD=<强口令>
+ADMIN_TOKEN=<随机长串>
 
 # 上游
 NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
 
 # 默认配额（可在管理后台"设置"页覆盖，免重启）
-DEFAULT_NVIDIA_RPM=40
-MAX_ROUTES_PER_REQUEST=50
+# DEFAULT_NVIDIA_RPM=0 表示默认不限流；设正数才启用每 Key 的 RPM 闸门
+DEFAULT_NVIDIA_RPM=0
+# 单请求最大并行线路数。默认 8：每条线路都是一个真实的上游并发流，
+# agent 客户端的工具调用是原子具现的（N 个子代理同一毫秒派发），
+# 大倍数会把上游打到掐流。注意按渠道的 SystemSetting 覆盖值优先于本默认。
+MAX_ROUTES_PER_REQUEST=8
 UPSTREAM_CONNECT_TIMEOUT=10
-UPSTREAM_READ_TIMEOUT=120
+# 0 = 不限制（慢模型写大文件可以跑数分钟，固定值会误杀）。
+# 僵尸请求的兜底是运行时参数 upstream_total_timeout（默认 3600 秒，后台可调）。
+UPSTREAM_READ_TIMEOUT=0
 PROXY_TIMEOUT=10
 MAX_CONCURRENT_REQUESTS=100
 
@@ -62,14 +71,18 @@ cd backend && python -m pytest tests
 docker compose up -d
 ```
 
-- `backend` 容器内运行 Django，SQLite 落到挂载的 `./data`
-- `frontend` 容器 `npm install && npm run build && npm run start`
+- `backend` 容器内运行 Django，SQLite 落到挂载的 `./data`；**前端由同一个进程同源托管**
+  （Next.js `output:"export"` 的静态产物在构建期复制进镜像，`api/frontend_views.py` 负责服务）
 
-仅后端 + 已有前端静态资源可用根 `Dockerfile`：前端先 build（Node 22 阶段），后端挂在 Python 3.12-slim，`DATA_DIR=/app/data`。
+根 `Dockerfile` 是 all-in-one 两阶段构建：Node 22 阶段 build 前端 → Python 阶段运行后端。
+（历史上这里写过"frontend 容器 `npm run start`"——该服务已删除，且 `output:"export"`
+下 `npm run start` 根本不工作。）
 
 ## 生产注意点
 
-- **前置代理**（nginx/caddy）需放行 SSE：`proxy_buffering off`，长连接 `read_timeout` ≥ `UPSTREAM_READ_TIMEOUT`（默认 120s）
+- **前置代理**（nginx/caddy）需放行 SSE：`proxy_buffering off`；读超时要 ≥ 运行时参数
+  `stream_max_duration`（默认 3600 秒）与 `upstream_total_timeout`（默认 3600 秒），
+  否则代理会先于网关掐断长流
 - 单实例 SQLite 适合中小流量；要承载大规模并发请迁移 PostgreSQL + Redis，并把 `MAX_CONCURRENT_REQUESTS` 提升
 - 定期备份 `./data/db.sqlite3`
 - 不要让 `/api/admin/*` 直接裸露公网，绑 Basic Auth 或放到内网域名
