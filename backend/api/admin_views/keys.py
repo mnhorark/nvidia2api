@@ -27,7 +27,7 @@ from services.proxy_checker import check_all, check_proxy
 from ..auth import AdminRequiredMixin
 from .common import *  # noqa: F401,F403  （辅助函数：_parse_int/_slugify 等）
 from ..serializers import (
-    ChannelKeySerializer, ChannelSerializer, ModelSerializer, ProxyGroupSerializer,
+    ChannelKeyListSerializer, ChannelKeySerializer, ChannelSerializer, ModelSerializer, ProxyGroupSerializer,
     ProxySerializer, ProxyWriteSerializer, RequestLogSerializer, SettingSerializer,
     UserApiKeySerializer,
 )
@@ -36,7 +36,9 @@ class ChannelKeyListView(AdminRequiredMixin, APIView):
     def get(self, request):
         channel = current_channel(request)
         qs = channel.keys.order_by('id')
-        return Response(ChannelKeySerializer(qs, many=True).data)
+        # 列表用裁剪版序列化器：created_at / updated_at / last_error 在 keys 页
+        # 一行都不显示，却占 339 行响应的 20%。详情接口仍是完整版。
+        return Response(ChannelKeyListSerializer(qs, many=True).data)
 
     def post(self, request):
         channel = current_channel(request)

@@ -28,7 +28,7 @@ from ..auth import AdminRequiredMixin
 from .common import *  # noqa: F401,F403  （辅助函数：_parse_int/_slugify 等）
 from ..serializers import (
     ChannelKeySerializer, ChannelSerializer, ModelSerializer, ProxyGroupSerializer,
-    ProxySerializer, ProxyWriteSerializer, RequestLogSerializer, SettingSerializer,
+    ProxyListSerializer, ProxySerializer, ProxyWriteSerializer, RequestLogSerializer, SettingSerializer,
     UserApiKeySerializer,
 )
 class ProxyListView(AdminRequiredMixin, APIView):
@@ -42,7 +42,9 @@ class ProxyListView(AdminRequiredMixin, APIView):
         n_total_keys, n_keys = proxy_service.key_counts(channel)
         max_allowed = max(n_keys - 1, 0)
         enabled = qs.filter(enabled=True).count()
-        return Response({'results': ProxySerializer(qs, many=True).data, 'summary': {'channel': channel.slug, 'channel_id': channel.id, 'disable_proxy_unhealthy': channel.disable_proxy_unhealthy, 'nvidia_keys': n_keys, 'total_keys': n_total_keys, 'max_enabled_proxies': max_allowed, 'enabled_proxies': enabled, 'direct_routes': 1 if n_keys else 0, 'total_routes': enabled + (1 if n_keys else 0)}})
+        # 列表用裁剪版序列化器：isp / region / city / url / username / password /
+        # created_at / updated_at 在代理池页面一行都不显示，占 300 行响应的 22%。
+        return Response({'results': ProxyListSerializer(qs, many=True).data, 'summary': {'channel': channel.slug, 'channel_id': channel.id, 'disable_proxy_unhealthy': channel.disable_proxy_unhealthy, 'nvidia_keys': n_keys, 'total_keys': n_total_keys, 'max_enabled_proxies': max_allowed, 'enabled_proxies': enabled, 'direct_routes': 1 if n_keys else 0, 'total_routes': enabled + (1 if n_keys else 0)}})
 
     def post(self, request):
         channel = current_channel(request)

@@ -220,8 +220,10 @@ export interface ChannelKey {
   success_count: number;
   failure_count: number;
   last_used_at: string | null;
-  created_at: string;
-  updated_at: string;
+  /** 列表接口（ChannelKeyListSerializer）已裁掉这两个时间戳与 last_error
+   *  （keys 页不渲染，占 339 行响应的 31%）；详情接口仍返回完整字段。 */
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface ProxyGroup {
@@ -253,8 +255,14 @@ export interface Proxy {
   public_ip?: string;
   success_count: number;
   failure_count: number;
-  created_at: string;
-  updated_at: string;
+  /**
+   * 列表接口（ProxyListSerializer）不再返回 created_at / updated_at / username /
+   * password / url / region / city / isp —— 代理池页面一个都不渲染，而它们占
+   * 300 行响应的 46%。标成可选，真去读时类型系统会强制处理 undefined，
+   * 而不是运行时拿到一个不存在的值。详情接口仍返回完整字段。
+   */
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface Model {

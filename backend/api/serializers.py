@@ -72,6 +72,24 @@ class ChannelKeySerializer(serializers.ModelSerializer):
         return max(obj.rpm_limit - obj.minute_request_count, 0)
 
 
+class ChannelKeyListSerializer(ChannelKeySerializer):
+    """列表专用序列化：砍掉列表页根本不渲染的字段。
+
+    实测一个渠道 339 行 = 144 KB，其中 created_at + updated_at + last_error
+    占 28 KB（20%）而 keys 页一行都不显示。列表是每次进页面、每次批量操作后
+    都要拉的，这个字节数会直接换算成首屏时间与 JSON 解析卡顿。
+
+    详情接口仍用完整的 ChannelKeySerializer，不改契约。
+    """
+
+    class Meta(ChannelKeySerializer.Meta):
+        fields = [
+            "id", "channel", "name", "api_key", "is_anonymous", "status", "rpm_limit",
+            "minute_request_count", "remaining_rpm", "success_count", "failure_count",
+            "last_used_at",
+        ]
+
+
 class ProxyGroupSerializer(serializers.ModelSerializer):
     proxy_count = serializers.IntegerField(read_only=True, default=0)
 
@@ -100,6 +118,26 @@ class ProxySerializer(serializers.ModelSerializer):
 
     def get_url(self, obj):
         return f"{obj.protocol}://{obj.host}:{obj.port}"
+
+
+class ProxyListSerializer(ProxySerializer):
+    """列表专用序列化：砍掉代理池页面根本不渲染的字段。
+
+    实测一个渠道 300 行 = 180 KB，其中 created_at / updated_at / isp / url /
+    username / region / city / password 合计约 40 KB（22%）而列表一行都不显示
+    （页面用的是 名称/协议/地址/分组/公网IP/国家/延迟/状态/启用/最后测速/操作）。
+    密码掩码尤其没必要在列表里逐行算。
+
+    详情接口仍用完整的 ProxySerializer。
+    """
+
+    class Meta(ProxySerializer.Meta):
+        fields = [
+            "id", "channel", "name", "protocol", "host", "port",
+            "group", "group_name", "country", "enabled",
+            "status", "latency_ms", "public_ip", "last_check_at",
+            "success_count", "failure_count",
+        ]
 
 
 class ProxyWriteSerializer(serializers.ModelSerializer):
