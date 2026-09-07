@@ -388,15 +388,64 @@ async def _race(routes: list[Route], body: dict) -> RaceResult:
     if not routes:
         raise NoRouteAvailable()
     t0 = _time.monotonic()
+
+    # 总墙钟兜底（A2）。upstream_read_timeout 默认 0 = 不限制，是为了不杀
+    # 慢模型（kimi-k3 写大文件可以静默数分钟）；但 read 超时管不住
+    # 「一直在动却永远不结束」的上游。而本函数由 race_chat 的 asyncio.run
+    # 驱动，跑在 asgiref 的**单线程** thread-sensitive 执行器上——本项目
+    # 每一个入口（数据面 / 管理面 / healthz / metrics）都是同步视图，
+    # 所以一条挂死的非流式请求冻结的是**整个网关**。
+    # 默认 1 小时：宽松到不会误杀任何真实生成，只挡真正的僵尸请求。
+    total_timeout = 0.0
+    try:
+        total_timeout = float(sysconfig.get(
+            "upstream_total_timeout", routes[0].key.channel) or 0)
+    except Exception:  # noqa: BLE001
+        # 取不到配置就退回不限制，绝不因为一个参数读取失败而打死竞速
+        logger.exception("upstream_total_timeout read failed; racing unbounded")
+
     tasks: dict[asyncio.Task, Route] = {
         asyncio.ensure_future(_do_request(r, body, t0)): r for r in routes
     }
     report: list[dict] = []
     errors: list[str] = []
+
+    async def _mark_timed_out(still_pending: set) -> None:
+        """把仍在途的线路如实记成 total_timeout 失败，而不是静默丢弃。
+
+        ⚠ 必须与 `first_byte_timeout` 走**同一套处置**（`await _mark_failure(route,
+        ..., 0)`），不能只写 report。`_mark_failure` 在 http_status==0 时同时给
+        Key 累计 `failure_count` + 设 `key_cooldown_seconds` 冷却、给代理
+        `report_proxy_result(False)`。只写 report 的话，一条挂满总墙钟的线路
+        在调度打分上完全隐身：`_score` 按 `(failure_count, lru)` 升序选 Key，
+        它的 failure_count 纹丝不动、`last_used_at` 又停在 1 小时前，
+        于是**同一条僵尸线路会被每一轮请求优先抽到**。
+        这正是 61fdb4a（"死线 Key 统计"）与 911393c 建立的不变量。
+        """
+        for p in still_pending:
+            r = tasks[p]
+            errors.append(f"{r.name}:total_timeout")
+            report.append(route_info(
+                r, "failed", (_time.monotonic() - t0) * 1000, "total_timeout", 0))
+            await _mark_failure(r, "total_timeout", 0)
+
     try:
         pending = set(tasks.keys())
         while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            wait_for = None
+            if total_timeout > 0:
+                wait_for = total_timeout - (_time.monotonic() - t0)
+                if wait_for <= 0:
+                    await _mark_timed_out(pending)
+                    pending = set()
+                    break
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED, timeout=wait_for)
+            if not done and pending:
+                # asyncio.wait 到期且没有任何任务完成 = 总墙钟到点
+                await _mark_timed_out(pending)
+                pending = set()
+                break
             for t in done:
                 try:
                     result = t.result()

@@ -161,3 +161,81 @@ class StreamRaceTests(TestCase):
             routes = [make_route("r0", 0)]
             with self.assertRaises(AllRoutesFailed):
                 asyncio.run(race_engine.race_stream_winner(routes, {}))
+
+
+class TotalWallClockTests(TestCase):
+    """A2：非流式竞速必须有总墙钟兜底。
+
+    `upstream_read_timeout` 默认 0（不限制）是为了不杀慢模型，但 read 超时
+    管不住「一直在动却永远不结束」的上游。而 `_race` 由 `race_chat` 的
+    `asyncio.run` 驱动，跑在 asgiref 的**单线程** thread-sensitive 执行器上，
+    本项目每个入口都是同步视图 —— 一条挂死的非流式请求冻结的是整个网关。
+
+    所以竞速循环必须有一个宽松到不会误杀真实生成、但确实存在的上限。
+    """
+
+    def test_hung_routes_are_bounded_not_waited_forever(self):
+        import time as _time
+        from unittest.mock import patch
+
+        async def hang(route, body, t0):
+            await asyncio.Event().wait()   # 永不完成，也不抛
+            return resp(route)
+
+        original_get = race_engine.sysconfig.get
+
+        def fake_get(key, channel=None, default=None):
+            if key == "upstream_total_timeout":
+                return 0.2
+            return original_get(key, channel, default)
+
+        routes = [make_route(f"h{i}", f"h{i}") for i in range(2)]
+        with patch.object(race_engine.sysconfig, "get", fake_get), \
+                patch.object(race_engine, "_do_request", hang):
+            t0 = _time.monotonic()
+            with self.assertRaises(AllRoutesFailed) as ctx:
+                asyncio.run(race_engine._race(routes, {}))
+            elapsed = _time.monotonic() - t0
+
+        self.assertLess(elapsed, 5.0,
+                        f"总墙钟没生效，竞速等了 {elapsed:.1f}s 才结束")
+        report = ctx.exception.report or []
+        self.assertTrue(
+            any(r.get("error") == "total_timeout" for r in report),
+            f"挂死的线路必须被如实记为 total_timeout，实际 report={report}")
+
+    def test_zero_total_timeout_stays_unbounded(self):
+        """0 = 不限制必须真的是不限制（防止有人把 `if total_timeout > 0`
+        「优化」成比较式，让 0 变成 0 秒超时）。"""
+        from unittest.mock import patch
+
+        done = asyncio.Event()
+
+        async def slow(route, body, t0):
+            await asyncio.sleep(0.25)
+            return resp(route)
+
+        original_get = race_engine.sysconfig.get
+
+        def fake_get(key, channel=None, default=None):
+            if key == "upstream_total_timeout":
+                return 0
+            return original_get(key, channel, default)
+
+        routes = [make_route("z0", "z0")]
+        with patch.object(race_engine.sysconfig, "get", fake_get), \
+                patch.object(race_engine, "_do_request", slow):
+            result = asyncio.run(race_engine._race(routes, {}))
+        self.assertTrue(result.ok)
+        del done
+
+    def test_default_is_generous_not_zero(self):
+        """默认值必须是「宽松到不会误杀、但确实存在」的正数，不能退回 0。"""
+        from services import sysconfig
+
+        self.assertGreater(float(sysconfig.RUNTIME_PARAMS["upstream_total_timeout"][1]), 0)
+        self.assertGreater(float(sysconfig.RUNTIME_PARAMS["stream_max_duration"][1]), 0)
+        # 而两条**静默**判死超时必须仍是 0（用户明确要求不限制慢模型）
+        self.assertEqual(float(sysconfig.RUNTIME_PARAMS["stream_idle_timeout"][1]), 0)
+        self.assertEqual(
+            float(sysconfig.RUNTIME_PARAMS["stream_content_idle_timeout"][1]), 0)

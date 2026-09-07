@@ -162,9 +162,31 @@ NVIDIA_BASE_URL = os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidi
 DEFAULT_NVIDIA_RPM = int(os.environ.get("DEFAULT_NVIDIA_RPM", "0"))
 PROXY_TIMEOUT = float(os.environ.get("PROXY_TIMEOUT", "10"))
 UPSTREAM_CONNECT_TIMEOUT = float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "10"))
-UPSTREAM_READ_TIMEOUT = float(os.environ.get("UPSTREAM_READ_TIMEOUT", "300"))
+# 非流式请求的上游读超时。默认 **0 = 不限制**（2026-09）：慢模型（kimi-k3 写大文件）
+# 单次生成可以跑数分钟以上，任何固定值都会误杀。
+# ⚠ 已知代价（2026-09-07 复核后**更正故障域范围**）：本项目的**每一个**入口都是同步
+# 视图——数据面 chat/responses/anthropic/count_tokens/models、管理面全部
+# /api/admin/*、以及 /healthz 与 /metrics。Django 对非协程视图一律
+# `sync_to_async(view, thread_sensitive=True)`，而 asgiref 的 thread-sensitive
+# 执行器是 `ThreadPoolExecutor(max_workers=1)`（sync.py:402/:481，**无法配置**；
+# 这里原先写的 ASGI_THREADS=64 是个不存在的环境变量，已随 config/asgi.py 删除）。
+# 所以不设上限时，一条挂死的非流式请求冻结的不是"admin 面 + 健康检查"，而是
+# **整个网关**：后续每一个请求（包括新起的流式请求——它的入口视图同样是同步的）
+# 都排在同一条线程上，/healthz 也答不出来。
+# 根治是把数据面视图改 async + 消灭请求路径里的 asyncio.run
+# （docs/architecture-review-2026-09b.md 第六节第 11 项；它必须先补第 12 项的测试，
+# 否则会把"冻结一条线程"换成"每个非流式请求泄漏 max_routes_per_request 个 RPM 槽位"）。
+# 在那之前，若观察到后台整体卡死，把本值调回一个大于最慢正常生成的秒数即可。
+UPSTREAM_READ_TIMEOUT = float(os.environ.get("UPSTREAM_READ_TIMEOUT", "0"))
 MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "500"))
-MAX_ROUTES_PER_REQUEST = int(os.environ.get("MAX_ROUTES_PER_REQUEST", "80"))
+# 单次请求的最大并发线路数。默认从 80 降到 8（2026-09）：
+# 竞速是为了压尾延迟，但每条线路都是一个**真实的上游并发流**，而 agent 客户端
+# 的工具调用是**原子具现**的——6 个子代理在同一毫秒派发，40 条/请求就是 240 条
+# 同时流砸向同一个上游，直接把上游打到掐流（实测 kimi-k3 在 300s 被上游关闭）。
+# 也就是说"竞速冗余"在这个倍数下是自伤。8 条已足够拿到"谁先出流"的收益。
+# 注意：SystemSetting 里的按渠道覆盖值优先于本默认（当前库 nvidia=40 / zen=60 /
+# openrouter=100 / kilo 与 bai 见后台设置页），要生效需在控制台调小。
+MAX_ROUTES_PER_REQUEST = int(os.environ.get("MAX_ROUTES_PER_REQUEST", "8"))
 # 全平台同时打开的上游 HTTP 连接数上限（跨请求的全局 socket 阀门）。
 # 默认 0 = 不限制（对齐原始设计：并发只由 max_concurrent_requests ×
 # max_routes_per_request 自然约束）。仅在受 fd 硬限制的环境（如 Windows +

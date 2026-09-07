@@ -81,7 +81,10 @@ RUNTIME_PARAMS: dict[str, tuple[str, object, str, str]] = {
                                 "竞速期间同时建立的上游连接上限；0=不限制"
                                 "（Windows SelectorEventLoop 受限环境才需调小）", "request"),
     "max_routes_per_request": ("int", lambda: settings.MAX_ROUTES_PER_REQUEST,
-                               "单次请求最大并行线路数", "request"),
+                               "单次请求最大并行线路数。每条线路=一个真实的上游并发流；"
+                               "agent 客户端的工具调用是原子具现的（N 个子代理同一毫秒"
+                               "派发），所以本值×并发请求数就是瞬间打到上游的流总数——"
+                               "40×6=240 会把上游打到掐流。建议 4~8", "request"),
     "retry_count": ("int", 0,
                     "全部线路失败后重试次数（0=不重试，上限 5）", "request"),
     "retry_backoff_seconds": ("float", 3,
@@ -99,15 +102,31 @@ RUNTIME_PARAMS: dict[str, tuple[str, object, str, str]] = {
                                   "竞速等待首个 SSE 块超时（0=不限制）", "timeout"),
     "stream_heartbeat_interval": ("float", 20,
                                   "上游静默时发送心跳间隔（秒，0=关闭）", "stream"),
-    "stream_idle_timeout": ("float", 300,
-                            "胜出后无真实内容时的静默上限（0=不限制）", "stream"),
-    "stream_content_idle_timeout": ("float", 300,
-                                    "已产出内容后的静默上限（0=不限制）。"
-                                    "思考模型在出过思考块后可能长静默，"
-                                    "给一个与 idle_timeout 一致的兜底，"
-                                    "避免无限悬空直至上游断连", "stream"),
-    "stream_max_duration": ("float", 0,
-                            "流式请求总时长上限（0=不限制）", "stream"),
+    "stream_idle_timeout": ("float", 0,
+                            "胜出后无真实内容时的静默判死上限（**0=不限制，默认**）。"
+                            "慢模型写大文件可以静默数分钟，任何固定值都会误杀。"
+                            "⚠ 关掉之后唯一的兜底是 stream_max_duration（默认 3600）："
+                            "stream_heartbeat_interval 只向**客户端**发 : keep-alive "
+                            "注释保活，对上游是否死亡**没有任何判定能力**"
+                            "（心跳探测判死那套机制已移除，别指望它）", "stream"),
+    "stream_content_idle_timeout": ("float", 0,
+                                    "已产出内容后的静默上限（**0=不限制，默认**）。"
+                                    "思考模型出过思考块后可能长时间静默，判死会丢掉"
+                                    "已经逐块下发给客户端的内容", "stream"),
+    "stream_max_duration": ("float", 3600,
+                            "流式请求总时长上限（秒，0=不限制）。默认 1 小时。"
+                            "**这不是静默判死**：持续吐字的慢模型不会被它杀，"
+                            "它只挡「每 19 秒滴一个字节 / 永不结束」的僵尸流——"
+                            "本项目所有入口都是同步视图、共用 asgiref 的一条线程，"
+                            "一条永不结束的流会永久占住一个并发名额与一份额度预占",
+                            "stream"),
+    "upstream_total_timeout": ("float", 3600,
+                               "非流式竞速的总墙钟上限（秒，0=不限制）。默认 1 小时。"
+                               "upstream_read_timeout 默认 0 是为了不杀慢模型，但 read "
+                               "超时管不住「一直在动却永远不结束」的上游；而 race_chat "
+                               "跑在 asgiref 的单线程执行器上，一条挂死的非流式请求会"
+                               "冻结整个网关（含 /healthz）。这里给一个宽松到不会误杀"
+                               "任何正常生成的兜底值", "timeout"),
     "proxy_failure_cooldown_seconds": ("int", 60,
                                        "代理失败后冷却秒数", "health"),
     "proxy_unhealthy_threshold": ("int", 3,

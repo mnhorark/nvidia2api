@@ -687,11 +687,16 @@ class R5_StreamJudgementTests(TestCase):
         self.assertIsNone(is_valid_stream_chunk("data: [DONE]"))
 
     def test_stream_idle_timeout_defaults(self):
-        """流式判死参数默认值：stream_idle_timeout 300s（宽松，思考模型友好），
-        竞速首字节 stream_first_byte_timeout 180s。"""
+        """流式静默判死默认**不限制**（0）：慢模型写大文件可以静默数分钟，
+        任何固定值都会误杀已经逐块下发给客户端的思考/正文流。
+        竞速首字节 stream_first_byte_timeout 仍为 180s——那是**换线**闸门
+        （等不到首块就判这条线路死、让别的路线上线），不是掐用户请求。
+        """
         from services import sysconfig
 
-        self.assertEqual(float(sysconfig.get("stream_idle_timeout") or 0), 300)
+        self.assertEqual(float(sysconfig.get("stream_idle_timeout") or 0), 0)
+        self.assertEqual(float(sysconfig.get("stream_content_idle_timeout") or 0), 0)
+        self.assertEqual(float(sysconfig.get("upstream_read_timeout") or 0), 0)
         self.assertEqual(float(sysconfig.get("stream_first_byte_timeout") or 0), 180)
 
     def test_legacy_alias_maps_to_idle_timeout(self):

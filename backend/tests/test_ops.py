@@ -466,6 +466,32 @@ class DrainFirstContentTimeoutTests(unittest.IsolatedAsyncioTestCase):
                                   content_idle_timeout=0.08):
                 pass
 
+    async def test_zero_idle_timeout_never_kills_and_heartbeat_continues(self):
+        """idle_timeout=0（**现在的默认**）= 不判死，且心跳照发。
+
+        慢模型写大文件可以静默数分钟，任何固定值都会误杀已经逐块下发给客户端的
+        流；默认改为不限制后，僵尸流的兜底交给心跳探测与上游自身收尾。
+        这条把"0 表示关闭"钉住，防止将来有人把 `if idle_timeout and ...` 的
+        短路写法"优化"成比较运算，让 0 变成"0 秒即超时"。
+        """
+        import asyncio
+
+        from api.openai_views import _drain
+
+        async def stream():
+            yield 'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n'
+            await asyncio.sleep(5)          # 静默远超测试内的任何合理窗口
+            yield 'data: {"choices":[{"index":0,"delta":{"content":"late"}}]}\n\n'
+
+        winner = self._winner(stream)
+        got = []
+        async for chunk in _drain(winner, idle_timeout=0.0, heartbeat=0.05,
+                                  content_idle_timeout=0.0):
+            got.append(chunk)
+        text = "".join(got)
+        self.assertIn("late", text, "静默后到达的内容必须仍然交付，不能被提前判死")
+        self.assertIn(": keep-alive", text, "静默期间心跳照发（保活客户端）")
+
     async def test_heartbeat_emitted_during_silence(self):
         """上游静默但未达判死阈值时，向客户端周期性发 `: keep-alive` 心跳（流式保活）。"""
         import asyncio
