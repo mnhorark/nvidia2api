@@ -681,3 +681,82 @@ R14 的 DB 争用守卫改为同时 patch 两个领取入口 —— 只 patch �
 
 **全量回归 619 passed / 0 failed**，`check` 无问题，`makemigrations --check` 无待生成，
 `tsc --noEmit` 干净，`next build` 13 路由预渲染，bench 实例与临时库副本已清理。
+
+---
+
+## 十四、§六 第 11 项实施：数据面视图改 async（2026-09-08）
+
+### 14.1 为什么这才是根因
+
+第 12.1 节那个"96 req/s"的算法**低估了问题的严重性**。`race_chat` 原本是
+`asyncio.run(_race(...))` 的同步函数，而同步视图全部由 asgiref 的
+thread-sensitive 执行器承载（`asgiref/sync.py:402` 硬编码 `max_workers=1`）。
+`asyncio.run` 会**阻塞调用线程直到竞速结束**，所以一条非流式请求占住那条唯一
+线程的不是 10.47 ms 的 CPU 时间，而是**整个上游往返时长**。
+
+真实上限因此是 `1/平均上游耗时`：上游 2 秒 → **0.5 req/s**，与数据库优化无关。
+前面所有把 10.47 ms 压小的工作，对非流式吞吐几乎没有意义。
+
+### 14.2 改了什么
+
+- `race_chat` → `async def`，直接 `await _race(...)`；另加 `race_chat_blocking`
+  （`asyncio.run` 包装）仅供仍是同步视图的管理端 playground 使用。
+- `chat_completions` / `responses` / `anthropic_messages` / `list_models` /
+  `anthropic_count_tokens` 全部 `async def`；`_run_authed`、`_parse_body` 改 async。
+- `_run_authed` 里每一处同步 ORM 都过 `run_db`：`_authorize`、`_reserve_quota`、
+  `_refund_reservation`、`_resolve_target`、`_not_found_error`、`_prepare_upstream`、
+  `build_routes`、`RequestLog.objects.create`、`_finish_log`、`record_result`、
+  `record_usage`、`release_rpm_slot`、`sysconfig.get("retry_count")`、
+  tokenizer 估算、`_force_settle_non_stream`。
+- `_parse_body` 拆成"读体 + 解析"。这里纠正一个我原本的错误假设：**`request.body`
+  在 Django 6.1 里仍是 property 而不是协程**（ASGIRequest 没覆盖它），
+  所以不能 `await request.body()`。在 async 视图里直接取它也安全——
+  `ASGIHandler.read_body()` 在构造 request **之前**就把整个 HTTP body 读进
+  `SpooledTemporaryFile` 了。真正该挪出循环的是读 `max_request_bytes`（DB）
+  和最大 32MB 的 JSON 解析（CPU）。
+
+### 14.3 实测
+
+20 个并发非流式请求、每个上游 0.3 s（同一事件循环上 gather）：
+
+```
+串行理论值      6.00 s
+async 化后      0.59 s        加速比 10.3x
+折算吞吐上限    34 req/s  （改造前同场景 3.3 req/s）
+```
+
+0.59 s 相对 0.3 s 理想值的差额约 0.29 s，是 20 个请求各自的 DB/CPU 工作
+（≈14 ms/请求）在 gather 调度下的摊薄——这部分已经过 `run_db` 挪出事件循环，
+但仍是有限并发下的排队开销。
+
+守卫 `NonStreamConcurrencyTests` 直接钉这个性质：5 个并发、每个上游 0.3 s，
+总耗时必须 < 0.75 s。证伪跑把 `await asyncio.sleep` 换成阻塞 `time.sleep`
+（即改造前"占着线程"的形态）后实测 **1.54 s**，断言如期变红。
+
+### 14.4 测试改造中撞到的两个框架事实（值得记下来）
+
+数据面视图变 async 后，测试必须 await 它。机械改造时撞到两条：
+
+1. **在同步测试里嵌套起事件循环会换掉数据库连接。** `asyncio.run(view(...))`
+   这种垫片里，`UserApiKey.objects.count()` 从 1 变 0、`in_atomic_block` 变 False
+   ——Django `TestCase` 的类级原子块未提交，而新上下文拿到的是另一个连接对象，
+   看不见那些行，鉴权直接 401。
+2. **`TestCase` + 同步 `setUp` + `async def test_*` 同样看不见 setUp 的数据**
+   （`asyncSetUp` 在 Django 的 `TestCase` 上不被调用）。
+   实测 `TransactionTestCase` + 同步 `setUp` + `async def test_*` 正常——
+   因为它的数据是真提交的。
+
+所以含 async 测试方法的类改用 `TransactionTestCase`，helper 用
+`tests.resolve()`（只对可 await 的返回值 await，因为管理端 DRF 视图仍是同步的，
+无条件 await 会抛 `'Response' object can't be awaited`）。
+
+改造过程中还修掉一批 `await f(x).attr` 的**优先级坑**——`await` 的优先级低于属性
+访问，那行实际是 `await (f(x).attr)`，在协程上取 `.content`。7 处，用 AST 扫出来的。
+
+### 14.5 现在的状态
+
+- 全量回归 **620 passed / 0 failed**，`check` 无问题，`makemigrations --check` 无待生成。
+- 测试套件总时长从 97 s 降到 66 s。
+- 数据面已不在 asgiref 单线程上；仍在那条线程上的是管理端控制台与 `/healthz`
+  （流量低，且 `AdminChatView` 用 `race_chat_blocking` 保持原语义）。
+- §六 第 11、12 项均已闭合。
