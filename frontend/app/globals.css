@@ -25,7 +25,9 @@ body {
   background-color: var(--bg);
   color: var(--text);
   min-height: 100%;
-  font-feature-settings: "ss01", "cv11";
+  /* 这里原本写着 font-feature-settings: "ss01", "cv11" —— 那是 Inter 专用的
+     OpenType 特性，而 tailwind.config 的 sans 是系统字体栈、从没加载过 Inter，
+     两条特性恒无效。要真用 Inter 就 next/font 引入后再开。 */
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
 }
@@ -63,18 +65,6 @@ body::before {
 }
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.2);
-}
-
-/* ---------- 面板 ---------- */
-.glass {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 12px;
-}
-.panel {
-  background: var(--panel-strong);
-  border: 1px solid var(--line);
-  border-radius: 12px;
 }
 
 /* ---------- 键盘焦点 ---------- */

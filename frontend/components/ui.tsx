@@ -140,11 +140,19 @@ const badgeTones: Record<string, { dot: string; text: string }> = {
   unknown: { dot: "bg-faint", text: "text-mute" },
 };
 
-const badgeLabels: Record<string, string> = {
+/**
+ * 状态 → 中文名的**单一来源**。
+ *
+ * 此前 dashboard 里另有一份一模一样的 `statusLabels`（两处逐字重复），
+ * 后端新增状态时只会改到其中一份，另一份静默漏翻——用户看到裸英文枚举。
+ * Badge 与仪表盘的状态分布面板现在共用这一份。
+ */
+export const STATUS_LABELS: Record<string, string> = {
   available: "正常",
   healthy: "正常",
   enabled: "启用",
   success: "成功",
+  pending: "处理中",
   rate_limited: "限流",
   degraded: "降级",
   error: "异常",
@@ -154,6 +162,13 @@ const badgeLabels: Record<string, string> = {
   disabled: "禁用",
   unknown: "未知",
 };
+
+/** 未登记的状态原样返回，宁可露出英文枚举也不要把未知含义翻译成错的中文。 */
+export function statusLabel(status: string): string {
+  return STATUS_LABELS[status] ?? status;
+}
+
+const badgeLabels = STATUS_LABELS;
 
 export function StatusDot({ status, className }: { status: string; className?: string }) {
   const tone = badgeTones[status] ?? { dot: "bg-info", text: "text-info" };
@@ -183,53 +198,106 @@ export function Badge({ status, label }: { status: string; label?: string }) {
 }
 
 /* ---------- Modal ---------- */
+const FOCUSABLE =
+  'a[href],button:not([disabled]),textarea:not([disabled]),' +
+  'input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
+
 export function Modal({
   open,
   title,
   onClose,
   children,
   wide,
+  dismissable = true,
 }: {
   open: boolean;
   title: string;
   onClose: () => void;
   children: React.ReactNode;
   wide?: boolean;
+  /**
+   * 是否允许 Esc / 点遮罩 / 右上角 X 关闭。默认 true。
+   *
+   * 传 false 的两类场景：
+   * 1) 提交在途（`dismissable={!saving}`）——此前 Modal 完全没有这个开关，
+   *    任何弹窗都能在请求飞行中被 Esc 关掉，结果落进已卸载的 state；
+   * 2) 只展示一次的机密（用户 API Key）——误按 Esc 就等于永久丢失这把 Key。
+   */
+  dismissable?: boolean;
 }) {
+  const panelRef = React.useRef<HTMLDivElement>(null);
+  const restoreRef = React.useRef<HTMLElement | null>(null);
+
   React.useEffect(() => {
-    if (!open) return;
+    if (!open || !dismissable) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+  }, [open, dismissable, onClose]);
+
+  // 打开时把焦点移入面板，关闭时归还给触发元素。
+  // 没有这段的话，弹窗打开后焦点仍停在遮罩后面的页面上：Tab 会一项项跳过
+  // 用户根本看不见的背景内容，读屏用户完全不知道弹窗出现过。
+  React.useEffect(() => {
+    if (!open) return;
+    restoreRef.current = document.activeElement as HTMLElement | null;
+    const first = panelRef.current?.querySelector<HTMLElement>(FOCUSABLE);
+    (first ?? panelRef.current)?.focus();
+    return () => restoreRef.current?.focus?.();
+  }, [open]);
 
   if (!open) return null;
+
+  // 焦点陷阱：Tab 到最后一个可聚焦元素后回到第一个（Shift+Tab 反向）。
+  const trapTab = (e: React.KeyboardEvent) => {
+    if (e.key !== "Tab") return;
+    const root = panelRef.current;
+    if (!root) return;
+    const items = Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE));
+    if (items.length === 0) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    const active = document.activeElement;
+    if (e.shiftKey && (active === first || active === root)) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && active === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 animate-fade"
-      onClick={onClose}
+      onClick={dismissable ? onClose : undefined}
     >
       <div
+        ref={panelRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-label={title}
+        onKeyDown={trapTab}
         className={cx(
-          "w-full max-h-[85vh] overflow-y-auto rounded-xl border border-line-strong bg-[#151619] shadow-pop p-6 animate-modal",
+          "w-full max-h-[85vh] overflow-y-auto rounded-xl border border-line-strong bg-[#151619] shadow-pop p-6 animate-modal outline-none",
           wide ? "max-w-2xl" : "max-w-md"
         )}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-5 flex items-center justify-between">
           <h3 className="text-[15px] font-semibold text-gray-100">{title}</h3>
-          <button
-            onClick={onClose}
-            aria-label="关闭"
-            className="-m-1.5 rounded-md p-1.5 text-faint transition-colors hover:bg-white/[0.07] hover:text-gray-200"
-          >
-            <X size={16} />
-          </button>
+          {dismissable && (
+            <button
+              onClick={onClose}
+              aria-label="关闭"
+              className="-m-1.5 rounded-md p-1.5 text-faint transition-colors hover:bg-white/[0.07] hover:text-gray-200"
+            >
+              <X size={16} />
+            </button>
+          )}
         </div>
         {children}
       </div>
@@ -481,4 +549,123 @@ export function fmtLatency(ms?: number | null) {
 export function safePct(ok: number, total: number) {
   if (!total) return "—";
   return `${((ok / total) * 100).toFixed(1)}%`;
+}
+
+/* ---------- 错误条 ---------- */
+/**
+ * 页内错误提示。此前 8 个页面各自逐字抄同一串 className，
+ * 只有 dashboard 那份带重试按钮 —— 其余页面出错后只能整页刷新重来。
+ * 统一到这里，重试变成可选参数。
+ */
+export function ErrorBanner({
+  message,
+  onRetry,
+}: {
+  message: string;
+  onRetry?: () => void;
+}) {
+  if (!message) return null;
+  return (
+    <div
+      role="alert"
+      className="mb-4 flex items-center justify-between gap-3 rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-[13px] text-err"
+    >
+      <span className="min-w-0 break-words">{message}</span>
+      {onRetry && (
+        <button
+          onClick={onRetry}
+          className="shrink-0 rounded-md border border-err/25 bg-err/10 px-2.5 py-1 text-xs font-medium text-err transition-colors hover:bg-err/20"
+        >
+          重试
+        </button>
+      )}
+    </div>
+  );
+}
+
+/* ---------- 应用内确认框 ---------- */
+export interface ConfirmOptions {
+  title: string;
+  message: React.ReactNode;
+  confirmText?: string;
+  cancelText?: string;
+  danger?: boolean;
+  /** 需要逐字输入这段文本才能点确认。用于级联删除这类不可恢复操作。 */
+  requireText?: string;
+}
+
+type ConfirmRequest = {
+  opts: ConfirmOptions;
+  resolve: (v: boolean) => void;
+};
+
+let confirmRequest: ((opts: ConfirmOptions) => Promise<boolean>) | null = null;
+
+/**
+ * 替代原生 `confirm()`。原生框是系统浅色样式，贴在深色控制台里视觉断裂，
+ * 阻塞主线程，而且没法要求"输入名称确认"这种强确认——
+ * 删除渠道会连带删掉其下所有 Key / 代理 / 模型 / 日志，用的却是一个 OK/Cancel。
+ *
+ * 宿主未挂载时降级回原生 confirm：宁可样式丑，也绝不能静默返回 false
+ * 让按钮看起来点了没反应。
+ */
+export function confirmDialog(opts: ConfirmOptions): Promise<boolean> {
+  if (confirmRequest) return confirmRequest(opts);
+  const text = typeof opts.message === "string" ? opts.message : opts.title;
+  return Promise.resolve(window.confirm(`${opts.title}\n\n${text}`));
+}
+
+/** 挂在根布局里，全应用共用一个确认框宿主。 */
+export function ConfirmHost() {
+  const [req, setReq] = React.useState<ConfirmRequest | null>(null);
+  const [typed, setTyped] = React.useState("");
+
+  React.useEffect(() => {
+    confirmRequest = (opts) =>
+      new Promise<boolean>((resolve) => {
+        setTyped("");
+        setReq({ opts, resolve });
+      });
+    return () => {
+      confirmRequest = null;
+    };
+  }, []);
+
+  if (!req) return null;
+  const { opts, resolve } = req;
+  const blocked = !!opts.requireText && typed.trim() !== opts.requireText;
+  const done = (v: boolean) => {
+    setReq(null);
+    resolve(v);
+  };
+
+  return (
+    <Modal open title={opts.title} dismissable={false} onClose={() => done(false)}>
+      <div className="space-y-4">
+        <div className="text-[13px] leading-relaxed text-gray-300">{opts.message}</div>
+        {opts.requireText && (
+          <Field label={`输入「${opts.requireText}」以确认`}>
+            <Input
+              value={typed}
+              onChange={(e) => setTyped(e.target.value)}
+              placeholder={opts.requireText}
+            />
+          </Field>
+        )}
+        <div className="flex justify-end gap-2">
+          <Button type="button" onClick={() => done(false)}>
+            {opts.cancelText ?? "取消"}
+          </Button>
+          <Button
+            type="button"
+            variant={opts.danger ? "danger" : "primary"}
+            disabled={blocked}
+            onClick={() => done(true)}
+          >
+            {opts.confirmText ?? "确认"}
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
 }

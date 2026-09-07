@@ -3,9 +3,8 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowRight, KeyRound } from "lucide-react";
-import { NvidiaLogo } from "@/components/ui";
+import { Button, Input, NvidiaLogo } from "@/components/ui";
 import { api, setToken } from "@/lib/api";
-import { Button, Input } from "@/components/ui";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -63,20 +62,32 @@ export default function LoginPage() {
           onSubmit={submit}
           className="rounded-xl border border-line bg-panel-strong p-6 shadow-panel space-y-4"
         >
-          <Input
-            placeholder="用户名"
-            autoComplete="username"
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            autoFocus
-          />
-          <Input
-            type="password"
-            placeholder="密码"
-            autoComplete="current-password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
+          {/* 只有 placeholder 不算标签：输入一下就消失、且对比度无保证
+              （WCAG 3.3.2）。用 sr-only 的 label 提供可编程标签，视觉设计不变。 */}
+          <div>
+            <label htmlFor="login-user" className="sr-only">用户名</label>
+            <Input
+              id="login-user"
+              name="username"
+              placeholder="用户名"
+              autoComplete="username"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              autoFocus
+            />
+          </div>
+          <div>
+            <label htmlFor="login-pass" className="sr-only">密码</label>
+            <Input
+              id="login-pass"
+              name="password"
+              type="password"
+              placeholder="密码"
+              autoComplete="current-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </div>
           {error && (
             <p role="alert" className="rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-xs text-err">
               {error}
