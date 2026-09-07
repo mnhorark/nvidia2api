@@ -396,6 +396,16 @@ class RequestLog(models.Model):
     total_tokens = models.IntegerField(default=0)
     cached_tokens = models.IntegerField(default=0)          # 缓存读取的输入 token
     first_token_ms = models.FloatField(null=True, blank=True)  # 首 chunk 耗时（TTFT）
+    # --- 交付量观测（2026-09）---------------------------------------------------
+    # 上游截断的两种形态在日志里曾经完全同形（completion_tokens 都是 0，因为
+    # usage 帧永远在截断之后才来），但处置**相反**：
+    #   上游静默被掐   -> 该换线重跑（没交付过任何东西）
+    #   思考流了很久被掐 -> 绝不能换线（字节已下发给客户端，重跑=重复交付）
+    # 没有这三个计数就只能靠猜。null = 非流式请求 / 修复前的历史行，
+    # 与"流式但确实一个 chunk 都没到"（0）区分开。
+    stream_chunks = models.IntegerField(null=True, blank=True)
+    content_chars = models.IntegerField(null=True, blank=True)
+    reasoning_chars = models.IntegerField(null=True, blank=True)
     # Full per-route outcome of the race: winner / failed / cancelled
     routes = models.JSONField(default=list, blank=True)
     # 客户端实际传入的思考参数（原始形态，含 extra_body 透传）

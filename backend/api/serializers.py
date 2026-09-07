@@ -150,7 +150,10 @@ class RequestLogSerializer(serializers.ModelSerializer):
                   "winner_key_name", "winner_proxy_name", "proxy_public_ip", "is_stream",
                   "routes_count", "prompt_tokens", "completion_tokens", "total_tokens",
                   "cached_tokens", "first_token_ms", "generation_speed", "routes",
-                  "client_thinking", "upstream_thinking", "request_summary"]
+                  "client_thinking", "upstream_thinking", "request_summary",
+                  # 交付量观测：回答"截断前这条流到底有没有在动"——静默被掐该换线，
+                  # 思考流了很久被掐绝不能换线，两者在 completion_tokens 上同形（都 0）
+                  "stream_chunks", "content_chars", "reasoning_chars"]
 
     def get_generation_speed(self, obj) -> float | None:
         completion = obj.completion_tokens or 0

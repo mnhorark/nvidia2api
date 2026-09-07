@@ -240,20 +240,31 @@ class RequestBodyPassthroughTests(TestCase):
 class StreamTapTests(TestCase):
     """StreamTap：单点解析 + 与旧探测器语义对齐。"""
 
-    def test_semantics_align_with_old_probes(self):
+    def test_gate_semantics_reasoning_counts_as_delivered(self):
+        """换线闸门：思考增量算"已交付"（2026-09 修正）。
+
+        旧断言是 `sent_content` 不含思考帧，前提是"思考不作为载体转发给客户端，
+        换线重发仍然安全"。该前提已失效——_drain 对每个 chunk 都实时 yield，
+        reasoning_content 同样送到客户端，重跑即重复交付（kimi-k3 实测丢过 300s）。
+        超时档位切换（seen_signal）与重试闸门是两件事，前者语义不变。
+        """
         tap = StreamTap()
-        # role 空帧：旧 _chunk_has_content=False（不锁重试），any_signal=False
+        # role 空帧：既不是交付也不是信号（换线仍然安全）
         info = tap.feed('data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n')
-        self.assertFalse(tap.sent_content)
+        self.assertFalse(tap.delivered_to_client)
         self.assertFalse(info.has_payload)
-        # 思考帧：旧 any_signal=True（切超时档），sent_content 仍 False（可重试）
+        self.assertFalse(info.has_reasoning)
+        # 思考帧：切超时档的信号 + **锁住换线重试**
         info = tap.feed('data: {"choices":[{"delta":{"reasoning_content":"嗯"}}]}\n\n')
         self.assertTrue(info.has_reasoning)
-        self.assertFalse(tap.sent_content)
-        # 正文帧：两边都 True
+        self.assertTrue(tap.delivered_to_client)
+        self.assertEqual(tap.reasoning_chars, 1)
+        self.assertEqual(tap.content_chars, 0)
+        # 正文帧
         info = tap.feed('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n')
         self.assertTrue(info.has_payload)
-        self.assertTrue(tap.sent_content)
+        self.assertTrue(tap.delivered_to_client)
+        self.assertEqual(tap.content_chars, 2)
         # usage 帧（累积替换）
         tap.feed('data: {"choices":[],"usage":{"prompt_tokens":3,'
                  '"completion_tokens":2}}\n\n')
@@ -266,7 +277,7 @@ class StreamTapTests(TestCase):
         tap = StreamTap()
         tap.feed('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n')
         self.assertEqual(tap.finish_reason, "stop")
-        self.assertTrue(tap.sent_content)
+        self.assertTrue(tap.delivered_to_client)
 
     def test_comments_and_bad_json_ignored(self):
         tap = StreamTap()
@@ -345,7 +356,7 @@ class InlineErrorAccountingTests(TestCase):
         tap.feed('data: {"error":{"message":"boom"}}\n\n')
         tap.feed("data: [DONE]\n\n")
         # error 也应锁定重试闸门（已交付内容）
-        self.assertTrue(tap.sent_content)
+        self.assertTrue(tap.delivered_to_client)
         self.assertTrue(tap.saw_done)
 
 

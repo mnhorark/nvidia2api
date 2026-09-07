@@ -323,6 +323,17 @@ export default function RequestLogsPage() {
                         {l.proxy_public_ip && <span>代理出口 IP {l.proxy_public_ip}</span>}
                         {l.error_type && <span className="text-err">错误 {l.error_type}</span>}
                       </div>
+                      {/* 交付量：截断类错误的归因关键——completion_tokens 为 0 时，
+                          靠这三个数区分"上游静默被掐"（该换线）与"思考流了很久被掐"
+                          （绝不能换线，重跑会把已交付的思考再发一遍）。 */}
+                      {detail.stream_chunks != null && (
+                        <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-mute">
+                          <span className="font-medium text-gray-300">已交付</span>
+                          <span className="tabular-nums">SSE 帧 {detail.stream_chunks ?? 0}</span>
+                          <span className="tabular-nums">正文 {detail.content_chars ?? 0} 字</span>
+                          <span className="tabular-nums">思考 {detail.reasoning_chars ?? 0} 字</span>
+                        </div>
+                      )}
                       <div className="space-y-1.5 rounded-lg border border-line bg-white/[0.015] p-3">
                         <div className="flex flex-wrap items-center gap-x-2 text-xs text-mute">
                           <span className="font-medium text-gray-400">客户端传入</span>

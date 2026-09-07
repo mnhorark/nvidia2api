@@ -70,6 +70,44 @@ route_i ── open POST stream ──► 等第一个有效 SSE chunk
 
 代理与 Key 的失败互不影响：单个 Key 失效不会抑制代理，反之亦然。
 
+## 截断与换线重试闸门
+
+上游流结束但**既没有 `finish_reason` 也没有 `[DONE]`** = 静默截断。网关绝不伪造
+`[DONE]` 把它伪装成成功。此时要不要换线重跑，取决于一个判据：
+**有没有已经下发给客户端、重跑就会重复交付的字节**
+（`StreamTap.delivered_to_client`）。
+
+| 已交付的内容 | 能否换线重跑 | 原因 |
+|---|---|---|
+| 无（连 role 帧都没有 / 只有 role 帧） | ✅ 可以 | 客户端什么都没收到 |
+| 正文 / 工具调用 / usage / finish / 流内 error | ❌ 不可以 | 重发即重复交付 |
+| **思考增量 `reasoning_content`** | ❌ **不可以** | 同上（2026-09 修正） |
+
+第三条是本轮修的。旧闸门只认正文，其成立前提是"思考不作为载体转发给客户端"——
+这个前提随思考成为一等公民载体而失效：`_drain` 对每个 chunk 都实时 `yield`，
+reasoning 同样送到了客户端。
+
+线上后果（`moonshotai/kimi-k3` + `reasoning_effort=max` + ~90K prompt）：思考流已
+逐块下发约 **300 秒**后被上游掐断，旧闸门判定"一个字都没交付"→ 丢弃这 300 秒、
+换线从头重跑 → 客户端再收一遍思考流 → 最终 502。实测占 `upstream_truncated` 的
+**7/10（其中 6 条 kimi-k3）**。
+
+守卫：`R12_SilentTruncationTests.test_reasoning_only_truncation_must_not_retry_on_new_route`
+（思考已交付 → `race_stream` 只调用一次）与
+`test_silent_stream_still_eligible_for_route_switch`（真空流 → 仍调用两次），
+两条互为反向锁，防止把合法重试一起关掉。
+
+### 为什么日志里要记交付量
+
+截断的两种形态在旧日志里**完全同形**——`completion_tokens` 都是 0（usage 帧永远在
+截断之后才到），但处置**相反**。所以 `RequestLog` 记了三个观测列（迁移 0026）：
+
+```
+stream_chunks / content_chars / reasoning_chars     null = 非流式或历史行
+```
+
+有了它们才能回答"这条流在被掐之前到底有没有在动"，而不是靠猜。
+
 ## 取消语义
 
 ```

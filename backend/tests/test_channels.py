@@ -827,16 +827,27 @@ class StreamRetryTests(TransactionTestCase):
         self.assertIn("data: [DONE]", body)
         self.assertNotIn("stream_error", body)
 
-    def test_stream_retries_when_breaks_after_reasoning_only(self):
-        # 思考模型：只输出了 reasoning_content（思考过程），尚未产出正文
-        # → 思考阶段断流不算"已提交内容"，应重建线路自动重试
+    def test_stream_no_retry_after_reasoning_only(self):
+        """思考阶段断流**不再**换线重试（2026-09 语义修正）。
+
+        旧断言是"思考阶段断流不算已提交内容，应重建线路自动重试"，其前提是
+        思考不作为载体转发给客户端。该前提已失效：`_drain` 对每个 chunk 都实时
+        yield，reasoning_content 同样送到客户端——换线重跑等于把思考流重发一遍。
+
+        线上形态：kimi-k3 + reasoning_effort=max + 90K prompt，思考流推了约 300 秒
+        被上游掐断，旧逻辑丢弃 300 秒重跑，最终仍 502（占 upstream_truncated 的
+        7/10）。现在：不重跑，把已交付的思考保留、末尾显式报错、日志如实记 failed。
+
+        对照 `test_stream_retries_when_breaks_after_heartbeat_only`：只有心跳帧
+        （choices 为空）时**仍然重试**——闸门收紧的边界是"交付过字节"，不是"流开过"。
+        """
         from services import sysconfig
         sysconfig.set_params({"retry_count": 2}, self.channel)
         reasoning = 'data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}\n\n'
-        ok_chunk = 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
         behaviors = [
             _FakeStreamWinner(chunks=[reasoning], error_after=1),
-            _FakeStreamWinner(chunks=[ok_chunk, "data: [DONE]\n\n"]),
+            _FakeStreamWinner(chunks=['data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+                                      "data: [DONE]\n\n"]),
         ]
         calls = {"n": 0}
 
@@ -847,11 +858,12 @@ class StreamRetryTests(TransactionTestCase):
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
             resp = self._call()
             body = _consume_stream(resp)
-        self.assertEqual(calls["n"], 2)
-        self.assertIn("thinking...", body)
-        self.assertIn('data: {"choices"', body)
-        self.assertIn("data: [DONE]", body)
-        self.assertNotIn("stream_error", body)
+        self.assertEqual(calls["n"], 1, "已交付思考字节不得换线重跑")
+        self.assertIn("thinking...", body, "已交付的思考内容必须保留，不能被丢弃")
+        self.assertNotIn('data: {"choices":[{"delta":{"content":"hi"}}', body,
+                         "不得出现第二份正文——重跑会把答案也重发一遍")
+        self.assertIn("stream_truncated", body, "截断要如实报错")
+        self.assertTrue(body.rstrip().endswith("data: [DONE]"), "仍以 [DONE] 收尾")
 
     def test_stream_no_retry_after_answer_content(self):
         # 已交付正文 content 后才断流 → 响应已提交，不能重试；

@@ -324,6 +324,12 @@ export interface RequestLog {
   cached_tokens?: number;
   first_token_ms?: number;
   generation_speed?: number | null;
+  // 交付量观测（仅流式请求有值；null = 非流式或修复前的历史行）。
+  // 截断归因关键：completion_tokens=0 时靠这三个数区分"上游静默被掐"（该换线
+  // 重跑）与"思考流了很久被掐"（绝不能换线——重跑会把已交付的思考再发一遍）。
+  stream_chunks?: number | null;
+  content_chars?: number | null;
+  reasoning_chars?: number | null;
   created_at: string;
   // 客户端实际传入的思考参数
   client_thinking?: Record<string, unknown>;

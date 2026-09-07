@@ -192,6 +192,7 @@ class AdminChatView(AdminRequiredMixin, APIView):
                 # 解析一次，这里只读累积态
                 stream_ok = False
                 truncated_stream = False
+                aborted = False
                 try:
                     async for chunk in _drain(winner, idle_timeout, heartbeat, max_duration,
                                               content_idle_timeout, tap=tap):
@@ -205,11 +206,25 @@ class AdminChatView(AdminRequiredMixin, APIView):
                         or tap.saw_done)
                     stream_ok = bool(tap.finish_reason or upstream_done)
                     truncated_stream = not stream_ok
+                except BaseException:
+                    # ⚠ 这个 except 是补的正确性缺陷，不是防御性冗余。
+                    # 此前只有 finally：`stream_ok` / `truncated_stream` 只在
+                    # `async for` **正常**结束后才被赋值，所以 _drain 抛异常时
+                    # finally 看到两个都是 False → 落到 else 记成 status="success"。
+                    # 异常继续传播到外层 `except Exception` 的"已交付"分支，
+                    # 那里只更新 duration_ms 就 return —— 不改 status、不记
+                    # error_type、不打日志。净效果：playground 里一条中途暴毙的
+                    # 流被静默伪装成成功。
+                    aborted = True
+                    raise
                 finally:
                     usage = dict(tap.usage)
                     if truncated_stream:
                         log.status = "failed"
                         log.error_type = "upstream_truncated"
+                    elif aborted:
+                        log.status = "failed"
+                        log.error_type = "stream_error"
                     else:
                         log.status = "success"
                     total_ms = round((_time.monotonic() - started) * 1000, 1)
@@ -229,15 +244,24 @@ class AdminChatView(AdminRequiredMixin, APIView):
                     log.total_tokens = (log.prompt_tokens or 0) + (log.completion_tokens or 0)
                     details = usage.get('prompt_tokens_details') or {}
                     log.cached_tokens = details.get('cached_tokens', 0) or 0
+                    # 交付量观测：与 /v1 流式同一口径，否则 admin 侧的截断日志
+                    # 三列永远是 NULL，无法区分"上游静默被掐"与"思考流了很久被掐"
+                    log.stream_chunks = tap.chunk_count
+                    log.content_chars = tap.content_chars
+                    log.reasoning_chars = tap.reasoning_chars
                     await _safe_save()
-                    if stream_ok:
-                        yield ('data: ' + json.dumps({'summary': {'duration_ms': total_ms, 'first_token_ms': log.first_token_ms or duration, 'prompt_tokens': log.prompt_tokens, 'completion_tokens': log.completion_tokens, 'total_tokens': log.total_tokens, 'cached_tokens': log.cached_tokens}}) + '\n\n')
-                        yield 'data: [DONE]\n\n'
-                    elif truncated_stream:
-                        # 静默截断：显式告知前端"输出不完整"（前端已支持 error 事件），
-                        # 不再把半截回答伪装成正常完成
-                        yield ('data: ' + json.dumps({'error': {'message': '上游输出中断：流被提前关闭（未收到 finish_reason/[DONE]），已收到的内容不完整', 'type': 'api_error', 'param': None, 'code': 'upstream_truncated'}}) + '\n\n')
-                        yield 'data: [DONE]\n\n'
+                # 收尾帧从 finally 里移出来：在异常传播路径上 yield 依赖
+                # "生成器被 GC 时才执行 finally"的时机，脆弱且难读。
+                # 正常路径上 finally 已跑完，这里等价地发完成/截断帧；
+                # 异常路径由外层 except 负责告知客户端。
+                if stream_ok:
+                    yield ('data: ' + json.dumps({'summary': {'duration_ms': total_ms, 'first_token_ms': log.first_token_ms or duration, 'prompt_tokens': log.prompt_tokens, 'completion_tokens': log.completion_tokens, 'total_tokens': log.total_tokens, 'cached_tokens': log.cached_tokens}}) + '\n\n')
+                    yield 'data: [DONE]\n\n'
+                elif truncated_stream:
+                    # 静默截断：显式告知前端"输出不完整"（前端已支持 error 事件），
+                    # 不再把半截回答伪装成正常完成
+                    yield ('data: ' + json.dumps({'error': {'message': '上游输出中断：流被提前关闭（未收到 finish_reason/[DONE]），已收到的内容不完整', 'type': 'api_error', 'param': None, 'code': 'upstream_truncated'}}) + '\n\n')
+                    yield 'data: [DONE]\n\n'
             except (NoRouteAvailable, AllRoutesFailed) as exc:
                 log.status, log.http_status, log.error_type = ('failed', 502, 'all_routes_failed')
                 if isinstance(exc, AllRoutesFailed):
@@ -246,9 +270,22 @@ class AdminChatView(AdminRequiredMixin, APIView):
                 yield ('data: ' + json.dumps({'error': {'message': f'所有线路均失败: {exc}', 'type': 'api_error', 'param': None, 'code': 'upstream_error'}}) + '\n\n')
                 yield 'data: [DONE]\n\n'
             except Exception as exc:
-                if tap.sent_content or tap.saw_done:
+                # 闸门含思考增量：见 StreamTap.delivered_to_client
+                if tap.delivered_to_client or tap.saw_done:
+                    # 此前这个分支把异常对象**整个丢弃**：无 logger、不改 status
+                    # （status 已由内层 finally 置为 failed/stream_error）。
+                    # 记账修好后仍要留痕，否则 playground 里一条中途暴毙的流
+                    # 除了一个 error 帧之外在日志里查不到任何线索。
+                    logger.exception(
+                        "admin stream died after delivery (req %s): %s", request_id, exc)
                     log.duration_ms = round((_time.monotonic() - started) * 1000, 1)
                     await _safe_save()
+                    # 显式告知"内容不完整"，而不是只补一个 [DONE] 让前端以为正常收尾
+                    yield ('data: ' + json.dumps({'error': {
+                        'message': f'输出中断：流在已交付部分内容后被异常终止（{exc}），'
+                                   f'已收到的内容不完整',
+                        'type': 'api_error', 'param': None,
+                        'code': 'upstream_stream_error'}}) + '\n\n')
                     if not tap.saw_done:
                         yield 'data: [DONE]\n\n'
                     return

@@ -850,12 +850,21 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                         or tap.saw_done)
                     if not (tap.finish_reason or upstream_done):
                         truncated = True
-                        if not tap.sent_content:
+                        # 闸门包含思考增量：已经吐过 reasoning 的流**不能**再透明
+                        # 换线重跑——那些字节早已逐块 yield 给客户端（kimi-k3 实测
+                        # 丢过 300 秒思考流并重复交付一遍）。
+                        if not tap.delivered_to_client:
                             raise UpstreamTruncated(
                                 "upstream closed stream without finish_reason/[DONE]")
                 finally:
                     usage = dict(tap.usage)
                     completion_text = tap.completion_parts
+                    # 观测：区分"上游静默 300s"与"思考流了 300s 被掐"——这两种
+                    # 情况的正确处置相反（前者该换线、后者绝不能换线），而此前
+                    # 日志里两者长得一模一样（completion_tokens 都是 0）。
+                    log.stream_chunks = tap.chunk_count
+                    log.content_chars = sum(len(p) for p in completion_text)
+                    log.reasoning_chars = tap.reasoning_chars
                     if truncated:
                         log.status = "failed"
                         log.error_type = "upstream_truncated"
@@ -967,7 +976,7 @@ async def _stream_response(routes, upstream_body, holder, user_key, channel,
                     async for _hb in _backoff_with_heartbeat(backoff):
                         yield _hb
             except Exception as exc:
-                if tap.sent_content or tap.saw_done:
+                if tap.delivered_to_client or tap.saw_done:
                     # 线路中途死亡（含已出部分内容后断流）：竞速时该 Key 已被
                     # _mark_success 记为成功，但中途死亡是真实故障。补记一次失败
                     # （不标 invalid，仅累计 failure_count + 冷却），否则"先吐

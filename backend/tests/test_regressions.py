@@ -780,6 +780,63 @@ class R6_AdminStreamFailureTests(IsolatedAsyncioTestCase):
         self.assertIsNotNone(log)
         self.assertEqual(log.status, "success")
 
+    @pytest.mark.django_db
+    async def test_stream_dying_after_delivery_is_not_recorded_success(self):
+        """A4 守卫：playground 流**已交付内容后**中途抛异常，绝不能记成 success。
+
+        回归的缺陷：`stream_ok` / `truncated_stream` 只在 `async for` 正常结束后
+        才被赋值，而收尾全在 `finally` 里 —— 异常路径上两者都是 False，于是落到
+        `else: log.status = "success"`；异常继续传播到外层 `except Exception` 的
+        "已交付"分支，那里只更新 duration_ms 就 return，不改 status、不记
+        error_type、不打日志。中途暴毙的流因此**静默伪装成功**。
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from api import admin_views
+        from services.race_engine import StreamWinner
+
+        ch = Channel.objects.create(name="r6-die", slug="r6-die",
+                                    base_url="https://up.example", enabled=True)
+        ChannelKey.objects.create(channel=ch, name="k0",
+                                  api_key="sk-" + "d" * 40, rpm_limit=1000)
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+
+        route = MagicMock()
+        route.kind = "direct"
+        route.key.name = "k0"
+        route.key.id = 1
+        route.key.channel = ch
+        route.proxy = None
+
+        async def lines(self=None):
+            # 先交付一段正文（锁死 delivered_to_client），再抛 —— 真实形态是
+            # "吐了一会儿字然后上游断了"，不是"一个字节没吐"
+            yield 'data: {"choices":[{"delta":{"content":"部分回答"}}]}\n\n'
+            raise RuntimeError("上游连接被重置")
+
+        w = StreamWinner(route=route, cm=MagicMock(), req_cm=MagicMock(),
+                         aiter=None, first_line="data: x\n\n")
+        w.report = [{"name": "direct:k0", "status": "winner"}]
+        w.lines = lines
+        w.close = AsyncMock()
+
+        with patch("services.race_engine.race_stream",
+                   new=AsyncMock(return_value=w)):
+            resp = admin_views.AdminChatView()._stream(body, "m", ch)
+
+        parts = [p async for p in resp.streaming_content]
+        payload = b"".join(parts).decode("utf-8", "replace")
+
+        log = RequestLog.objects.filter(channel=ch).order_by("-id").first()
+        self.assertIsNotNone(log)
+        self.assertEqual(
+            log.status, "failed",
+            "已交付内容后中途暴毙的流被记成了 success —— A4 回归")
+        self.assertEqual(log.error_type, "stream_error")
+        # 客户端必须收到显式 error 帧，而不是只收到一个 [DONE] 以为正常收尾
+        self.assertIn("upstream_stream_error", payload)
+        self.assertIn("部分回答", payload)
+
 
 class R8_ModelSyncPruneTests(TestCase):
     """R8: 模型"同步并清理 / 仅清理不同步"。
@@ -1307,6 +1364,83 @@ class R12_SilentTruncationTests(IsolatedAsyncioTestCase):
         log.refresh_from_db()
         self.assertEqual(log.status, "failed")
         self.assertEqual(log.error_type, "upstream_truncated")
+
+    async def test_reasoning_only_truncation_must_not_retry_on_new_route(self):
+        """思考流已交付 = 不可重发：绝不能换线重跑（2026-09 修正的闸门语义）。
+
+        线上形态（req_c8e18fc0 等，占 upstream_truncated 的 7/10，6 条 kimi-k3）：
+        reasoning_effort=max + 90K prompt，思考增量逐块下发 300 秒后被上游掐断。
+        旧闸门只认正文，判定"一个字都没交付"→ 丢弃这 300 秒、换线从头重跑 →
+        客户端再收一遍思考流 → 最终 502。
+
+        守卫点：max_attempts=2 时 race_stream 必须**只被调用一次**（不换线），
+        同时思考字节照常送达客户端、末尾给显式 error 帧、观测列如实记录。
+        """
+        from unittest.mock import AsyncMock
+
+        import time as _time
+
+        async def lines(self=None):
+            for t in ("嗯", "，", "让我", "想想"):
+                yield 'data: {"choices":[{"delta":{"reasoning_content":' \
+                      + json.dumps(t, ensure_ascii=False) + '}}]}\n\n'
+            # 思考流了很久，上游直接 EOF：无 finish_reason、无 [DONE]
+
+        w = self._mk_winner(self.ch, lines)
+        race = AsyncMock(return_value=w)
+        log = RequestLog.objects.create(
+            channel=self.ch, request_id="r12-t3", user_api_key=self.user,
+            model="m", routes_count=1, is_stream=True)
+        holder = {"log": log, "started": _time.monotonic()}
+        with patch("api.openai_views.race_stream", new=race):
+            gen = openai_views._stream_response(
+                [w.route], {}, holder, self.user, self.ch, 2)   # 允许重试一次
+            chunks = [c async for c in gen]
+        text = "".join(chunks)
+
+        self.assertEqual(race.await_count, 1,
+                         "已交付思考字节的流不得换线重跑（会重复交付思考内容）")
+        self.assertIn("让我", text, "思考增量必须原样送达客户端")
+        self.assertIn("upstream_truncated", text, "截断仍要显式报错，不能伪装成功")
+        log.refresh_from_db()
+        self.assertEqual(log.status, "failed")
+        self.assertEqual(log.error_type, "upstream_truncated")
+        # 观测列：能区分"静默被掐"与"思考流了很久被掐"
+        self.assertEqual(log.reasoning_chars, 6)      # 嗯 ， 让 我 想 想
+        self.assertEqual(log.content_chars, 0)
+        self.assertGreaterEqual(log.stream_chunks, 4)
+
+    async def test_silent_stream_still_eligible_for_route_switch(self):
+        """反向守卫：真的什么都没交付时，换线重跑仍然是正确行为——不能被
+        上一条修复顺手关掉。role 空帧不算交付。"""
+        from unittest.mock import AsyncMock
+
+        import time as _time
+
+        async def lines(self=None):
+            yield 'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+            # 只有 role 标记，然后上游就断了
+
+        w = self._mk_winner(self.ch, lines)
+        race = AsyncMock(return_value=w)
+        # 重试轮要能重建出线路，渠道里必须真的有一把 Key（_mk_winner 的 route 是
+        # mock，key.id=4242 不在库内，因此不会被 exclude 集合误伤）
+        ChannelKey.objects.create(channel=self.ch, name="r12-k",
+                                  api_key="nvapi-r12-retry", rpm_limit=40)
+        log = RequestLog.objects.create(
+            channel=self.ch, request_id="r12-t4", user_api_key=self.user,
+            model="m", routes_count=1, is_stream=True)
+        holder = {"log": log, "started": _time.monotonic()}
+        with patch("api.openai_views.race_stream", new=race):
+            gen = openai_views._stream_response(
+                [w.route], {}, holder, self.user, self.ch, 2)
+            [c async for c in gen]
+        self.assertEqual(race.await_count, 2,
+                         "未交付任何字节时应换线重试（max_attempts=2 → 调用两次）")
+        log.refresh_from_db()
+        self.assertEqual(log.error_type, "upstream_truncated")
+        self.assertEqual(log.reasoning_chars, 0)
+        self.assertEqual(log.content_chars, 0)
 
     async def test_finish_reason_without_done_is_still_complete(self):
         from unittest.mock import AsyncMock
