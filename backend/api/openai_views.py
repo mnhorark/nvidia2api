@@ -350,17 +350,24 @@ def _request_summary(body: dict, tool_alias_map: dict | None) -> dict:
     return summary
 
 
-def _authorize(request, *, consume_quota: bool = True):
-    """数据面入口鉴权：Bearer Key 有效性 → enabled → RPM → 额度。
+def _authorize(request):
+    """数据面入口鉴权：Bearer Key 有效性 → enabled → RPM → 额度闸门（只读）。
 
-    `consume_quota=True`（默认，生成类端点）：用 `claim_quota` **原子预占
-    1 token**，成功路径由 `record_usage(reservation=1)` 结算、失败路径显式
-    退还。预占的意义是"额度将尽时也不让 N 个并发同时越过 quota"。
+    ⚠ 本函数**只过闸门、不预占**。真正的原子预占在 `_reserve_quota`，
+    由生成类视图在 `_parse_body` 之后、进入 `_run_authed` 之前调用。
 
-    `consume_quota=False`（不产生上游消耗的端点，如 count_tokens）：改用
-    只读 `check_quota` 做**同一道 402 闸门**，但绝不预占。历史缺陷：该端点
-    曾走默认分支 claim 了 1 token 却从不结算，Claude Code 类客户端每轮上下文
-    计数都永久吞掉 1 额度，且不落 RequestLog，排查时完全隐形。
+    为什么拆两段（2026-09-07，A3）：旧实现在这里就 `claim_quota` 预占 1 token，
+    而视图层有 7 个出口在 `_authorize` 成功之后直接 `return err`
+    （`_parse_body` 的 400/413、`input is required`、`messages is required`、
+    `model and messages are required`、`channel_not_found`、模型不存在），
+    **一个都不退还**，且全部位于 `RequestLog.objects.create` 之前——
+    畸形 body / 不存在模型每请求永久吞掉 1 额度且零留痕。
+    那正是 09-05 修掉的 `count_tokens` 吞额度缺陷换了个形态复现。
+    把预占挪到"所有校验都过了、马上要生成"的位置，泄漏面从 7 个分散出口
+    收敛为 0：早退发生在预占之前，天然无事可退。
+
+    闸门本身仍然在这里过：额度已耗尽的 Key 不该因为"请求体还没解析"就绕过
+    计费边界。只读判定不会超扣，并发超扣由后面的原子 claim 兜住。
     """
     user_key = _authenticate(request)
     if user_key is None:
@@ -372,14 +379,33 @@ def _authorize(request, *, consume_quota: bool = True):
         if reason == "rate_limited":
             return None, openai_error("Rate limit exceeded", "rate_limit_exceeded", 429)
         return None, openai_error("API key disabled", "key_disabled", 403, "authentication_error")
-    if consume_quota:
-        ok, reason = api_key_service.claim_quota(user_key)
-    else:
-        ok, reason = api_key_service.check_quota(user_key)
+    ok, reason = api_key_service.check_quota(user_key)
     if not ok:
         return None, openai_error("Insufficient quota (quota exceeded)",
                                   "insufficient_quota", 402, "insufficient_quota")
     return user_key, None
+
+
+def _reserve_quota(user_key):
+    """原子预占 1 token 额度。返回 `(ok, err_response)`。
+
+    必须在视图里所有可早退的校验之后调用，紧邻 `_run_authed`：
+    预占一旦成功，责任就交给 `_run_authed` 的结算/退还路径。
+    """
+    ok, reason = api_key_service.claim_quota(user_key)
+    if ok:
+        return True, None
+    return False, openai_error("Insufficient quota (quota exceeded)",
+                               "insufficient_quota", 402, "insufficient_quota")
+
+
+def _refund_reservation(user_key):
+    """退还 `_reserve_quota` 的预占。用于 `_run_authed` 里预占之后、
+    尚未进入结算路径就早退的分支（模型不存在 / 参数缺失）。"""
+    try:
+        api_key_service.record_usage(user_key, reservation=1)
+    except Exception:  # noqa: BLE001
+        logger.exception("refund quota reservation failed")
 
 
 MAX_BODY_BYTES = 32 * 1024 * 1024
@@ -422,15 +448,30 @@ def _parse_body(request):
 
 def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
     if not _try_acquire_request():
+        # 预占已在视图里发生（_reserve_quota），而这个出口在 try 之外、
+        # 走不到 finally 的兜底 —— 不在此退还，拥塞期每一个 429 都会永久吞
+        # 1 token 额度且不落 RequestLog（并发越接近 max_concurrent_requests
+        # 漏得越快，恰是最不该计费出错的时候）。
+        _refund_reservation(user_key)
         return openai_error("Server busy, too many concurrent requests",
                             "server_overloaded", 429)
     log = None
     semaphore_released_by_stream = False
     upstream_reserved = 0
+    # B5：`crashed` 只在异常逃逸时置位，用于区分"正常 return（终态路径已结算）"
+    # 与"异常穿透"。`request_id` 与 `started` 都在 try 内部才生成，而 finally 里的
+    # 兜底要无条件读它们 —— 少预声明任何一个，兜底自己就会先抛 UnboundLocalError，
+    # 既掩盖原始异常、又让退款/结算完全不执行（正是它声称要防的场景）。
+    crashed = False
+    # 兜底路径的耗时从"进入生成流程"起算；建日志后会被重新绑定为原语义
+    started = time.monotonic()
+    request_id = ""
     try:
         requested_name = body.get("model", "")
         messages = body.get("messages")
         if not requested_name or not isinstance(messages, list) or not messages:
+            # 预占已在视图里发生（_reserve_quota），此处早退必须退还
+            _refund_reservation(user_key)
             return openai_error("model and messages are required", "invalid_request",
                                 400, "invalid_request_error")
 
@@ -438,9 +479,11 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
         try:
             model, channel = _resolve_target(requested_name, slug)
         except ChannelNotFound as exc:
+            _refund_reservation(user_key)
             return openai_error(f"Unknown channel '{exc.slug}'",
                                 "channel_not_found", 404, "invalid_request_error")
         if model is None:
+            _refund_reservation(user_key)
             return _not_found_error(requested_name, slug)
 
         model_name = model.model_name
@@ -502,7 +545,6 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
 
         if stream:
             log_id_holder = {"log": log, "started": started}
-            semaphore_released_by_stream = True
             gen = _stream_response(routes, upstream_body, log_id_holder,
                                    user_key, channel, max_attempts,
                                    proxy_group=model.proxy_group_id,
@@ -515,6 +557,13 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
             response = StreamingHttpResponse(gen, content_type="text/event-stream")
             response["Cache-Control"] = "no-cache"
             response["X-Accel-Buffering"] = "no"
+            # B9：交接标志必须**在响应对象构造成功之后**才置位。
+            # 旧写法在创建生成器之前就置 True，于是若 `StreamingHttpResponse(...)`
+            # 或上面任何一行抛错，外层 finally 会因为该标志为 True 而跳过
+            # `_bump_active(-1)` —— 而生成器从未被迭代，它自己的 finally 也不会跑，
+            # `_active_count` 就永久 +1（累积到 max_concurrent_requests 后整站 429
+            # 且不可自愈，因为僵尸名额自己不会退出）。
+            semaphore_released_by_stream = True
             return response
 
         result = None
@@ -522,6 +571,7 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
         for attempt in range(max_attempts):
             attempt_routes = routes if attempt == 0 else build_routes(
                 channel, proxy_group=model.proxy_group_id, endpoint=model.endpoint)
+
             if not attempt_routes:
                 last_exc = NoRouteAvailable()
                 continue
@@ -621,10 +671,55 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
         elif protocol == "anthropic":
             payload = anthropic_api.chat_to_messages_payload(payload)
         return JsonResponse(payload, status=200)
+    except BaseException:
+        # B5：区分"正常 return（各终态路径已自行结算）"与"异常逃逸"。
+        # 只有后者需要兜底，绝不能在正常路径上重复退款/重复结算。
+        crashed = True
+        raise
     finally:
         if not semaphore_released_by_stream:
             _bump_active(-1)
             _release_upstream(upstream_reserved)
+        if crashed:
+            _force_settle_non_stream(user_key, log, started, request_id)
+
+
+def _force_settle_non_stream(user_key, log, started: float,
+                             request_id: str = "") -> None:
+    """B5：非流式路径的兜底结算。
+
+    流式的 `finally` 会强制 settle（未结算的置 failed 并退款），非流式此前
+    **只释放信号量与上游额度**——于是 `RequestLog.objects.create` 之后、
+    `_finish_log` 之前抛出的任何未捕获异常，都会同时留下：
+
+    1. 一行永久 `status="pending"` 的 RequestLog。实测库里 630 条（最早 9 天前），
+       而成功率与平均延迟的分母都含 pending → 统计被系统性拉低；
+    2. 一份悬空的 `claim_quota` 预占（`used_quota` 永久 +1）。
+
+    触发面很宽：`build_routes` 撞 SQLite 写锁、`sysconfig.get` 对未知键抛
+    KeyError、协议转换抛 AttributeError，以及最要紧的一条——一旦有人把数据面
+    视图改成 async，`race_chat` 里的 `asyncio.run` 必抛 RuntimeError，
+    每个非流式请求都会走到这里。
+
+    判据用 `log.status == "pending"`：所有正常终态都是先 `_finish_log`
+    （置 success/failed）再退款，所以"仍是 pending"等价于"没人结算过"。
+    """
+    try:
+        if log is None:
+            # 日志还没建就炸了：只退额度，没有行可结算
+            api_key_service.record_usage(user_key, reservation=1)
+            return
+        if log.status != "pending":
+            return          # 已有终态路径处理过，绝不重复退
+        _finish_log(log, started, False, 500, "unhandled_error")
+        api_key_service.record_result(user_key, False)
+        api_key_service.record_usage(user_key, reservation=1)
+        logger.error(
+            "request %s 未捕获异常逃逸出非流式路径，已兜底结算为 failed 并退还额度",
+            log.request_id or request_id)
+    except Exception:  # noqa: BLE001
+        # 兜底路径自己再抛会掩盖原始异常，这里只留痕
+        logger.exception("非流式兜底结算自身失败 (req %s)", request_id)
 
 
 @csrf_exempt
@@ -635,6 +730,10 @@ def chat_completions(request, channel_slug: str | None = None):
     if err:
         return err
     body, err = _parse_body(request)
+    if err:
+        return err
+    # 预占放在**所有可早退的校验之后**：见 _authorize 的 A3 说明
+    ok, err = _reserve_quota(user_key)
     if err:
         return err
     return _run_authed(user_key, body, channel_slug, "chat")
@@ -653,6 +752,9 @@ def responses(request, channel_slug: str | None = None):
     chat_body = responses_api.responses_to_chat_body(body)
     if not isinstance(chat_body.get("messages"), list) or not chat_body.get("messages"):
         return openai_error("input is required", "invalid_request", 400, "invalid_request_error")
+    ok, err = _reserve_quota(user_key)
+    if err:
+        return err
     return _run_authed(user_key, chat_body, channel_slug, "responses", echo_body=body)
 
 
@@ -669,6 +771,9 @@ def anthropic_messages(request, channel_slug: str | None = None):
     chat_body = anthropic_api.messages_to_chat_body(body)
     if not isinstance(chat_body.get("messages"), list) or not chat_body.get("messages"):
         return openai_error("messages is required", "invalid_request", 400, "invalid_request_error")
+    ok, err = _reserve_quota(user_key)
+    if err:
+        return err
     return _run_authed(user_key, chat_body, channel_slug, "anthropic", echo_body=body)
 
 
@@ -676,9 +781,10 @@ def anthropic_messages(request, channel_slug: str | None = None):
 def anthropic_count_tokens(request, channel_slug: str | None = None):
     if request.method != "POST":
         return openai_error("Method not allowed", "method_not_allowed", 405)
-    # consume_quota=False：本端点是**纯本地计算**（不产生上游消耗），只过
-    # 额度闸门不预占。走默认分支会让每次计数永久吞掉 1 token 额度。
-    user_key, err = _authorize(request, consume_quota=False)
+    # 本端点是**纯本地计算**（不产生上游消耗）：过 `_authorize` 的只读额度闸门，
+    # 但**不调 `_reserve_quota`**。历史上它走默认分支 claim 了 1 token 却从不结算，
+    # Claude Code 类客户端每轮上下文计数都永久吞掉 1 额度且不落 RequestLog。
+    user_key, err = _authorize(request)
     if err:
         return err
     body, err = _parse_body(request)

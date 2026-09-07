@@ -217,8 +217,16 @@ class CountTokensQuotaTests(TestCase):
         self.assertEqual(codes[2], 429)
 
     def test_generation_path_still_reserves_quota(self):
-        # 反向守卫：不能把修复做成"整个 _authorize 都不预占"——生成类端点
-        # 必须继续原子预占，否则并发会越过 quota
+        """反向守卫：不能把修复做成"生成类端点也不预占"——否则并发会越过 quota。
+
+        ⚠ 这条守卫在本批把预占从 `_authorize` 挪到视图的 `_reserve_quota` 之后
+        一度变成**空断言**：`used_quota` 无论有没有预占过都会是 0
+        （失败路径的 `record_usage(reservation=1)` 会把它打成 -1，再被
+        `api_key_service` 的负值归零钳回 0），`total_requests` 来自 RPM 而非额度。
+        所以必须**直接观测 claim 是否发生**，不能靠结果值反推。
+        """
+        from unittest.mock import patch
+
         from apps.core.models import AIModel, ChannelKey
         from services import channel_service
         channel = channel_service.ensure_default_channel()
@@ -226,14 +234,116 @@ class CountTokensQuotaTests(TestCase):
                                   rpm_limit=100)
         AIModel.objects.create(channel=channel, model_name="m", enabled=True)
         rec, raw = api_key_service.create_key("gen", quota=100)
-        resp = openai_views.chat_completions(
-            self.factory.post("/v1/chat/completions",
-                              data=json.dumps({"model": "m", "messages": [
-                                  {"role": "user", "content": "hi"}]}),
-                              content_type="application/json",
-                              HTTP_AUTHORIZATION=f"Bearer {raw}"))
-        # 无可用线路也会走失败路径退还预占；关键是"预占发生过"
+
+        real_claim = api_key_service.claim_quota
+        claims: list[int] = []
+
+        def spy(rec_arg):
+            claims.append(rec_arg.pk)
+            return real_claim(rec_arg)
+
+        with patch.object(api_key_service, "claim_quota", side_effect=spy):
+            resp = openai_views.chat_completions(
+                self.factory.post("/v1/chat/completions",
+                                  data=json.dumps({"model": "m", "messages": [
+                                      {"role": "user", "content": "hi"}]}),
+                                  content_type="application/json",
+                                  HTTP_AUTHORIZATION=f"Bearer {raw}"))
+
         self.assertIn(resp.status_code, (200, 502, 503))
+        self.assertEqual(
+            claims, [rec.pk],
+            "生成路径没有发生原子预占 —— 并发会越过 quota，"
+            "这正是 d3bc0a3 立这条守卫要防的回归")
         rec.refresh_from_db()
         self.assertEqual(rec.used_quota, 0)  # 失败已退还
         self.assertEqual(rec.total_requests, 1)  # RPM/计数确实记过
+
+    def test_count_tokens_never_claims(self):
+        """与上一条配对：只读端点必须**不**触发 claim，否则又回到吞额度老 bug。"""
+        from unittest.mock import patch
+
+        rec, raw = api_key_service.create_key("gen2", quota=100)
+        with patch.object(api_key_service, "claim_quota",
+                          side_effect=AssertionError("count_tokens 不该预占")):
+            resp = openai_views.anthropic_count_tokens(
+                self.factory.post("/v1/messages/count_tokens",
+                                  data=json.dumps({"model": "claude-sonnet-4",
+                                                   "messages": [
+                                                       {"role": "user",
+                                                        "content": "hi"}]}),
+                                  content_type="application/json",
+                                  HTTP_AUTHORIZATION=f"Bearer {raw}"))
+        self.assertEqual(resp.status_code, 200)
+        rec.refresh_from_db()
+        self.assertEqual(rec.used_quota, 0)
+
+
+class EarlyReturnQuotaLeakTests(TestCase):
+    """A3：视图层早退绝不能吞掉额度预占。
+
+    2026-09-07 复审发现：`_authorize` 里 `claim_quota` 预占 1 token，而视图层有
+    7 个出口在它成功之后直接 `return err`，一个都不退还，且全部位于
+    `RequestLog.objects.create` 之前 —— 畸形 body / 不存在的模型每请求永久吞
+    1 额度且零留痕。这正是 09-05 修掉的 count_tokens 吞额度缺陷换了个形态复现。
+
+    修复方式是把预占从 `_authorize` 挪到 `_reserve_quota`，由视图在**所有可早退
+    的校验之后**调用；`_run_authed` 内部预占之后的 3 个早退显式退还。
+    """
+
+    PATH = "/v1/chat/completions"
+
+    def setUp(self):
+        self.factory = RequestFactory()
+
+    def _post_raw(self, raw, data=None, body_bytes=None):
+        kwargs = {"content_type": "application/json",
+                  "HTTP_AUTHORIZATION": f"Bearer {raw}"}
+        if body_bytes is not None:
+            return openai_views.chat_completions(
+                self.factory.post(self.PATH, data=body_bytes, **kwargs))
+        return openai_views.chat_completions(
+            self.factory.post(self.PATH, data=json.dumps(data), **kwargs))
+
+    def test_malformed_body_does_not_consume_quota(self):
+        """_parse_body 的 400 发生在预占之前：无事可退，绝不能吞额度。"""
+        rec, raw = api_key_service.create_key("leak1", quota=100)
+        resp = self._post_raw(raw, body_bytes=b"{not json")
+        self.assertEqual(resp.status_code, 400)
+        rec.refresh_from_db()
+        self.assertEqual(
+            rec.used_quota, 0,
+            "畸形 body 的 400 吞掉了额度预占 —— A3 回归")
+
+    def test_missing_messages_does_not_consume_quota(self):
+        """`model and messages are required` 在 _run_authed 内、预占之后：
+        必须显式退还。"""
+        rec, raw = api_key_service.create_key("leak2", quota=100)
+        resp = self._post_raw(raw, {"model": "m"})
+        self.assertEqual(resp.status_code, 400)
+        rec.refresh_from_db()
+        self.assertEqual(rec.used_quota, 0,
+                         "参数缺失的 400 吞掉了额度预占 —— A3 回归")
+
+    def test_unknown_model_does_not_consume_quota(self):
+        """模型不存在的 404 同样在预占之后，必须退还。"""
+        from services import channel_service
+        channel_service.ensure_default_channel()
+        rec, raw = api_key_service.create_key("leak3", quota=100)
+        resp = self._post_raw(raw, {"model": "no-such-model-xyz",
+                                    "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(resp.status_code, 404)
+        rec.refresh_from_db()
+        self.assertEqual(rec.used_quota, 0,
+                         "模型不存在的 404 吞掉了额度预占 —— A3 回归")
+
+    def test_exhausted_quota_still_gates_before_parsing(self):
+        """反向守卫：闸门不能被挪走。额度耗尽的 Key 打畸形 body 也要 402，
+        而不是因为"预占延后了"就先花力气解析请求体。"""
+        rec, raw = api_key_service.create_key("leak4", quota=10)
+        rec.used_quota = 10
+        rec.save()
+        resp = self._post_raw(raw, body_bytes=b"{not json")
+        self.assertEqual(resp.status_code, 402)
+        self.assertEqual(json.loads(resp.content)["error"]["code"],
+                         "insufficient_quota")
