@@ -230,8 +230,17 @@ def schedulable_proxies(channel: Channel, group: int | None = None) -> list[Prox
         if not cancel_unhealthy:
             if p.cooldown_until and p.cooldown_until > now:
                 continue
-            if p.status == ProxyStatus.UNHEALTHY:
-                continue
+            # B7：unhealthy 曾经是**永久**判决——上面那行冷却判断只看
+            # `cooldown_until`，而这一行无条件跳过 UNHEALTHY，于是冷却到期后
+            # 代理依然回不到调度池，唯一出路是有人在控制台手点测速
+            # （只有 `report_proxy_result(success=True)` 会恢复 HEALTHY）。
+            # 一条代理被偶发网络抖动连续打挂三次，就得等人工复检——
+            # 在 1200+ 代理的池子里等于永久损失一条线路。
+            #
+            # 现在退化成标准熔断器的 half-open：`cooldown_until` 过期即重新
+            #  eligible。真死的代理会快速失败（connect 超时 10s）并被
+            # `report_proxy_result` 重新置 UNHEALTHY + 新冷却，自动回到 open。
+            # 状态字段本身不改——读路径不做写操作。
         out.append(p)
     out.sort(key=lambda p: (
         p.latency_ms if p.latency_ms is not None else float("inf"),

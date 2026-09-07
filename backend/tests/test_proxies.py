@@ -321,3 +321,51 @@ class ProxySecretStorageTests(TestCase):
         data = ProxySerializer(self._proxy()).data
         self.assertNotIn("s3cret-pass", str(dict(data)))
         self.assertEqual(data["password"], "••••••")
+
+
+class ProxyUnhealthyRecoveryTests(TestCase):
+    """B7：unhealthy 必须是**可恢复**的熔断状态，不是永久判决。
+
+    旧实现 `schedulable_proxies` 无条件跳过 UNHEALTHY，而 `cooldown_until`
+    过期后没有任何自动路径把状态改回 HEALTHY —— 唯一出路是有人在控制台手点测速。
+    一条代理被偶发抖动连续打挂三次就永久退出调度池，在 1200+ 代理的池子里
+    等于静默损失线路，且前端只会显示"异常"，看不出它其实早就该被重新试探。
+    """
+
+    def setUp(self):
+        self.channel = make_channel("b7")
+        self.proxy = Proxy.objects.create(
+            channel=self.channel, name="p0", protocol="socks5", host="1.2.3.4",
+            port=1080, enabled=True, status=ProxyStatus.UNHEALTHY,
+            consecutive_failures=3)
+
+    def test_expired_cooldown_makes_it_schedulable_again(self):
+        self.proxy.cooldown_until = timezone.now() - timedelta(seconds=1)
+        self.proxy.save(update_fields=["cooldown_until"])
+        ids = [p.id for p in proxy_service.schedulable_proxies(self.channel)]
+        self.assertIn(self.proxy.id, ids,
+                      "冷却已过期却仍被永久排除 —— B7 回归")
+
+    def test_active_cooldown_still_excludes_it(self):
+        """反向守卫：half-open 不等于无视冷却。"""
+        self.proxy.cooldown_until = timezone.now() + timedelta(seconds=60)
+        self.proxy.save(update_fields=["cooldown_until"])
+        ids = [p.id for p in proxy_service.schedulable_proxies(self.channel)]
+        self.assertNotIn(self.proxy.id, ids)
+
+    def test_no_cooldown_record_means_never_blocked(self):
+        """被标 unhealthy 但从未设冷却（历史行 / 手工置状态）也必须能回来。"""
+        self.proxy.cooldown_until = None
+        self.proxy.save(update_fields=["cooldown_until"])
+        ids = [p.id for p in proxy_service.schedulable_proxies(self.channel)]
+        self.assertIn(self.proxy.id, ids)
+
+    def test_cancel_unhealthy_channel_still_bypasses_everything(self):
+        """渠道级"关闭异常标记"的既有语义不变。"""
+        Channel.objects.filter(pk=self.channel.pk).update(
+            disable_proxy_unhealthy=True)
+        self.channel.refresh_from_db()
+        self.proxy.cooldown_until = timezone.now() + timedelta(seconds=60)
+        self.proxy.save(update_fields=["cooldown_until"])
+        ids = [p.id for p in proxy_service.schedulable_proxies(self.channel)]
+        self.assertIn(self.proxy.id, ids)
