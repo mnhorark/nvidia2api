@@ -257,7 +257,7 @@ class UpstreamWireTests(TransactionTestCase):
     Django 的 DB 连接是按 task 隔离的，看不到 TestCase 未提交事务中的数据。
     """
 
-    def _call_upstream(self, client_body: dict) -> dict:
+    async def _call_upstream(self, client_body: dict) -> dict:
         captured: dict = {}
 
         def handler(request: httpx.Request):
@@ -294,12 +294,12 @@ class UpstreamWireTests(TransactionTestCase):
         )
         with patch.object(race_engine, "_client_kwargs", patched), \
              patch.object(openai_views, "_finish_log"):
-            response = openai_views.chat_completions(request)
+            response = await openai_views.chat_completions(request)
         self.assertEqual(response.status_code, 200)
         return captured.get("body", {})
 
-    def test_reasoning_effort_reaches_upstream(self):
-        body = self._call_upstream({
+    async def test_reasoning_effort_reaches_upstream(self):
+        body = await self._call_upstream({
             "model": "deepseek-ai/deepseek-v4-pro-0813",
             "messages": [{"role": "user", "content": "hi"}],
             "reasoning_effort": "high",
@@ -309,8 +309,8 @@ class UpstreamWireTests(TransactionTestCase):
         # 显式开关仍正常传递（见 test_chat_template_kwargs_known_keys）。
         self.assertNotIn("chat_template_kwargs", body)
 
-    def test_extra_body_chat_template_kwargs_reaches_upstream(self):
-        body = self._call_upstream({
+    async def test_extra_body_chat_template_kwargs_reaches_upstream(self):
+        body = await self._call_upstream({
             "model": "deepseek-ai/deepseek-v4-pro-0813",
             "messages": [{"role": "user", "content": "hi"}],
             "extra_body": {"chat_template_kwargs": {"enable_thinking": True},
@@ -321,8 +321,8 @@ class UpstreamWireTests(TransactionTestCase):
         self.assertNotIn("enable_thinking", body["chat_template_kwargs"])
         self.assertEqual(body["reasoning_budget"], 8192)
 
-    def test_unknown_params_forwarded_losslessly(self):
-        body = self._call_upstream({
+    async def test_unknown_params_forwarded_losslessly(self):
+        body = await self._call_upstream({
             "model": "deepseek-ai/deepseek-v4-pro-0813",
             "messages": [{"role": "user", "content": "hi"}],
             "bogus_param": 1,

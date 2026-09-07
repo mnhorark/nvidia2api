@@ -625,9 +625,26 @@ async def _stream_first_valid(route: Route, body: dict):
         return None, route_info(route, "failed", error=typ)
 
 
-def race_chat(routes: list[Route], body: dict) -> RaceResult:
-    """Synchronous entry: race non-streaming chat completion."""
-    return asyncio.run(_race(routes, body))
+async def race_chat(routes: list[Route], body: dict) -> RaceResult:
+    """异步竞速入口：直接 `await`，跑在调用方所在的事件循环上。
+
+    旧实现是同步函数 `asyncio.run(_race(...))`，被同步视图调用。而本项目所有
+    同步视图都由 asgiref 的 thread-sensitive 执行器承载
+    （`asgiref/sync.py:402` 硬编码 `ThreadPoolExecutor(max_workers=1)`），
+    `asyncio.run` 会**阻塞调用线程直到竞速结束**——所以一条非流式请求独占那条
+    唯一线程的不是我们测出的 10ms CPU 时间，而是**整个上游往返时长**（几秒到
+    几分钟）。真实吞吐上限因此是 `1/平均上游时长`，而不是 `1/10ms`。
+    改成 await 之后，等待期间那条线程可以服务别的请求。
+    """
+    return await _race(routes, body)
+
+
+def race_chat_blocking(routes: list[Route], body: dict) -> RaceResult:
+    """同步入口，仅供仍是同步视图的调用方使用（管理端 playground）。
+
+    数据面不要用这个：它会在 asgiref 的单线程执行器上开一个新事件循环并阻塞。
+    """
+    return asyncio.run(race_chat(routes, body))
 
 
 async def race_stream_winner(routes: list[Route], body: dict):

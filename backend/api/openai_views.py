@@ -139,24 +139,25 @@ def _model_entry(m: AIModel, name: str | None = None) -> dict:
     }
 
 
-def list_models(request, channel_slug: str | None = None):
-    user_key = _authenticate(request)
+async def list_models(request, channel_slug: str | None = None):
+    user_key = await run_db(_authenticate, request)
     if user_key is None:
         return openai_error("Invalid API key", "invalid_api_key", 401, "authentication_error")
     if not user_key.enabled:
         return openai_error("API key disabled", "key_disabled", 403, "authentication_error")
 
     if channel_slug:
-        channel = channel_service.lookup(channel_slug)
+        channel = await run_db(channel_service.lookup, channel_slug)
         if channel is None or not channel.enabled:
             return openai_error(f"Unknown channel '{channel_slug}'",
                                 "channel_not_found", 404, "invalid_request_error")
-        ms = list(channel.models.filter(enabled=True).order_by("model_name"))
+        ms = await run_db(lambda: list(
+            channel.models.filter(enabled=True).order_by("model_name")))
         entries: list[tuple[AIModel, str]] = [
             (m, n) for m in ms for n in model_registry.public_names(m)
         ]
     else:
-        entries = model_registry.list_public()
+        entries = await run_db(model_registry.list_public)
     return JsonResponse({"object": "list", "data": [_model_entry(m, n) for m, n in entries]})
 
 
@@ -410,28 +411,24 @@ def _refund_reservation(user_key):
 
 MAX_BODY_BYTES = 32 * 1024 * 1024
 
+# 数据面视图改成 async 之后，所有同步 ORM 都必须经 run_db 挪出事件循环；
+# 测试里 run_db 自动同线程执行（见 services.loop_offload），语义不变。
+from services.loop_offload import run_db  # noqa: E402
 
-def _parse_body(request):
+
+def _max_body_bytes() -> int:
+    """读运行时参数 max_request_bytes（走 DB，必须在 worker 线程里调用）。"""
     from services import sysconfig as _sc
     try:
         limit = int(_sc.get("max_request_bytes") or MAX_BODY_BYTES)
     except (TypeError, ValueError):
         limit = MAX_BODY_BYTES
     limit = max(0, limit)
-    if limit <= 0:
-        limit = MAX_BODY_BYTES
-    declared = request.headers.get("Content-Length")
-    if declared is not None:
-        try:
-            if int(declared) > limit:
-                return None, openai_error("Request body too large",
-                                          "payload_too_large", 413)
-        except (TypeError, ValueError):
-            pass
-    try:
-        raw = request.body or b""
-    except RequestDataTooBig:
-        return None, openai_error("Request body too large", "payload_too_large", 413)
+    return limit if limit > 0 else MAX_BODY_BYTES
+
+
+def _parse_body_bytes(raw: bytes, limit: int):
+    """纯 CPU：字节上限复核 + JSON 解析 + 形状校验。"""
     if len(raw) > limit:
         return None, openai_error("Request body too large", "payload_too_large", 413)
     try:
@@ -446,7 +443,59 @@ def _parse_body(request):
     return body, None
 
 
-def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
+async def _parse_body(request):
+    """读并解析请求体。
+
+    `request.body` 是 **property 而不是协程**（Django 6.1 里 `HttpRequest.body`
+    仍是 property，ASGIRequest 没有覆盖它），所以不能 `await request.body()`。
+    在 async 视图里直接取它也安全：`ASGIHandler.read_body()` 在构造 request
+    **之前**就把整个 HTTP body 读进 `SpooledTemporaryFile` 了，视图拿到的
+    `.body` 只是读那个已缓冲的文件，不会在事件循环上碰 stream。
+
+    真正该挪出循环的是两件别的事：读 max_request_bytes 走 DB（run_db），
+    以及最大 32MB 的 JSON 解析是纯 CPU（run_db）。
+    """
+    limit = await run_db(_max_body_bytes)
+    declared = request.headers.get("Content-Length")
+    if declared is not None:
+        try:
+            if int(declared) > limit:
+                return None, openai_error("Request body too large",
+                                          "payload_too_large", 413)
+        except (TypeError, ValueError):
+            pass
+    try:
+        raw = request.body or b""
+    except RequestDataTooBig:
+        return None, openai_error("Request body too large", "payload_too_large", 413)
+    return await run_db(_parse_body_bytes, raw, limit)
+
+
+def _prepare_upstream(body: dict, model_name: str, channel):
+    """思考归一 + 上游请求体构造。返回 (upstream_thinking, upstream_body)。
+
+    两者都可能读 sysconfig（DB），所以在 async 视图里必须经 run_db 调用。
+    归一化只算一次：同一份结果既合入上游请求体、又记审计日志。
+    """
+    upstream_thinking = thinking.build_upstream(body, model_name, channel)
+    upstream_body = _build_upstream_body(body, model_name, channel,
+                                         thinking_params=upstream_thinking)
+    return upstream_thinking, upstream_body
+
+
+def _create_request_log(channel, request_id, user_key, requested_name, routes,
+                        stream, client_thinking, upstream_thinking, body,
+                        tool_alias_map):
+    """建 RequestLog（同步 ORM，供 run_db 调用）。字段与原内联实现逐一对应。"""
+    return RequestLog.objects.create(
+        channel=channel, request_id=request_id, user_api_key=user_key,
+        model=requested_name, routes_count=len(routes), is_stream=stream,
+        client_thinking=client_thinking, upstream_thinking=upstream_thinking,
+        request_summary=_request_summary(body, tool_alias_map),
+    )
+
+
+async def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
     if not _try_acquire_request():
         # 预占已在视图里发生（_reserve_quota），而这个出口在 try 之外、
         # 走不到 finally 的兜底 —— 不在此退还，拥塞期每一个 429 都会永久吞
@@ -471,27 +520,26 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
         messages = body.get("messages")
         if not requested_name or not isinstance(messages, list) or not messages:
             # 预占已在视图里发生（_reserve_quota），此处早退必须退还
-            _refund_reservation(user_key)
+            await run_db(_refund_reservation, user_key)
             return openai_error("model and messages are required", "invalid_request",
                                 400, "invalid_request_error")
 
         slug = channel_slug or (str(body.get("channel") or "").strip() or None)
         try:
-            model, channel = _resolve_target(requested_name, slug)
+            model, channel = await run_db(_resolve_target, requested_name, slug)
         except ChannelNotFound as exc:
-            _refund_reservation(user_key)
+            await run_db(_refund_reservation, user_key)
             return openai_error(f"Unknown channel '{exc.slug}'",
                                 "channel_not_found", 404, "invalid_request_error")
         if model is None:
-            _refund_reservation(user_key)
-            return _not_found_error(requested_name, slug)
+            await run_db(_refund_reservation, user_key)
+            return await run_db(_not_found_error, requested_name, slug)
 
         model_name = model.model_name
         stream = bool(body.get("stream"))
         # 思考参数归一化只算一次：同一份结果既合入上游请求体、又记审计日志
-        upstream_thinking = thinking.build_upstream(body, model_name, channel)
-        upstream_body = _build_upstream_body(body, model_name, channel,
-                                             thinking_params=upstream_thinking)
+        upstream_thinking, upstream_body = await run_db(
+            _prepare_upstream, body, model_name, channel)
         # 消息形态钳制（AI SDK 系客户端方言）：tool/assistant 消息的
         # content 数组 -> 字符串、tool 消息剔除规范外附加键——多数上游
         # 对 tool.content 强校验 string，数组形态整包 400（字节零丢失，
@@ -513,8 +561,9 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
         }
 
         request_id = key_service.new_request_id()
-        routes = build_routes(channel, proxy_group=model.proxy_group_id,
-                              endpoint=model.endpoint)
+        routes = await run_db(
+            build_routes, channel, proxy_group=model.proxy_group_id,
+            endpoint=model.endpoint)
         if not stream:
             upstream_reserved = _reserve_upstream(len(routes))
             if upstream_reserved < len(routes):
@@ -522,25 +571,24 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
                 # RPM 名额，整条丢弃前必须退回，否则拥塞期白烧配额。
                 for dropped in routes[upstream_reserved:]:
                     if dropped.claimed and getattr(dropped.key, "id", None):
-                        key_service.release_rpm_slot(dropped.key.id)
+                        await run_db(key_service.release_rpm_slot, dropped.key.id)
                 routes = routes[:upstream_reserved]
-        log = RequestLog.objects.create(
-            channel=channel, request_id=request_id, user_api_key=user_key,
-            model=requested_name, routes_count=len(routes), is_stream=stream,
-            client_thinking=client_thinking, upstream_thinking=upstream_thinking,
-            request_summary=_request_summary(body, tool_alias_map),
-        )
+        log = await run_db(
+            _create_request_log, channel, request_id, user_key, requested_name,
+            routes, stream, client_thinking, upstream_thinking, body,
+            tool_alias_map)
         started = time.monotonic()
 
         if not routes:
-            _finish_log(log, started, False, 503, "no_available_route")
-            api_key_service.record_result(user_key, False)
+            await run_db(_finish_log, log, started, False, 503, "no_available_route")
+            await run_db(api_key_service.record_result, user_key, False)
             # claim_quota 预占的 1 token 在失败路径退还
-            api_key_service.record_usage(user_key, reservation=1)
+            await run_db(api_key_service.record_usage, user_key, reservation=1)
             return openai_error("当前没有可用线路（该渠道没有可用的 Key）",
                                 "no_available_route", 503)
 
-        retries = max(0, min(int(sysconfig.get("retry_count", channel) or 0), 5))
+        retries = max(0, min(int(await run_db(sysconfig.get, "retry_count", channel)
+                                   or 0), 5))
         max_attempts = 1 + retries
 
         if stream:
@@ -577,8 +625,9 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
         excluded: set[tuple[int, int | None]] = set()
         excluded_proxies: set[int] = set()
         for attempt in range(max_attempts):
-            attempt_routes = routes if attempt == 0 else build_routes(
-                channel, proxy_group=model.proxy_group_id, endpoint=model.endpoint,
+            attempt_routes = routes if attempt == 0 else await run_db(
+                build_routes, channel, proxy_group=model.proxy_group_id,
+                endpoint=model.endpoint,
                 exclude=excluded or None, exclude_proxies=excluded_proxies or None)
             if not attempt_routes:
                 last_exc = NoRouteAvailable()
@@ -593,13 +642,14 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
                     # 整条丢弃前必须退回。
                     for dropped in attempt_routes[upstream_reserved:]:
                         if dropped.claimed and getattr(dropped.key, "id", None):
-                            key_service.release_rpm_slot(dropped.key.id)
+                            await run_db(key_service.release_rpm_slot,
+                                         dropped.key.id)
                     attempt_routes = attempt_routes[:upstream_reserved]
                 if not attempt_routes:
                     last_exc = NoRouteAvailable()
                     continue
             try:
-                result = race_chat(attempt_routes, upstream_body)
+                result = await race_chat(attempt_routes, upstream_body)
                 break
             except (NoRouteAvailable, AllRoutesFailed) as exc:
                 # 把本轮判定死亡的 Key+代理组合记入排除集，下一轮换线时
@@ -630,19 +680,22 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
                                 request_id, attempt + 1, exc)
         if result is None:
             if isinstance(last_exc, NoRouteAvailable):
-                _finish_log(log, started, False, 503, "no_available_route")
-                api_key_service.record_result(user_key, False)
-                api_key_service.record_usage(user_key, reservation=1)  # 退还预占
+                await run_db(_finish_log, log, started, False, 503,
+                             "no_available_route")
+                await run_db(api_key_service.record_result, user_key, False)
+                await run_db(api_key_service.record_usage, user_key,
+                             reservation=1)  # 退还预占
                 return openai_error("当前没有可用线路", "no_available_route", 503)
             report = getattr(last_exc, "report", None) or []
             logger.warning("all routes failed after %d attempt(s): %s",
                            max_attempts, last_exc)
             content_rejected = bool(getattr(last_exc, "content_rejected", False))
-            _finish_log(log, started, False, 502,
-                        "upstream_content_rejected" if content_rejected
-                        else "all_routes_failed", routes=report)
-            api_key_service.record_result(user_key, False)
-            api_key_service.record_usage(user_key, reservation=1)  # 退还预占
+            await run_db(_finish_log, log, started, False, 502,
+                         "upstream_content_rejected" if content_rejected
+                         else "all_routes_failed", routes=report)
+            await run_db(api_key_service.record_result, user_key, False)
+            await run_db(api_key_service.record_usage, user_key,
+                         reservation=1)  # 退还预占
             if content_rejected:
                 # req_2c34411b / req_32382 案：上游内容审核拒收请求体时
                 # 返回无信息量的通用 400，四线路全灭曾被误报为"上游暂时
@@ -675,12 +728,14 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
                 completion_tokens = _tokenizer.estimate_tokens("".join(_text_parts))
         usage = dict(usage, prompt_tokens=prompt_tokens,
                      completion_tokens=completion_tokens)
-        _finish_log(log, started, True, result.http_status, "", route_kind=r.kind,
-                    key_name=r.key.name, proxy_name=r.proxy.name if r.proxy else "",
-                    proxy_ip=(r.proxy.public_ip if r.proxy else ""),
-                    usage=usage, routes=result.report or [])
-        api_key_service.record_result(user_key, True)
-        api_key_service.record_usage(
+        await run_db(_finish_log, log, started, True, result.http_status, "",
+                     route_kind=r.kind, key_name=r.key.name,
+                     proxy_name=r.proxy.name if r.proxy else "",
+                     proxy_ip=(r.proxy.public_ip if r.proxy else ""),
+                     usage=usage, routes=result.report or [])
+        await run_db(api_key_service.record_result, user_key, True)
+        await run_db(
+            api_key_service.record_usage,
             user_key,
             prompt_tokens,
             completion_tokens,
@@ -706,11 +761,11 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
             _bump_active(-1)
             _release_upstream(upstream_reserved)
         if crashed:
-            _force_settle_non_stream(user_key, log, started, request_id)
+            await _force_settle_non_stream(user_key, log, started, request_id)
 
 
-def _force_settle_non_stream(user_key, log, started: float,
-                             request_id: str = "") -> None:
+async def _force_settle_non_stream(user_key, log, started: float,
+                                   request_id: str = "") -> None:
     """B5：非流式路径的兜底结算。
 
     流式的 `finally` 会强制 settle（未结算的置 failed 并退款），非流式此前
@@ -722,9 +777,10 @@ def _force_settle_non_stream(user_key, log, started: float,
     2. 一份悬空的 `claim_quota` 预占（`used_quota` 永久 +1）。
 
     触发面很宽：`build_routes` 撞 SQLite 写锁、`sysconfig.get` 对未知键抛
-    KeyError、协议转换抛 AttributeError，以及最要紧的一条——一旦有人把数据面
-    视图改成 async，`race_chat` 里的 `asyncio.run` 必抛 RuntimeError，
-    每个非流式请求都会走到这里。
+    KeyError、协议转换抛 AttributeError。数据面视图改成 async 之后触发面更宽
+    ——任何一处漏包的同步 ORM 调用、任何 await 上的意外异常都会走到这里，
+    所以这条兜底是那次改造的前提之一（另一条是 test_stream_lifecycle 的
+    心跳/断开结算测试）。
 
     判据用 `log.status == "pending"`：所有正常终态都是先 `_finish_log`
     （置 success/failed）再退款，所以"仍是 pending"等价于"没人结算过"。
@@ -732,13 +788,13 @@ def _force_settle_non_stream(user_key, log, started: float,
     try:
         if log is None:
             # 日志还没建就炸了：只退额度，没有行可结算
-            api_key_service.record_usage(user_key, reservation=1)
+            await run_db(api_key_service.record_usage, user_key, reservation=1)
             return
         if log.status != "pending":
             return          # 已有终态路径处理过，绝不重复退
-        _finish_log(log, started, False, 500, "unhandled_error")
-        api_key_service.record_result(user_key, False)
-        api_key_service.record_usage(user_key, reservation=1)
+        await run_db(_finish_log, log, started, False, 500, "unhandled_error")
+        await run_db(api_key_service.record_result, user_key, False)
+        await run_db(api_key_service.record_usage, user_key, reservation=1)
         logger.error(
             "request %s 未捕获异常逃逸出非流式路径，已兜底结算为 failed 并退还额度",
             log.request_id or request_id)
@@ -748,74 +804,75 @@ def _force_settle_non_stream(user_key, log, started: float,
 
 
 @csrf_exempt
-def chat_completions(request, channel_slug: str | None = None):
+async def chat_completions(request, channel_slug: str | None = None):
     if request.method != "POST":
         return openai_error("Method not allowed", "method_not_allowed", 405)
-    user_key, err = _authorize(request)
+    user_key, err = await run_db(_authorize, request)
     if err:
         return err
-    body, err = _parse_body(request)
+    body, err = await _parse_body(request)
     if err:
         return err
     # 预占放在**所有可早退的校验之后**：见 _authorize 的 A3 说明
-    ok, err = _reserve_quota(user_key)
+    ok, err = await run_db(_reserve_quota, user_key)
     if err:
         return err
-    return _run_authed(user_key, body, channel_slug, "chat")
+    return await _run_authed(user_key, body, channel_slug, "chat")
 
 
 @csrf_exempt
-def responses(request, channel_slug: str | None = None):
+async def responses(request, channel_slug: str | None = None):
     if request.method != "POST":
         return openai_error("Method not allowed", "method_not_allowed", 405)
-    user_key, err = _authorize(request)
+    user_key, err = await run_db(_authorize, request)
     if err:
         return err
-    body, err = _parse_body(request)
+    body, err = await _parse_body(request)
     if err:
         return err
     chat_body = responses_api.responses_to_chat_body(body)
     if not isinstance(chat_body.get("messages"), list) or not chat_body.get("messages"):
         return openai_error("input is required", "invalid_request", 400, "invalid_request_error")
-    ok, err = _reserve_quota(user_key)
+    ok, err = await run_db(_reserve_quota, user_key)
     if err:
         return err
-    return _run_authed(user_key, chat_body, channel_slug, "responses", echo_body=body)
+    return await _run_authed(user_key, chat_body, channel_slug, "responses", echo_body=body)
 
 
 @csrf_exempt
-def anthropic_messages(request, channel_slug: str | None = None):
+async def anthropic_messages(request, channel_slug: str | None = None):
     if request.method != "POST":
         return openai_error("Method not allowed", "method_not_allowed", 405)
-    user_key, err = _authorize(request)
+    user_key, err = await run_db(_authorize, request)
     if err:
         return err
-    body, err = _parse_body(request)
+    body, err = await _parse_body(request)
     if err:
         return err
     chat_body = anthropic_api.messages_to_chat_body(body)
     if not isinstance(chat_body.get("messages"), list) or not chat_body.get("messages"):
         return openai_error("messages is required", "invalid_request", 400, "invalid_request_error")
-    ok, err = _reserve_quota(user_key)
+    ok, err = await run_db(_reserve_quota, user_key)
     if err:
         return err
-    return _run_authed(user_key, chat_body, channel_slug, "anthropic", echo_body=body)
+    return await _run_authed(user_key, chat_body, channel_slug, "anthropic", echo_body=body)
 
 
 @csrf_exempt
-def anthropic_count_tokens(request, channel_slug: str | None = None):
+async def anthropic_count_tokens(request, channel_slug: str | None = None):
     if request.method != "POST":
         return openai_error("Method not allowed", "method_not_allowed", 405)
     # 本端点是**纯本地计算**（不产生上游消耗）：过 `_authorize` 的只读额度闸门，
     # 但**不调 `_reserve_quota`**。历史上它走默认分支 claim 了 1 token 却从不结算，
     # Claude Code 类客户端每轮上下文计数都永久吞掉 1 额度且不落 RequestLog。
-    user_key, err = _authorize(request)
+    user_key, err = await run_db(_authorize, request)
     if err:
         return err
-    body, err = _parse_body(request)
+    body, err = await _parse_body(request)
     if err:
         return err
-    return JsonResponse({"input_tokens": anthropic_api.count_tokens(body)})
+    return JsonResponse({"input_tokens": await run_db(anthropic_api.count_tokens,
+                                                   body)})
 
 
 # 转发路径的 chunk 观察统一走 StreamTap（单次解析、零改写）：

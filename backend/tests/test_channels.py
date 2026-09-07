@@ -2,11 +2,11 @@
 import asyncio
 import json
 import types
-from unittest.mock import patch
+from unittest.mock import AsyncMock, AsyncMock, patch
 
 import httpx
 from django.conf import settings
-from django.test import RequestFactory, TestCase, TransactionTestCase
+from django.test import TransactionTestCase, RequestFactory, TestCase, TransactionTestCase
 from django.utils import timezone
 
 from api import admin_views, openai_views
@@ -16,16 +16,18 @@ from services import api_key_service, channel_service, key_service, proxy_servic
 from services import race_engine as race_engine_module
 
 
-def _acollect(agen) -> list:
-    """同步消费异步生成器（streaming_content / SSE 转换器现为 async 生成器）。"""
-    async def _gather():
-        return [part async for part in agen]
-    return asyncio.run(_gather())
+async def _acollect(agen) -> list:
+    """消费异步生成器（streaming_content / SSE 转换器都是 async 生成器）。
+
+    必须是 async 而不是内部再套 asyncio.run：数据面视图改 async 之后，调用它的
+    测试本身已经跑在事件循环里，嵌套 asyncio.run 会直接
+    `RuntimeError: asyncio.run() cannot be called from a running event loop`。
+    """
+    return [part async for part in agen]
 
 
-def _consume_stream(resp) -> str:
-    """同步消费异步流式响应体（streaming_content 现为 async 生成器）。"""
-    return b"".join(_acollect(resp.streaming_content)).decode()
+async def _consume_stream(resp) -> str:
+    return b"".join(await _acollect(resp.streaming_content)).decode()
 
 
 
@@ -226,7 +228,7 @@ class AdminChannelApiTests(TestCase):
 class OpenAiChannelRoutingTests(TransactionTestCase):
     """/v1/* 走默认渠道，/c/<slug>/v1/* 走指定渠道。"""
 
-    def _call(self, path, body, channel_slug=None, extra=None):
+    async def _call(self, path, body, channel_slug=None, extra=None):
         captured = {}
 
         def handler(request: httpx.Request):
@@ -254,9 +256,9 @@ class OpenAiChannelRoutingTests(TransactionTestCase):
         with patch.object(race_engine_module, "_client_kwargs", patched), \
              patch.object(openai_views, "_finish_log"):
             if channel_slug is None:
-                response = openai_views.chat_completions(request)
+                response = await openai_views.chat_completions(request)
             else:
-                response = openai_views.chat_completions(request, channel_slug)
+                response = await openai_views.chat_completions(request, channel_slug)
         return response, captured
 
     def setUp(self):
@@ -269,16 +271,16 @@ class OpenAiChannelRoutingTests(TransactionTestCase):
         AIModel.objects.create(channel=self.nvidia, model_name="m1", enabled=True)
         AIModel.objects.create(channel=self.zen, model_name="m1", enabled=True)
 
-    def test_default_channel_route(self):
-        response, captured = self._call(
+    async def test_default_channel_route(self):
+        response, captured = await self._call(
             "/v1/chat/completions", {"model": "m1", "messages": [{"role": "user",
                                                                  "content": "hi"}]})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(captured["url"], "https://nvidia.test/v1/chat/completions")
         self.assertEqual(captured["auth"], "Bearer nvapi-n")
 
-    def test_named_channel_route(self):
-        response, captured = self._call(
+    async def test_named_channel_route(self):
+        response, captured = await self._call(
             "/c/zen/v1/chat/completions",
             {"model": "m1", "messages": [{"role": "user", "content": "hi"}]},
             channel_slug="zen")
@@ -287,8 +289,8 @@ class OpenAiChannelRoutingTests(TransactionTestCase):
                          "https://opencode.ai/zen/v1/chat/completions")
         self.assertEqual(captured["auth"], "Bearer zen-key")
 
-    def test_body_channel_field(self):
-        response, captured = self._call(
+    async def test_body_channel_field(self):
+        response, captured = await self._call(
             "/v1/chat/completions",
             {"model": "m1", "messages": [{"role": "user", "content": "hi"}],
              "channel": "zen"})
@@ -296,27 +298,27 @@ class OpenAiChannelRoutingTests(TransactionTestCase):
         self.assertEqual(captured["url"],
                          "https://opencode.ai/zen/v1/chat/completions")
 
-    def test_model_must_exist_in_target_channel(self):
+    async def test_model_must_exist_in_target_channel(self):
         AIModel.objects.filter(channel=self.zen).update(enabled=False)
-        response, _ = self._call(
+        response, _ = await self._call(
             "/c/zen/v1/chat/completions",
             {"model": "m1", "messages": [{"role": "user", "content": "hi"}]},
             channel_slug="zen")
         self.assertEqual(response.status_code, 404)
 
-    def test_list_models_per_channel(self):
+    async def test_list_models_per_channel(self):
         _user, raw_key = api_key_service.create_key("tester")
         AIModel.objects.create(channel=self.zen, model_name="zen-only", enabled=True)
         request = RequestFactory().get("/v1/models",
                                        HTTP_AUTHORIZATION=f"Bearer {raw_key}")
-        default = json.loads(openai_views.list_models(request).content)
-        zen = json.loads(openai_views.list_models(request, "zen").content)
+        default = json.loads((await openai_views.list_models(request)).content)
+        zen = json.loads((await openai_views.list_models(request, "zen")).content)
         # /v1/models 汇总所有启用渠道的模型（含 zen 渠道）
         self.assertEqual([m["id"] for m in default["data"]], ["m1", "zen-only"])
         self.assertEqual([m["id"] for m in zen["data"]], ["m1", "zen-only"])
 
 
-class ModelAliasTests(TestCase):
+class ModelAliasTests(TransactionTestCase):
     """对外名称映射（仅保留别名系统）：alias > model_name；display_name 不参与对外。"""
 
     def setUp(self):
@@ -340,13 +342,13 @@ class ModelAliasTests(TestCase):
         self.assertIsNone(model_registry.resolve("显示名"))
         self.assertIsNone(model_registry.resolve("nope"))
 
-    def test_list_models_ignores_display_name(self):
+    async def test_list_models_ignores_display_name(self):
         AIModel.objects.create(channel=self.channel, model_name="raw/name",
                                display_name="显示名", enabled=True)
         _user, raw_key = api_key_service.create_key("tester")
         request = RequestFactory().get(
             "/v1/models", HTTP_AUTHORIZATION=f"Bearer {raw_key}")
-        data = json.loads(openai_views.list_models(request).content)
+        data = json.loads((await openai_views.list_models(request)).content)
         # /v1/models 只暴露别名/原始名，display_name 不出现
         self.assertEqual([m["id"] for m in data["data"]], ["raw/name"])
 
@@ -359,7 +361,7 @@ class ModelAliasTests(TestCase):
         # 别名只存在于平台对外层，不进上游请求体
         self.assertNotEqual(out["model"], "kimi-k3")
 
-    def test_multiple_aliases(self):
+    async def test_multiple_aliases(self):
         """一个模型可暴露多个对外名（主名 + 附加别名），/v1 与解析均生效。"""
         from services import model_registry
         AIModel.objects.create(channel=self.channel, model_name="raw/name",
@@ -372,7 +374,7 @@ class ModelAliasTests(TestCase):
         _user, raw_key = api_key_service.create_key("tester")
         request = RequestFactory().get(
             "/v1/models", HTTP_AUTHORIZATION=f"Bearer {raw_key}")
-        data = json.loads(openai_views.list_models(request).content)
+        data = json.loads((await openai_views.list_models(request)).content)
         self.assertEqual(sorted(x["id"] for x in data["data"]),
                          ["alias-1", "alias-2", "main-name"])
 
@@ -708,14 +710,14 @@ class RetryTests(TransactionTestCase):
         AIModel.objects.create(channel=self.channel, model_name="m1", enabled=True)
         _user, self.raw_key = api_key_service.create_key("tester")
 
-    def _call(self):
+    async def _call(self):
         request = RequestFactory().post(
             "/v1/chat/completions",
             data=json.dumps({"model": "m1",
                              "messages": [{"role": "user", "content": "hi"}]}),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {self.raw_key}")
-        return openai_views.chat_completions(request)
+        return await openai_views.chat_completions(request)
 
     @staticmethod
     def _ok_result():
@@ -729,32 +731,32 @@ class RetryTests(TransactionTestCase):
         r.report = []
         return r
 
-    def test_retry_succeeds_on_second_attempt(self):
+    async def test_retry_succeeds_on_second_attempt(self):
         from services import sysconfig
         sysconfig.set_params({"retry_count": 2}, self.channel)
         with patch.object(openai_views, "race_chat",
                           side_effect=[race_engine_module.AllRoutesFailed(["boom"]),
                                        self._ok_result()]) as m:
-            resp = self._call()
+            resp = await self._call()
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(m.call_count, 2)
 
-    def test_no_retry_when_disabled(self):
+    async def test_no_retry_when_disabled(self):
         """retry_count=0：竞速失败后不重试（默认值已改为 1，此处显式关闭验证关闭语义）。"""
         from services import sysconfig
         sysconfig.set_params({"retry_count": 0}, self.channel)
         with patch.object(openai_views, "race_chat",
                           side_effect=race_engine_module.AllRoutesFailed(["boom"])) as m:
-            resp = self._call()
+            resp = await self._call()
         self.assertEqual(resp.status_code, 502)
         self.assertEqual(m.call_count, 1)
 
-    def test_retry_exhausted_returns_502(self):
+    async def test_retry_exhausted_returns_502(self):
         from services import sysconfig
         sysconfig.set_params({"retry_count": 2}, self.channel)
         with patch.object(openai_views, "race_chat",
                           side_effect=race_engine_module.AllRoutesFailed(["boom"])) as m:
-            resp = self._call()
+            resp = await self._call()
         self.assertEqual(resp.status_code, 502)
         self.assertEqual(m.call_count, 3)
 
@@ -770,7 +772,7 @@ class StreamRetryTests(TransactionTestCase):
         AIModel.objects.create(channel=self.channel, model_name="m1", enabled=True)
         _user, self.raw_key = api_key_service.create_key("tester")
 
-    def _call(self):
+    async def _call(self):
         request = RequestFactory().post(
             "/v1/chat/completions",
             data=json.dumps({"model": "m1",
@@ -778,9 +780,9 @@ class StreamRetryTests(TransactionTestCase):
                              "stream": True}),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {self.raw_key}")
-        return openai_views.chat_completions(request)
+        return await openai_views.chat_completions(request)
 
-    def test_stream_retries_when_breaks_before_first_byte(self):
+    async def test_stream_retries_when_breaks_before_first_byte(self):
         from services import sysconfig
         sysconfig.set_params({"retry_count": 2}, self.channel)
         ok_chunk = 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
@@ -795,14 +797,14 @@ class StreamRetryTests(TransactionTestCase):
             return behaviors.pop(0)
 
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
-            resp = self._call()
-            body = _consume_stream(resp)
+            resp = await self._call()
+            body = await _consume_stream(resp)
         self.assertEqual(calls["n"], 2)
         self.assertIn('data: {"choices"', body)
         self.assertIn("data: [DONE]", body)
         self.assertNotIn("stream_error", body)
 
-    def test_stream_retries_when_breaks_after_heartbeat_only(self):
+    async def test_stream_retries_when_breaks_after_heartbeat_only(self):
         # 首字节只是心跳（choices 为空），未交付任何实际内容 → 中断后应重试
         from services import sysconfig
         sysconfig.set_params({"retry_count": 2}, self.channel)
@@ -820,14 +822,14 @@ class StreamRetryTests(TransactionTestCase):
             return behaviors.pop(0)
 
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
-            resp = self._call()
-            body = _consume_stream(resp)
+            resp = await self._call()
+            body = await _consume_stream(resp)
         self.assertEqual(calls["n"], 2)
         self.assertIn('data: {"choices"', body)
         self.assertIn("data: [DONE]", body)
         self.assertNotIn("stream_error", body)
 
-    def test_stream_no_retry_after_reasoning_only(self):
+    async def test_stream_no_retry_after_reasoning_only(self):
         """思考阶段断流**不再**换线重试（2026-09 语义修正）。
 
         旧断言是"思考阶段断流不算已提交内容，应重建线路自动重试"，其前提是
@@ -856,8 +858,8 @@ class StreamRetryTests(TransactionTestCase):
             return behaviors.pop(0)
 
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
-            resp = self._call()
-            body = _consume_stream(resp)
+            resp = await self._call()
+            body = await _consume_stream(resp)
         self.assertEqual(calls["n"], 1, "已交付思考字节不得换线重跑")
         self.assertIn("thinking...", body, "已交付的思考内容必须保留，不能被丢弃")
         self.assertNotIn('data: {"choices":[{"delta":{"content":"hi"}}', body,
@@ -865,7 +867,7 @@ class StreamRetryTests(TransactionTestCase):
         self.assertIn("stream_truncated", body, "截断要如实报错")
         self.assertTrue(body.rstrip().endswith("data: [DONE]"), "仍以 [DONE] 收尾")
 
-    def test_stream_no_retry_after_answer_content(self):
+    async def test_stream_no_retry_after_answer_content(self):
         # 已交付正文 content 后才断流 → 响应已提交，不能重试；
         # 且绝不能发 error 事件（否则客户端 SSE 解析报 "error decoding response body"），
         # 应干净收尾 [DONE]。
@@ -882,13 +884,13 @@ class StreamRetryTests(TransactionTestCase):
             return behaviors.pop(0)
 
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
-            resp = self._call()
-            body = _consume_stream(resp)
+            resp = await self._call()
+            body = await _consume_stream(resp)
         self.assertEqual(calls["n"], 1)
         self.assertIn("data: [DONE]", body)
         self.assertNotIn("stream_error", body)
 
-    def test_stream_no_retry_after_first_byte_sent(self):
+    async def test_stream_no_retry_after_first_byte_sent(self):
         from services import sysconfig
         sysconfig.set_params({"retry_count": 3}, self.channel)
         ok_chunk = 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
@@ -903,13 +905,13 @@ class StreamRetryTests(TransactionTestCase):
             return behaviors.pop(0)
 
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
-            resp = self._call()
-            body = _consume_stream(resp)
+            resp = await self._call()
+            body = await _consume_stream(resp)
         self.assertEqual(calls["n"], 1)
         self.assertIn("data: [DONE]", body)
         self.assertNotIn("stream_error", body)
 
-    def test_stream_retry_exhausted_returns_stream_error(self):
+    async def test_stream_retry_exhausted_returns_stream_error(self):
         from services import sysconfig
         sysconfig.set_params({"retry_count": 2}, self.channel)
         behaviors = [_FakeStreamWinner(error=httpx.ReadError("boom")) for _ in range(3)]
@@ -920,12 +922,12 @@ class StreamRetryTests(TransactionTestCase):
             return behaviors.pop(0)
 
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
-            resp = self._call()
-            body = _consume_stream(resp)
+            resp = await self._call()
+            body = await _consume_stream(resp)
         self.assertEqual(calls["n"], 3)
         self.assertIn("stream_error", body)
 
-    def test_stream_failure_tail_persists_failed_log(self):
+    async def test_stream_failure_tail_persists_failed_log(self):
         """失败收尾日志必须落库为 failed（锁死 _safe_finish 递归不再吞掉落库）。"""
         from services import sysconfig
         sysconfig.set_params({"retry_count": 0}, self.channel)
@@ -937,14 +939,14 @@ class StreamRetryTests(TransactionTestCase):
             return behaviors.pop(0)
 
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
-            resp = self._call()
-            _consume_stream(resp)
+            resp = await self._call()
+            await _consume_stream(resp)
         self.assertEqual(calls["n"], 1)
         log = RequestLog.objects.order_by("-id").first()
         self.assertIsNotNone(log)
         self.assertEqual(log.status, "failed")
 
-    def test_stream_releases_upstream_slots_when_done(self):
+    async def test_stream_releases_upstream_slots_when_done(self):
         """流结束后全局上游阀门必须归零（锁死 slot 泄漏，防并发流被拖到 no_available_route）。"""
         openai_views._upstream_active = 0
         ok_chunk = 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
@@ -954,12 +956,12 @@ class StreamRetryTests(TransactionTestCase):
 
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
             before = openai_views._upstream_active
-            resp = self._call()
-            body = _consume_stream(resp)
+            resp = await self._call()
+            body = await _consume_stream(resp)
         self.assertIn("data: [DONE]", body)
         self.assertEqual(openai_views._upstream_active, before)
 
-    def test_truncated_after_content_is_marked_not_silent(self):
+    async def test_truncated_after_content_is_marked_not_silent(self):
         """已交付内容后上游断流：必须在日志里留下 stream_truncated 标记，
         而非伪装成"正常成功"的无声中断（锁死无报错中断的可见性）。"""
         from services import sysconfig
@@ -971,8 +973,8 @@ class StreamRetryTests(TransactionTestCase):
             return behaviors.pop(0)
 
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
-            resp = self._call()
-            body = _consume_stream(resp)
+            resp = await self._call()
+            body = await _consume_stream(resp)
         self.assertIn("data: [DONE]", body)
         log = RequestLog.objects.order_by("-id").first()
         self.assertIsNotNone(log)
@@ -1016,13 +1018,13 @@ class ResponsesEndpointTests(TransactionTestCase):
         AIModel.objects.create(channel=self.channel, model_name="m1", enabled=True)
         _user, self.raw_key = api_key_service.create_key("tester")
 
-    def _call(self, body):
+    async def _call(self, body):
         request = RequestFactory().post(
             "/v1/responses",
             data=json.dumps(body),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {self.raw_key}")
-        return openai_views.responses(request)
+        return await openai_views.responses(request)
 
     @staticmethod
     def _ok_result():
@@ -1043,9 +1045,9 @@ class ResponsesEndpointTests(TransactionTestCase):
         r.report = []
         return r
 
-    def test_non_stream_returns_responses_format(self):
-        with patch.object(openai_views, "race_chat", return_value=self._ok_result()):
-            resp = self._call({"model": "m1", "input": "hi", "stream": False})
+    async def test_non_stream_returns_responses_format(self):
+        with patch.object(openai_views, "race_chat", new=AsyncMock(return_value=self._ok_result())):
+            resp = await self._call({"model": "m1", "input": "hi", "stream": False})
         self.assertEqual(resp.status_code, 200)
         data = json.loads(resp.content)
         self.assertEqual(data["object"], "response")
@@ -1053,27 +1055,27 @@ class ResponsesEndpointTests(TransactionTestCase):
         self.assertEqual(data["output"][0]["type"], "message")
         self.assertEqual(data["output"][0]["content"][0]["text"], "hi there")
 
-    def test_string_input_becomes_user_message(self):
-        with patch.object(openai_views, "race_chat", return_value=self._ok_result()) as m:
-            resp = self._call({"model": "m1", "input": "hello", "stream": False})
+    async def test_string_input_becomes_user_message(self):
+        with patch.object(openai_views, "race_chat", new=AsyncMock(return_value=self._ok_result())) as m:
+            resp = await self._call({"model": "m1", "input": "hello", "stream": False})
         self.assertEqual(resp.status_code, 200)
         sent = m.call_args[0][1]
         self.assertEqual(sent["messages"], [{"role": "user", "content": "hello"}])
 
-    def test_max_output_tokens_maps_to_max_tokens(self):
-        with patch.object(openai_views, "race_chat", return_value=self._ok_result()) as m:
-            resp = self._call({"model": "m1", "input": "hi",
+    async def test_max_output_tokens_maps_to_max_tokens(self):
+        with patch.object(openai_views, "race_chat", new=AsyncMock(return_value=self._ok_result())) as m:
+            resp = await self._call({"model": "m1", "input": "hi",
                                "max_output_tokens": 512, "stream": False})
         self.assertEqual(resp.status_code, 200)
         sent = m.call_args[0][1]
         self.assertEqual(sent["max_tokens"], 512)
         self.assertNotIn("seed", sent)
 
-    def test_missing_input_returns_400(self):
-        resp = self._call({"model": "m1"})
+    async def test_missing_input_returns_400(self):
+        resp = await self._call({"model": "m1"})
         self.assertEqual(resp.status_code, 400)
 
-    def test_stream_returns_responses_sse(self):
+    async def test_stream_returns_responses_sse(self):
         ok_chunk = ('data: {"id":"c1","choices":[{"delta":{"role":"assistant",'
                     '"content":"he"}}]}\n\n')
         done_chunk = "data: [DONE]\n\n"
@@ -1083,16 +1085,16 @@ class ResponsesEndpointTests(TransactionTestCase):
             return fake
 
         with patch.object(openai_views, "race_stream", new=fake_race_stream):
-            resp = self._call({"model": "m1", "input": "hi", "stream": True})
+            resp = await self._call({"model": "m1", "input": "hi", "stream": True})
             # streaming_content 是惰性生成器，必须在 patch 生效期间消费
-            body = _consume_stream(resp)
+            body = await _consume_stream(resp)
         self.assertIn("event: response.created", body)
         self.assertIn("event: response.output_text.delta", body)
         self.assertIn('"delta": "he"', body)
         self.assertIn("data: [DONE]", body)
 
 
-class ResponsesTranslateTests(TestCase):
+class ResponsesTranslateTests(TransactionTestCase):
     """responses_api 双向转换：assistant 消息 / 参数过滤 / 请求-响应互转。"""
 
     def test_assistant_message_uses_output_text(self):
@@ -1349,7 +1351,7 @@ class ResponsesTranslateTests(TestCase):
         self.assertEqual(msg["content"], "答案是 2")
         self.assertEqual(msg["reasoning_content"], "Q-PaDgG1qC1DLLFH_xxxx")
 
-    def test_chat_sse_to_responses_emits_reasoning_event(self):
+    async def test_chat_sse_to_responses_emits_reasoning_event(self):
         """内部 chat SSE 含 reasoning_content 时，/v1/responses 出口发出推理事件。"""
         from services import responses_api
         chat_iter = iter([
@@ -1364,7 +1366,7 @@ class ResponsesTranslateTests(TestCase):
             for c in chat_iter:
                 yield c
 
-        out = "".join(_acollect(
+        out = "".join(await _acollect(
             responses_api.iter_chat_sse_as_responses(_achunks())))
         self.assertIn("response.reasoning_summary_text.delta", out)
         self.assertIn("思考中", out)
@@ -1422,7 +1424,7 @@ class BatchApiTests(TestCase):
         self.assertEqual(Proxy.objects.count(), 2)
 
 
-class DisabledChannelAccessTests(TestCase):
+class DisabledChannelAccessTests(TransactionTestCase):
     """M1 回归：禁用渠道必须彻底下线，不得被 /c/<slug>/ 或 body.channel 显式寻址。"""
 
     def setUp(self):
@@ -1434,34 +1436,34 @@ class DisabledChannelAccessTests(TestCase):
         _user, self.raw_key = api_key_service.create_key("tester")
         self.auth = {"HTTP_AUTHORIZATION": f"Bearer {self.raw_key}"}
 
-    def test_chat_by_slug_rejected_when_disabled(self):
+    async def test_chat_by_slug_rejected_when_disabled(self):
         request = self.factory.post(
             "/c/zen/v1/chat/completions",
             data=json.dumps({"model": "m1",
                              "messages": [{"role": "user", "content": "hi"}]}),
             content_type="application/json", **self.auth)
-        resp = openai_views.chat_completions(request, channel_slug="zen")
+        resp = await openai_views.chat_completions(request, channel_slug="zen")
         self.assertEqual(resp.status_code, 404)
 
-    def test_chat_by_body_channel_rejected_when_disabled(self):
+    async def test_chat_by_body_channel_rejected_when_disabled(self):
         request = self.factory.post(
             "/v1/chat/completions",
             data=json.dumps({"model": "m1", "channel": "zen",
                              "messages": [{"role": "user", "content": "hi"}]}),
             content_type="application/json", **self.auth)
-        resp = openai_views.chat_completions(request)
+        resp = await openai_views.chat_completions(request)
         self.assertEqual(resp.status_code, 404)
 
-    def test_models_by_slug_rejected_when_disabled(self):
+    async def test_models_by_slug_rejected_when_disabled(self):
         request = self.factory.get("/c/zen/v1/models", **self.auth)
-        resp = openai_views.list_models(request, channel_slug="zen")
+        resp = await openai_views.list_models(request, channel_slug="zen")
         self.assertEqual(resp.status_code, 404)
 
-    def test_reenable_restores_access(self):
+    async def test_reenable_restores_access(self):
         self.channel.enabled = True
         self.channel.save()
         request = self.factory.get("/c/zen/v1/models", **self.auth)
-        resp = openai_views.list_models(request, channel_slug="zen")
+        resp = await openai_views.list_models(request, channel_slug="zen")
         self.assertEqual(resp.status_code, 200)
 
 

@@ -6,15 +6,16 @@
 
 每条用例注明对应的审查条目编号、复现方式与期望行为。
 """
+from tests import resolve
 import asyncio
 import json
 from datetime import timedelta
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from unittest import IsolatedAsyncioTestCase
 
 import pytest
 from django.conf import settings
-from django.test import RequestFactory, TestCase
+from django.test import TransactionTestCase, RequestFactory, TestCase
 from django.utils import timezone
 
 from api import admin_views, openai_views
@@ -39,7 +40,7 @@ async def _collect(agen):
     return [item async for item in agen]
 
 
-class H2_NonDictJsonBodyTests(TestCase):
+class H2_NonDictJsonBodyTests(TransactionTestCase):
     """H2: 合法 JSON 但非对象（数组/字符串/数字）时，三个对外端点应返回 400
     invalid_request，而不是 AttributeError -> 500。"""
 
@@ -47,30 +48,30 @@ class H2_NonDictJsonBodyTests(TestCase):
         self.factory = RequestFactory()
         self.headers = _user_headers()
 
-    def _post(self, view, payload):
+    async def _post(self, view, payload):
         request = self.factory.post(
             "/v1/chat/completions", data=payload,
             content_type="application/json", **self.headers)
-        return view(request)
+        return await resolve(view(request))
 
-    def test_chat_array_body_returns_400(self):
-        resp = self._post(openai_views.chat_completions, "[1,2,3]")
+    async def test_chat_array_body_returns_400(self):
+        resp = await self._post(openai_views.chat_completions, "[1,2,3]")
         self.assertEqual(resp.status_code, 400)
 
-    def test_chat_string_body_returns_400(self):
-        resp = self._post(openai_views.chat_completions, '"a string"')
+    async def test_chat_string_body_returns_400(self):
+        resp = await self._post(openai_views.chat_completions, '"a string"')
         self.assertEqual(resp.status_code, 400)
 
-    def test_chat_number_body_returns_400(self):
-        resp = self._post(openai_views.chat_completions, "123")
+    async def test_chat_number_body_returns_400(self):
+        resp = await self._post(openai_views.chat_completions, "123")
         self.assertEqual(resp.status_code, 400)
 
-    def test_responses_array_body_returns_400(self):
-        resp = self._post(openai_views.responses, "[1,2,3]")
+    async def test_responses_array_body_returns_400(self):
+        resp = await self._post(openai_views.responses, "[1,2,3]")
         self.assertEqual(resp.status_code, 400)
 
-    def test_anthropic_array_body_returns_400(self):
-        resp = self._post(openai_views.anthropic_messages, "[1,2,3]")
+    async def test_anthropic_array_body_returns_400(self):
+        resp = await self._post(openai_views.anthropic_messages, "[1,2,3]")
         self.assertEqual(resp.status_code, 400)
 
 
@@ -149,7 +150,7 @@ class M3_BareDoneFirstChunkTests(TestCase):
         self.assertIsNone(is_valid_stream_chunk("data: [DONE]"))
 
 
-class M4_UnknownChannelSlugTests(TestCase):
+class M4_UnknownChannelSlugTests(TransactionTestCase):
     """M4: `/c/<slug>/v1/*` 指定的 slug 不存在时应 404（channel_not_found），
     而不是静默回落到默认渠道——否则同名模型会把请求路由到错误的上游。"""
 
@@ -162,13 +163,13 @@ class M4_UnknownChannelSlugTests(TestCase):
         AIModel.objects.create(channel=self.channel, model_name="model-x",
                                enabled=True)
 
-    def test_unknown_slug_is_404_not_default_channel(self):
+    async def test_unknown_slug_is_404_not_default_channel(self):
         request = self.factory.post(
             "/c/ghost/v1/chat/completions",
             data=json.dumps({"model": "model-x",
                              "messages": [{"role": "user", "content": "hi"}]}),
             content_type="application/json", **self.headers)
-        resp = openai_views.chat_completions(request, channel_slug="ghost")
+        resp = await openai_views.chat_completions(request, channel_slug="ghost")
         self.assertEqual(resp.status_code, 404)
 
 
@@ -224,7 +225,7 @@ class M9_ProxyKeyPairingTests(TestCase):
                          "首把 Key 占位失败时不应让排头的启用代理闲置")
 
 
-class Low1_LoginBruteForceBucketTests(TestCase):
+class Low1_LoginBruteForceBucketTests(TransactionTestCase):
     """Low1: 登录防撞桶。反代场景下 REMOTE_ADDR 全是网关地址，若只按它分桶，
     一个客户端连续试错会把所有人的登录一起锁死；桶字典也必须能自行收缩。"""
 
@@ -235,7 +236,7 @@ class Low1_LoginBruteForceBucketTests(TestCase):
     def tearDown(self):
         admin_views._login_fail_bucket.clear()
 
-    def _login(self, password=None, xff=None):
+    async def _login(self, password=None, xff=None):
         # 故意错误的登录口令（触发限流路径）；默认参数用 None 承载，
         # 函数体内合成——静态扫描器的"测试内硬编码凭据"误报由此消除
         if password is None:
@@ -248,21 +249,21 @@ class Low1_LoginBruteForceBucketTests(TestCase):
                                     content_type="application/json", **extra)
         return admin_views.LoginView.as_view()(request)
 
-    def test_key_includes_forwarded_for(self):
+    async def test_key_includes_forwarded_for(self):
         """同一 REMOTE_ADDR 下，不同 XFF 首跳应各自计数，互不影响。"""
         for _ in range(admin_views._LOGIN_FAIL_LIMIT):
-            self.assertEqual(self._login(xff="203.0.113.7").status_code, 401)
+            self.assertEqual((await self._login(xff="203.0.113.7")).status_code, 401)
         # 攻击者自己撞上限
-        self.assertEqual(self._login(xff="203.0.113.7").status_code, 429)
+        self.assertEqual((await self._login(xff="203.0.113.7")).status_code, 429)
         # 但另一个真实客户端不受牵连
-        self.assertEqual(self._login(xff="198.51.100.9").status_code, 401)
+        self.assertEqual((await self._login(xff="198.51.100.9")).status_code, 401)
 
-    def test_bucket_is_swept_instead_of_growing_forever(self):
+    async def test_bucket_is_swept_instead_of_growing_forever(self):
         from api.admin_views import common as admin_common
 
         with patch.object(admin_common, "_LOGIN_FAIL_SWEEP_THRESHOLD", 4):
             for i in range(6):
-                self._login(xff=f"198.51.100.{i}")
+                await self._login(xff=f"198.51.100.{i}")
             self.assertEqual(len(admin_views._login_fail_bucket), 6)
             # 时间越过窗口后，下一次失败会顺带清扫掉所有过期桶（只留本次的）。
             # 注意 patch 目标是 common 模块的 time（登录限流实际引用处），
@@ -270,18 +271,18 @@ class Low1_LoginBruteForceBucketTests(TestCase):
             with patch.object(admin_common.time, "monotonic",
                               return_value=admin_common.time.monotonic()
                                            + admin_views._LOGIN_FAIL_WINDOW + 1):
-                self._login(xff="198.51.100.99")
+                await self._login(xff="198.51.100.99")
             self.assertEqual(len(admin_views._login_fail_bucket), 1)
 
-    def test_successful_login_not_counted_as_failure(self):
+    async def test_successful_login_not_counted_as_failure(self):
         for _ in range(3):
-            self._login(xff="203.0.113.1")
-        resp = self._login(password=settings.ADMIN_PASSWORD, xff="203.0.113.1")
+            await self._login(xff="203.0.113.1")
+        resp = await self._login(password=settings.ADMIN_PASSWORD, xff="203.0.113.1")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data["token"], settings.ADMIN_TOKEN)
 
 
-class Low2_AnthropicProtocolTests(TestCase):
+class Low2_AnthropicProtocolTests(TransactionTestCase):
     """Low3（Anthropic 协议瑕疵）。"""
 
     def test_user_text_alongside_tool_result_is_kept(self):
@@ -298,25 +299,26 @@ class Low2_AnthropicProtocolTests(TestCase):
         self.assertEqual(roles, ["user", "tool"])
         self.assertEqual(out["messages"][0]["content"], "这是工具结果，请据此回答")
 
-    def test_stream_error_is_wrapped_in_message_lifecycle(self):
+    async def test_stream_error_is_wrapped_in_message_lifecycle(self):
         """流式错误事件必须先 message_start、后 message_stop，否则严格客户端报错。"""
 
         async def src():
             yield 'data: {"error":{"message":"boom"}}\n\n'
 
-        events = asyncio.run(
-            _collect(anthropic_api.iter_chat_sse_as_anthropic(src())))
+        events = await _collect(
+            anthropic_api.iter_chat_sse_as_anthropic(src()))
         kinds = [e.split("event: ")[1].split("\n")[0] for e in events]
         self.assertEqual(kinds, ["message_start", "error", "message_stop"])
 
-    def test_empty_stream_still_emits_message_start(self):
+    async def test_empty_stream_still_emits_message_start(self):
         """上游一条内容都没吐就结束时，也要先 message_start 再 message_stop。"""
 
         async def src():
             return
             yield  # pragma: no cover  （使其成为 async generator）
 
-        events = asyncio.run(_collect(anthropic_api.iter_chat_sse_as_anthropic(src())))
+        events = await _collect(
+            anthropic_api.iter_chat_sse_as_anthropic(src()))
         kinds = [e.split("event: ")[1].split("\n")[0] for e in events]
         self.assertEqual(kinds[0], "message_start")
         self.assertEqual(kinds[-1], "message_stop")
@@ -1926,7 +1928,7 @@ class R14_RpmClaimUnavailableTests(TestCase):
         self.assertTrue(bulk.called, "build_routes 没有走批量领取")
 
 
-class R16_NonStreamRetryExcludesDeadRoutes(TestCase):
+class R16_NonStreamRetryExcludesDeadRoutes(TransactionTestCase):
     """B2：非流式重试必须排除上一轮判死的 Key+代理组合。
 
     流式路径一直传 `exclude` / `exclude_proxies`，非流式路径此前**没传**——
@@ -1943,7 +1945,7 @@ class R16_NonStreamRetryExcludesDeadRoutes(TestCase):
         AIModel.objects.create(channel=self.ch, model_name="m", enabled=True)
         self.user_key, self.raw = api_key_service.create_key("r16-user")
 
-    def test_second_attempt_receives_exclusion_sets(self):
+    async def test_second_attempt_receives_exclusion_sets(self):
         from unittest.mock import patch
 
         from api import openai_views
@@ -1970,9 +1972,10 @@ class R16_NonStreamRetryExcludesDeadRoutes(TestCase):
 
         body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
         with patch.object(openai_views, "build_routes", side_effect=fake_build), \
-                patch.object(openai_views, "race_chat", side_effect=fake_race), \
+                patch.object(openai_views, "race_chat", new=AsyncMock(side_effect=fake_race)), \
                 patch.object(openai_views.sysconfig, "get", fake_get):
-            resp = openai_views._run_authed(self.user_key, body, "r16", "chat")
+            resp = await openai_views._run_authed(
+                self.user_key, body, "r16", "chat")
 
         self.assertEqual(resp.status_code, 502)
         self.assertEqual(len(calls), 2, f"应重试一次，实际 build_routes 调用 {len(calls)} 次")
@@ -1982,7 +1985,7 @@ class R16_NonStreamRetryExcludesDeadRoutes(TestCase):
         self.assertEqual(second.get("exclude"), {(self.key.id, None)},
                          "非流式重试没把上一轮死线路传进 exclude —— B2 回归")
 
-    def test_content_rejected_still_short_circuits(self):
+    async def test_content_rejected_still_short_circuits(self):
         """反向守卫：内容被拒是确定性失败，加了排除集也不该重试。"""
         from unittest.mock import patch
 
@@ -2012,16 +2015,17 @@ class R16_NonStreamRetryExcludesDeadRoutes(TestCase):
 
         body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
         with patch.object(openai_views, "build_routes", side_effect=fake_build), \
-                patch.object(openai_views, "race_chat", side_effect=fake_race), \
+                patch.object(openai_views, "race_chat", new=AsyncMock(side_effect=fake_race)), \
                 patch.object(openai_views.sysconfig, "get", fake_get):
-            resp = openai_views._run_authed(self.user_key, body, "r16", "chat")
+            resp = await openai_views._run_authed(
+                self.user_key, body, "r16", "chat")
 
         self.assertEqual(len(calls), 1, "内容被拒不该再重试一轮")
         self.assertEqual(json.loads(resp.content)["error"]["code"],
                          "upstream_content_rejected")
 
 
-class R17_NonStreamForceSettleTests(TestCase):
+class R17_NonStreamForceSettleTests(TransactionTestCase):
     """B5：非流式路径的异常逃逸绝不能留下 pending 行与悬空额度预占。
 
     流式的 finally 会强制 settle，非流式此前只释放信号量与上游额度。
@@ -2040,7 +2044,7 @@ class R17_NonStreamForceSettleTests(TestCase):
         AIModel.objects.create(channel=self.ch, model_name="m", enabled=True)
         self.user_key, self.raw = api_key_service.create_key("r17-user", quota=1000)
 
-    def _post_with_boom(self):
+    async def _post_with_boom(self):
         """走**视图**而不是直接调 `_run_authed`：额度预占现在发生在视图里的
         `_reserve_quota`，绕过视图就等于绕过被测的预占本身，断言会空转。"""
         from unittest.mock import patch
@@ -2050,17 +2054,17 @@ class R17_NonStreamForceSettleTests(TestCase):
         def boom(*a, **kw):
             raise RuntimeError("模拟未捕获异常（例如数据面改 async 后 asyncio.run 必抛）")
 
-        with patch.object(openai_views, "race_chat", side_effect=boom):
+        with patch.object(openai_views, "race_chat", new=AsyncMock(side_effect=boom)):
             with self.assertRaises(RuntimeError):
-                openai_views.chat_completions(
+                await openai_views.chat_completions(
                     self.factory.post("/v1/chat/completions",
                                       data=json.dumps({"model": "m", "messages": [
                                           {"role": "user", "content": "hi"}]}),
                                       content_type="application/json",
                                       HTTP_AUTHORIZATION=f"Bearer {self.raw}"))
 
-    def test_unhandled_exception_leaves_no_pending_row(self):
-        self._post_with_boom()
+    async def test_unhandled_exception_leaves_no_pending_row(self):
+        await self._post_with_boom()
         rows = list(RequestLog.objects.filter(channel=self.ch))
         self.assertEqual(len(rows), 1, f"应恰好一条日志，实际 {len(rows)}")
         self.assertEqual(
@@ -2068,16 +2072,16 @@ class R17_NonStreamForceSettleTests(TestCase):
             "异常逃逸留下了永久 pending 行 —— B5 回归")
         self.assertEqual(rows[0].error_type, "unhandled_error")
 
-    def test_unhandled_exception_refunds_reservation(self):
+    async def test_unhandled_exception_refunds_reservation(self):
         # 前置断言：预占确实发生过，否则这条守卫会空转
         self.user_key.refresh_from_db()
-        self._post_with_boom()
+        await self._post_with_boom()
         self.user_key.refresh_from_db()
         self.assertEqual(
             self.user_key.used_quota, 0,
             f"额度预占未退还（used_quota={self.user_key.used_quota}）—— B5 回归")
 
-    def test_normal_failure_path_is_not_double_refunded(self):
+    async def test_normal_failure_path_is_not_double_refunded(self):
         """反向守卫：兜底不得在已结算的正常路径上重复退款/重复写日志。"""
         from unittest.mock import patch
 
@@ -2088,8 +2092,8 @@ class R17_NonStreamForceSettleTests(TestCase):
             raise AllRoutesFailed(["k0:boom"], [{"name": "direct:k0",
                                                  "status": "failed"}])
 
-        with patch.object(openai_views, "race_chat", side_effect=fail):
-            resp = openai_views.chat_completions(
+        with patch.object(openai_views, "race_chat", new=AsyncMock(side_effect=fail)):
+            resp = await openai_views.chat_completions(
                 self.factory.post("/v1/chat/completions",
                                   data=json.dumps({"model": "m", "messages": [
                                       {"role": "user", "content": "hi"}]}),
@@ -2110,7 +2114,7 @@ class R17_NonStreamForceSettleTests(TestCase):
         self.assertEqual(self.user_key.success_requests, 0)
 
 
-class R18_FallbackSettleBeforeLogTests(TestCase):
+class R18_FallbackSettleBeforeLogTests(TransactionTestCase):
     """F1（code-review I1）：兜底结算绝不能因引用未绑定的 `started` 而自爆。
 
     `_run_authed` 的 finally 无条件读 `started`，而它原本只在
@@ -2129,7 +2133,7 @@ class R18_FallbackSettleBeforeLogTests(TestCase):
         AIModel.objects.create(channel=self.ch, model_name="m", enabled=True)
         self.user_key, self.raw = api_key_service.create_key("r18-user", quota=1000)
 
-    def _post(self):
+    async def _post(self):
         from unittest.mock import patch
 
         from api import openai_views
@@ -2138,24 +2142,24 @@ class R18_FallbackSettleBeforeLogTests(TestCase):
             raise RuntimeError("build_routes 撞 SQLite 写锁")
 
         with patch.object(openai_views, "build_routes", side_effect=boom):
-            return openai_views.chat_completions(
+            return await openai_views.chat_completions(
                 self.factory.post("/v1/chat/completions",
                                   data=json.dumps({"model": "m", "messages": [
                                       {"role": "user", "content": "hi"}]}),
                                   content_type="application/json",
                                   HTTP_AUTHORIZATION=f"Bearer {self.raw}"))
 
-    def test_original_exception_is_not_masked(self):
+    async def test_original_exception_is_not_masked(self):
         """异常必须原样上抛，不能被 finally 的 UnboundLocalError 顶掉。"""
         with self.assertRaises(RuntimeError) as ctx:
-            self._post()
+            await self._post()
         self.assertNotIsInstance(ctx.exception, UnboundLocalError)
         self.assertIn("写锁", str(ctx.exception))
 
-    def test_reservation_refunded_even_when_log_never_created(self):
+    async def test_reservation_refunded_even_when_log_never_created(self):
         """日志还没建就炸：额度预占仍必须退还。"""
         with self.assertRaises(RuntimeError):
-            self._post()
+            await self._post()
         self.user_key.refresh_from_db()
         self.assertEqual(
             self.user_key.used_quota, 0,
@@ -2275,7 +2279,7 @@ class R20_TotalTimeoutAccountsHealth(TestCase):
                              "http_status 必须为 0，否则代理不会被一起记账")
 
 
-class R21_ServerOverloadedRefundsTests(TestCase):
+class R21_ServerOverloadedRefundsTests(TransactionTestCase):
     """I2：429 server_overloaded 出口不得吞掉额度预占。
 
     视图在 `_run_authed` 之前就已 `_reserve_quota`，而这个出口位于 `try` 之外、
@@ -2287,13 +2291,13 @@ class R21_ServerOverloadedRefundsTests(TestCase):
         self.factory = RequestFactory()
         self.user_key, self.raw = api_key_service.create_key("r21", quota=1000)
 
-    def test_429_refunds_the_reservation(self):
+    async def test_429_refunds_the_reservation(self):
         from unittest.mock import patch
 
         from api import openai_views
 
         with patch.object(openai_views, "_try_acquire_request", return_value=False):
-            resp = openai_views.chat_completions(
+            resp = await openai_views.chat_completions(
                 self.factory.post("/v1/chat/completions",
                                   data=json.dumps({"model": "m", "messages": [
                                       {"role": "user", "content": "hi"}]}),

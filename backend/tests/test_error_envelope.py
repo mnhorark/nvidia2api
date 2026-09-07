@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 
 from django.conf import settings
-from django.test import RequestFactory, TestCase
+from django.test import TransactionTestCase, RequestFactory, TestCase
 
 from api import admin_views, openai_views
 from api.errors import admin_exception_handler, openai_error
@@ -113,13 +113,13 @@ class AdminEnvelopeContractTests(TestCase):
         self.assertEqual(resp.data["error"]["code"], "method_not_allowed")
 
 
-class DataPlaneEnvelopeTests(TestCase):
+class DataPlaneEnvelopeTests(TransactionTestCase):
     def setUp(self):
         self.factory = RequestFactory()
 
-    def test_invalid_user_key_401_uses_envelope(self):
+    async def test_invalid_user_key_401_uses_envelope(self):
         """数据面 401 此前**完全没有测试**（审查覆盖缺口 #1）。"""
-        resp = openai_views.chat_completions(
+        resp = await openai_views.chat_completions(
             self.factory.post("/v1/chat/completions",
                               data=json.dumps({"model": "m", "messages": [
                                   {"role": "user", "content": "hi"}]}),
@@ -130,17 +130,17 @@ class DataPlaneEnvelopeTests(TestCase):
         _assert_envelope(self, payload)
         self.assertEqual(payload["error"]["code"], "invalid_api_key")
 
-    def test_missing_authorization_header_401(self):
-        resp = openai_views.list_models(self.factory.get("/v1/models"))
+    async def test_missing_authorization_header_401(self):
+        resp = await openai_views.list_models(self.factory.get("/v1/models"))
         self.assertEqual(resp.status_code, 401)
         _assert_envelope(self, json.loads(resp.content))
 
-    def test_disabled_key_403_uses_envelope(self):
+    async def test_disabled_key_403_uses_envelope(self):
         from services import api_key_service
         rec, raw = api_key_service.create_key("disabled")
         rec.enabled = False
         rec.save()
-        resp = openai_views.list_models(
+        resp = await openai_views.list_models(
             self.factory.get("/v1/models", HTTP_AUTHORIZATION=f"Bearer {raw}"))
         self.assertEqual(resp.status_code, 403)
         _assert_envelope(self, json.loads(resp.content))

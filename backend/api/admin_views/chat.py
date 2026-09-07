@@ -40,7 +40,9 @@ class AdminChatView(AdminRequiredMixin, APIView):
 
     def post(self, request):
         from services.load_balancer import build_routes
-        from services.race_engine import AllRoutesFailed, NoRouteAvailable, race_chat
+        from services.race_engine import (
+            AllRoutesFailed, NoRouteAvailable, race_chat_blocking,
+        )
         from services import key_service as ks
         channel_param = (request.data.get('channel') or '').strip()
         channel = channel_service.resolve(channel_param) if channel_param else current_channel(request)
@@ -78,7 +80,10 @@ class AdminChatView(AdminRequiredMixin, APIView):
         import time
         t0 = time.monotonic()
         try:
-            result = race_chat(routes, body)
+            # 管理端 playground 仍是同步视图（DRF APIView），用阻塞入口。
+            # 它不在这轮 async 化的范围内：控制台流量低，且 DRF 的 async view
+            # 支持不完整，硬改的风险大于收益。
+            result = race_chat_blocking(routes, body)
         except AllRoutesFailed as exc:
             log.status, log.error_type = ('failed', 'all_routes_failed')
             log.http_status = 502

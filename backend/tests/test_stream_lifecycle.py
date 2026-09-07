@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time as _time
 import unittest
 import uuid
@@ -26,6 +27,8 @@ from contextlib import suppress
 import pytest
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, MagicMock, patch
+
+from django.test import TransactionTestCase
 
 from apps.core.models import AIModel, Channel, ChannelKey, RequestLog
 from services import api_key_service, key_service, sysconfig
@@ -312,3 +315,95 @@ class ClientDisconnectForcedSettleTests(IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NonStreamConcurrencyTests(TransactionTestCase):
+    """数据面改 async 的核心目的：非流式请求不得再独占一条线程。
+
+    改造前 `race_chat` 是 `asyncio.run(_race(...))`，而同步视图全部由 asgiref 的
+    thread-sensitive 执行器承载（`asgiref/sync.py:402` 硬编码 max_workers=1）。
+    `asyncio.run` 会阻塞调用线程直到竞速结束，所以一条非流式请求占住那条唯一的
+    线程**整个上游往返时长**，不是我们测出的那点 CPU 时间——N 个并发只能一个个排队，
+    吞吐上限是 1/上游耗时。
+
+    这条测试直接钉住"等待期是可重叠的"：5 个并发请求、每个上游 0.3s，
+    总耗时应当接近 0.3s 而不是 1.5s。
+    """
+
+    def setUp(self):
+        self.ch = Channel.objects.create(name="conc", slug="conc",
+                                         base_url="https://up.test/v1",
+                                         is_default=True)
+        ChannelKey.objects.create(channel=self.ch, name="k0",
+                                  api_key="nvapi-conc", rpm_limit=1000)
+        AIModel.objects.create(channel=self.ch, model_name="m", enabled=True)
+        self.user, self.raw = api_key_service.create_key("conc-user")
+
+    async def test_concurrent_non_streaming_requests_overlap(self):
+        import time
+        from unittest.mock import MagicMock, patch
+
+        from api import openai_views
+        from services import race_engine
+        from services.race_engine import RaceResult
+
+        def make_result(route):
+            payload = {
+                "id": "chatcmpl-c", "object": "chat.completion", "created": 1,
+                "model": "m",
+                "choices": [{"index": 0,
+                             "message": {"role": "assistant", "content": "ok"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2},
+            }
+            r = RaceResult(ok=True, route=route, payload=payload,
+                           http_status=200)
+            r.report = []
+            return r
+
+        upstream_seconds = 0.3
+        real_race = race_engine._race
+
+        async def slow_race(routes, body):
+            # 模拟上游耗时：真实实现里这段时间以前是**占着线程**的
+            await asyncio.sleep(upstream_seconds)
+            return make_result(routes[0])
+
+        def fake_build(channel=None, **kw):
+            route = MagicMock()
+            route.kind = "direct"
+            route.name = "direct:k0"
+            route.key.name = "k0"
+            route.key.id = self.ch.keys.first().id
+            route.key.channel = self.ch
+            route.proxy = None
+            route.claimed = False
+            return [route]
+
+        from django.test import RequestFactory
+        factory = RequestFactory()
+
+        async def one():
+            request = factory.post(
+                "/v1/chat/completions",
+                data=json.dumps({"model": "m",
+                                 "messages": [{"role": "user", "content": "hi"}]}),
+                content_type="application/json",
+                HTTP_AUTHORIZATION=f"Bearer {self.raw}")
+            return await openai_views.chat_completions(request)
+
+        with patch.object(openai_views, "build_routes", side_effect=fake_build), \
+                patch.object(race_engine, "_race", new=slow_race), \
+                patch.object(openai_views, "race_chat",
+                             new=lambda routes, body: race_engine.race_chat(routes, body)):
+            t0 = time.monotonic()
+            responses = await asyncio.gather(*(one() for _ in range(5)))
+            elapsed = time.monotonic() - t0
+
+        self.assertEqual([r.status_code for r in responses], [200] * 5)
+        serialized = 5 * upstream_seconds
+        self.assertLess(
+            elapsed, upstream_seconds * 2.5,
+            f"5 个并发非流式请求耗时 {elapsed:.2f}s，接近串行的 {serialized:.2f}s —— "
+            "说明上游等待期仍然独占线程，async 化没生效")
