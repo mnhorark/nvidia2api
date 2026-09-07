@@ -379,3 +379,85 @@ class ChannelScopeTests(unittest.TestCase):
         self.assertIn("getChannel()", body)
         self.assertIn("setChannel(", body,
                       "删除当前渠道后必须显式切走 slug，否则静默换作用域")
+
+
+@requires_frontend
+class RenderCostGuardsTests(unittest.TestCase):
+    """钉住"大列表交互不再整片重渲染"这组性能不变量。
+
+    为什么用源码断言而不是浏览器 profiling：前端零 JS 测试依赖，没有
+    vitest / playwright 组件级 harness，而这类改动一旦回退**不会有任何功能
+    测试变红**——12 列 × 200 行 ≈ 6000 个元素重新协调只是"点一下卡一下"，
+    没人会为此写断言。所以把结构本身钉住。
+    """
+
+    def test_data_table_header_is_sticky(self):
+        """12 列表格展开到 200 行后纵向滚动会完全失去列对应关系。"""
+        code = _code(_read("components/ui.tsx"))
+        body = _func_body(code, "export function Th")
+        self.assertIn("sticky top-0", body)
+        # sticky 表头必须有实色背景，否则行会从表头底下透出来
+        self.assertRegex(body, r"bg-\[#")
+
+    def test_data_table_loading_is_skeleton_not_spinner(self):
+        """加载态换成骨架行：首屏表格就有形状，列宽与滚动位置不跳。"""
+        body = _func_body(_code(_read("components/ui.tsx")), "export function DataTable")
+        self.assertIn("TableSkeleton", body)
+        self.assertIn("aria-busy", body)
+
+    def test_data_table_has_no_magic_colspan(self):
+        code = _code(_read("components/ui.tsx"))
+        self.assertNotIn("colSpan={50}", code)
+        self.assertNotIn("colSpan={100}", code)
+
+    def test_big_list_rows_are_memoized(self):
+        """keys / proxies 的行必须是 memo 组件，且父组件传的是引用恒定的 actions。
+
+        否则父组件任何 setState（勾一个复选框、切一个开关、busyId 变化）都会把
+        200 行整片重渲染——这就是"点一下卡一下"。
+        """
+        for page, comp in (("app/(console)/keys/page.tsx", "KeyRow"),
+                           ("app/(console)/proxies/page.tsx", "ProxyRow")):
+            with self.subTest(page=page):
+                code = _code(_read(page))
+                self.assertIn(f"memo(function {comp}", code,
+                              f"{page} 的行组件没有 memo 化")
+                self.assertIn("rowActions", code)
+                self.assertIn("useMemo(", code)
+                # 行组件必须只通过 props 拿数据/动作，不能直接闭包父组件的 setter，
+                # 否则 memo 立刻失效。用文本范围而不是括号配对：
+                # `memo(function X({...}: {...}) {` 这种参数形态让配对定位不可靠。
+                start = code.index(f"memo(function {comp}")
+                end = code.index("export default function", start)
+                row_src = code[start:end]
+                for leaked in ("setSelected", "setBusyId(", "setEditItem("):
+                    self.assertNotIn(leaked, row_src,
+                                     f"{comp} 直接闭包了 {leaked}，memo 会失效")
+
+    def test_list_filters_are_memoized(self):
+        for page in ("app/(console)/keys/page.tsx",
+                     "app/(console)/proxies/page.tsx",
+                     "app/(console)/models/page.tsx"):
+            with self.subTest(page=page):
+                code = _read(page)
+                self.assertIn("const filtered = useMemo(", code,
+                              f"{page} 的过滤没有 memo：每次 setState 都重算全集")
+                self.assertIn("const visible = useMemo(", code,
+                              f"{page} 的窗口切片没有 memo")
+
+    def test_log_poll_refreshes_silently_and_incrementally(self):
+        """日志页自动刷新必须是静默增量。
+
+        原来每轮都 setLoading(true)，DataTable 就把整张表换成骨架行——等于每 5 秒
+        把列表清空一次再长回来；而且为了保住"加载更多"展开的窗口按同等大小重拉，
+        滚到 1000 行后就是每 5 秒重传重渲染 1000 行。
+        """
+        code = _code(_read("app/(console)/request-logs/page.tsx"))
+        self.assertRegex(code, r"load\(true\)",
+                         "轮询没有走静默分支")
+        self.assertIn("const incremental = silent", code)
+        # 手动刷新按钮不能把 MouseEvent 当成 silent 参数
+        self.assertNotIn("<Button onClick={load}", code,
+                         "onClick={load} 会把事件对象当成 silent（真值）")
+
+
