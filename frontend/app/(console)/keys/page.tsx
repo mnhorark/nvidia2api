@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Ban, Check, Eraser, FlaskConical, Gauge, Pencil, Plus, RefreshCw, Search, Trash2, Upload, Wand2 } from "lucide-react";
 import { api, asList, Channel, ChannelKey } from "@/lib/api";
 import { useSubmitGuard } from "@/lib/use-submit-guard";
@@ -38,6 +38,101 @@ interface ImportResult {
   [k: string]: unknown;
 }
 
+interface RowActions {
+  toggleOne: (id: number) => void;
+  toggle: (k: ChannelKey) => void;
+  test: (k: ChannelKey) => void;
+  remove: (k: ChannelKey) => void;
+  openEdit: (k: ChannelKey) => void;
+}
+
+/**
+ * memo 过的行。
+ *
+ * 一个渠道可以有上千把 Key，默认渲染窗口 200 行 × 约 10 个单元格。父组件任何
+ * setState（勾选、切开关、busyId 变化）原本都会把 200 行整片重渲染一遍——
+ * 勾选一个复选框要等 6000 个元素重新协调，这就是"点一下卡一下"的来源。
+ * 行只依赖自己的 k / selected / busy 与一个引用恒定的 actions 对象，
+ * 于是每次交互实际只有 1-2 行重渲染。
+ */
+const KeyRow = memo(function KeyRow({
+  k,
+  selected,
+  busy,
+  actions,
+}: {
+  k: ChannelKey;
+  selected: boolean;
+  busy: boolean;
+  actions: RowActions;
+}) {
+  const enabled = k.enabled ?? k.status !== "disabled";
+  return (
+    <tr className="transition-colors hover:bg-white/[0.025]">
+      <Td>
+        <Checkbox
+          ariaLabel={`选择 ${k.name}`}
+          checked={selected}
+          onChange={() => actions.toggleOne(k.id)}
+        />
+      </Td>
+      <Td className="font-medium text-gray-200">{k.name}</Td>
+      <Td>
+        <code className="block max-w-[220px] truncate font-mono text-xs text-faint" title={k.api_key}>
+          {k.api_key}
+        </code>
+      </Td>
+      <Td>
+        <Badge status={k.status} />
+      </Td>
+      <Td className="text-mute">{k.rpm_limit ?? 40}/分钟</Td>
+      <Td>{k.minute_request_count ?? 0}</Td>
+      <Td>{safePct(k.success_count, k.success_count + k.failure_count)}</Td>
+      <Td>
+        <span className="text-ok">{k.success_count}</span>
+        <span className="text-faint"> / </span>
+        <span className="text-err/80">{k.failure_count}</span>
+      </Td>
+      <Td className="text-xs text-faint">{fmtTime(k.last_used_at)}</Td>
+      <Td>
+        <div className="flex items-center gap-0.5">
+          <IconButton
+            title={enabled ? "禁用" : "启用"}
+            aria-label={enabled ? "禁用" : "启用"}
+            disabled={busy}
+            onClick={() => actions.toggle(k)}
+          >
+            {enabled ? <Ban size={14} /> : <Check size={14} />}
+          </IconButton>
+          <IconButton
+            title="测试"
+            aria-label="测试"
+            disabled={busy}
+            onClick={() => actions.test(k)}
+          >
+            <FlaskConical size={14} />
+          </IconButton>
+          <IconButton
+            title="编辑"
+            aria-label="编辑"
+            onClick={() => actions.openEdit(k)}
+          >
+            <Pencil size={14} />
+          </IconButton>
+          <IconButton
+            title="删除"
+            aria-label="删除"
+            danger
+            onClick={() => actions.remove(k)}
+          >
+            <Trash2 size={14} />
+          </IconButton>
+        </div>
+      </Td>
+    </tr>
+  );
+});
+
 export default function ChannelKeysPage() {
   const [keys, setKeys] = useState<ChannelKey[]>([]);
   const [channelName, setChannelName] = useState("");
@@ -70,16 +165,25 @@ export default function ChannelKeysPage() {
   // 渲染窗口大小：行内操作触发的全量 load() 不重置它，仅搜索词变化时重置
   const [windowSize, setWindowSize] = useState(RENDER_WINDOW);
 
-  const filtered = q.trim()
-    ? keys.filter((k) => {
-        const needle = q.trim().toLowerCase();
-        return (
-          (k.name || "").toLowerCase().includes(needle) ||
-          (k.api_key || "").toLowerCase().includes(needle)
-        );
-      })
-    : keys;
-  const visible = filtered.slice(0, windowSize);
+  // 过滤与切片都要 memo：一个渠道可以有上千把 Key，而勾选一行、切换一行开关
+  // 都会 setState —— 不 memo 的话每次交互都要重新 filter 全集并重新 slice，
+  // 更贵的是下面 200 行会整片重渲染。
+  const needle = q.trim().toLowerCase();
+  const filtered = useMemo(
+    () =>
+      needle
+        ? keys.filter(
+            (k) =>
+              (k.name || "").toLowerCase().includes(needle) ||
+              (k.api_key || "").toLowerCase().includes(needle),
+          )
+        : keys,
+    [keys, needle],
+  );
+  const visible = useMemo(
+    () => filtered.slice(0, windowSize),
+    [filtered, windowSize],
+  );
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -372,6 +476,24 @@ export default function ChannelKeysPage() {
     await batch("set_rpm", n);
   }
 
+  // 行内操作的动作集合用一个**稳定引用**传给 memo 过的行组件。
+  // 这些函数每次渲染都会重建（普通函数声明），直接传进 React.memo 的行等于
+  // 每渲染一次父组件就让所有行的 props 变化、memo 完全失效。
+  // 用 latest-ref 包一层：既保持上面所有逻辑原样不动，又让 rowActions 引用恒定，
+  // 且永远调到最新的闭包。
+  const fnsRef = useRef({ toggleOne, toggle, test, remove, openEdit });
+  fnsRef.current = { toggleOne, toggle, test, remove, openEdit };
+  const rowActions = useMemo(
+    () => ({
+      toggleOne: (id: number) => fnsRef.current.toggleOne(id),
+      toggle: (k: ChannelKey) => fnsRef.current.toggle(k),
+      test: (k: ChannelKey) => fnsRef.current.test(k),
+      remove: (k: ChannelKey) => fnsRef.current.remove(k),
+      openEdit: (k: ChannelKey) => fnsRef.current.openEdit(k),
+    }),
+    [],
+  );
+
   return (
     <div>
       <PageHeader
@@ -458,73 +580,15 @@ export default function ChannelKeysPage() {
           </>
         }
       >
-        {visible.map((k) => {
-          const enabled = k.enabled ?? k.status !== "disabled";
-          return (
-            <tr key={k.id} className="transition-colors hover:bg-white/[0.025]">
-              <Td>
-                <Checkbox
-                  ariaLabel={`选择 ${k.name}`}
-                  checked={selected.has(k.id)}
-                  onChange={() => toggleOne(k.id)}
-                />
-              </Td>
-              <Td className="font-medium text-gray-200">{k.name}</Td>
-              <Td>
-                <code className="block max-w-[220px] truncate font-mono text-xs text-faint" title={k.api_key}>
-                  {k.api_key}
-                </code>
-              </Td>
-              <Td>
-                <Badge status={k.status} />
-              </Td>
-              <Td className="text-mute">{k.rpm_limit ?? 40}/分钟</Td>
-              <Td>{k.minute_request_count ?? 0}</Td>
-              <Td>{safePct(k.success_count, k.success_count + k.failure_count)}</Td>
-              <Td>
-                <span className="text-ok">{k.success_count}</span>
-                <span className="text-faint"> / </span>
-                <span className="text-err/80">{k.failure_count}</span>
-              </Td>
-              <Td className="text-xs text-faint">{fmtTime(k.last_used_at)}</Td>
-              <Td>
-                <div className="flex items-center gap-0.5">
-                  <IconButton
-                    title={enabled ? "禁用" : "启用"}
-                    aria-label={enabled ? "禁用" : "启用"}
-                    disabled={busyId === k.id}
-                    onClick={() => toggle(k)}
-                  >
-                    {enabled ? <Ban size={14} /> : <Check size={14} />}
-                  </IconButton>
-                  <IconButton
-                    title="测试"
-                    aria-label="测试"
-                    disabled={busyId === k.id}
-                    onClick={() => test(k)}
-                  >
-                    <FlaskConical size={14} />
-                  </IconButton>
-                  <IconButton
-                    title="编辑"
-                    aria-label="编辑"
-                    onClick={() => openEdit(k)}
-                  >
-                    <Pencil size={14} />
-                  </IconButton>
-                  <IconButton
-                    title="删除"
-                    aria-label="删除"
-                    danger
-                    onClick={() => remove(k)}
-                  >
-                    <Trash2 size={14} />
-                  </IconButton>
-                </div>
-              </Td>
-            </tr>
-          );
-        })}
+        {visible.map((k) => (
+          <KeyRow
+            key={k.id}
+            k={k}
+            selected={selected.has(k.id)}
+            busy={busyId === k.id}
+            actions={rowActions}
+          />
+        ))}
       </DataTable>
 
       {!loading && filtered.length > 0 && (

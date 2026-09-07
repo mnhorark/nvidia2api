@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Download, Pencil, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
 import { api, asList, Model, ProxyGroup } from "@/lib/api";
 import { useSubmitGuard } from "@/lib/use-submit-guard";
@@ -91,15 +91,26 @@ export default function ModelsPage() {
     });
   }
 
-  const filtered = models.filter(
-    (m) =>
-      !q ||
-      m.model_name.toLowerCase().includes(q.toLowerCase()) ||
-      (m.alias || "").toLowerCase().includes(q.toLowerCase()) ||
-      (m.aliases ?? []).some((a) => a.toLowerCase().includes(q.toLowerCase()))
+  // 过滤与切片都要 memo：模型表可以有上千行，而每次勾选/切开关/搜索都会
+  // setState，不 memo 时整片可见行都重新计算并重新渲染。
+  const needle = q.trim().toLowerCase();
+  const filtered = useMemo(
+    () =>
+      !needle
+        ? models
+        : models.filter(
+            (m) =>
+              m.model_name.toLowerCase().includes(needle) ||
+              (m.alias || "").toLowerCase().includes(needle) ||
+              (m.aliases ?? []).some((a) => a.toLowerCase().includes(needle)),
+          ),
+    [models, needle],
   );
   // 渲染窗口：全选/反选仍作用于 filtered 全集，这里只控制 DOM 渲染行数
-  const visible = filtered.slice(0, windowSize);
+  const visible = useMemo(
+    () => filtered.slice(0, windowSize),
+    [filtered, windowSize],
+  );
 
   async function sync(prune = false, pruneOnly = false) {
     setSyncing(true);

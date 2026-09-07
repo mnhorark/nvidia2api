@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Gauge, Globe, Pencil, Plus, RefreshCw, Search, Trash2, Upload } from "lucide-react";
 import { api, asList, Proxy, ProxyGroup } from "@/lib/api";
 import { useSubmitGuard } from "@/lib/use-submit-guard";
@@ -43,6 +43,89 @@ function matchKw(p: Proxy, needle: string): boolean {
     (p.group_name || "").toLowerCase().includes(needle)
   );
 }
+
+interface RowActions {
+  toggleOne: (id: number) => void;
+  setEnabled: (p: Proxy, v: boolean) => void;
+  testOne: (p: Proxy) => void;
+  fetchIp: (p: Proxy) => void;
+  openEdit: (p: Proxy) => void;
+  remove: (p: Proxy) => void;
+}
+
+/**
+ * memo 过的代理行。12 列 × 200 行 = 一次交互重渲染 6000 个元素是
+ * "点一下卡一下"的直接原因；行只依赖自己的 p / selected / busy 与恒定引用的
+ * actions，于是每次交互实际只有 1-2 行重渲染。
+ */
+const ProxyRow = memo(function ProxyRow({
+  p,
+  selected,
+  busy,
+  actions,
+}: {
+  p: Proxy;
+  selected: boolean;
+  busy: boolean;
+  actions: RowActions;
+}) {
+  return (
+    <tr className="transition-colors hover:bg-white/[0.025]">
+      <Td>
+        <Checkbox
+          ariaLabel={`选择 ${p.name}`}
+          checked={selected}
+          onChange={() => actions.toggleOne(p.id)}
+        />
+      </Td>
+      <Td className="font-medium text-gray-200">{p.name}</Td>
+      <Td>
+        <code className="rounded border border-line bg-white/[0.03] px-1.5 py-0.5 text-[10px] font-medium uppercase text-info">
+          {p.protocol}
+        </code>
+      </Td>
+      <Td className="font-mono text-xs text-mute">{p.host}:{p.port}</Td>
+      <Td className="text-mute">{p.group_name || "—"}</Td>
+      <Td className="font-mono text-xs text-mute">{p.public_ip || "—"}</Td>
+      <Td className="text-mute">{p.country || "—"}</Td>
+      <Td className="tabular-nums" title={p.latency_ms != null ? `${p.latency_ms} ms` : undefined}>
+        <span
+          className={
+            p.latency_ms == null ? "text-faint"
+              : p.latency_ms < 300 ? "text-ok"
+              : p.latency_ms < 1000 ? "text-gray-200"
+              : "text-warn"
+          }
+        >
+          {fmtLatency(p.latency_ms)}
+        </span>
+      </Td>
+      <Td>
+        <Badge status={p.status} />
+      </Td>
+      <Td>
+        <Toggle checked={p.enabled} disabled={busy} onChange={(v) => actions.setEnabled(p, v)} />
+      </Td>
+      <Td className="text-xs text-faint">{fmtTime(p.last_check_at)}</Td>
+      <Td>
+        <div className="flex items-center gap-0.5">
+          <IconButton title="测速" aria-label="测速" disabled={busy} onClick={() => actions.testOne(p)}>
+            <Gauge size={14} />
+          </IconButton>
+          <IconButton title="获取 IP" aria-label="获取 IP" disabled={busy} onClick={() => actions.fetchIp(p)}>
+            <Globe size={14} />
+          </IconButton>
+          <IconButton title="编辑" aria-label="编辑" onClick={() => actions.openEdit(p)}>
+            <Pencil size={14} />
+          </IconButton>
+          <IconButton title="删除" aria-label="删除" danger onClick={() => actions.remove(p)}>
+            <Trash2 size={14} />
+          </IconButton>
+        </div>
+      </Td>
+    </tr>
+  );
+});
 
 export default function ProxiesPage() {
   const [proxies, setProxies] = useState<Proxy[]>([]);
@@ -122,10 +205,18 @@ export default function ProxiesPage() {
     setWindowSize(RENDER_WINDOW);
   }, [kw]);
 
-  // 关键字过滤：名称 / host / 分组名命中即保留（谓词见 matchKw）
+  // 关键字过滤：名称 / host / 分组名命中即保留（谓词见 matchKw）。
+  // 必须 memo：一个渠道可以有上千条代理，而勾选一行、切一个开关都会 setState，
+  // 不 memo 时每次交互都要重新 filter 全集；更贵的是下面 200 行整片重渲染。
   const needle = kw.trim().toLowerCase();
-  const filtered = proxies.filter((p) => matchKw(p, needle));
-  const visible = filtered.slice(0, windowSize);
+  const filtered = useMemo(
+    () => proxies.filter((p) => matchKw(p, needle)),
+    [proxies, needle],
+  );
+  const visible = useMemo(
+    () => filtered.slice(0, windowSize),
+    [filtered, windowSize],
+  );
 
   /** 就地写入/更新一行：PATCH/POST 的响应就是权威整行序列化，
    *  没必要为一次单行操作重拉全表（千级代理 ≈ 195KB + 后端全表扫描）。
@@ -138,6 +229,11 @@ export default function ProxiesPage() {
       next[idx] = row;
       return next;
     });
+  }
+
+  /** 打开编辑弹窗（行内 memo 组件通过稳定的 actions 引用调它）。 */
+  function openEdit(p: Proxy) {
+    setEditItem(p);
   }
 
   async function setEnabled(p: Proxy, enabled: boolean) {
@@ -404,6 +500,22 @@ export default function ProxiesPage() {
 
   const atCap = enabledCount >= maxProxies && maxProxies > 0;
 
+  // 见 keys 页同名注释：行内操作用稳定引用传给 memo 过的行，
+  // 否则父组件每次 setState 都会让 200 行整片重渲染。
+  const fnsRef = useRef({ toggleOne, setEnabled, testOne, fetchIp, openEdit, remove });
+  fnsRef.current = { toggleOne, setEnabled, testOne, fetchIp, openEdit, remove };
+  const rowActions = useMemo(
+    () => ({
+      toggleOne: (id: number) => fnsRef.current.toggleOne(id),
+      setEnabled: (p: Proxy, v: boolean) => fnsRef.current.setEnabled(p, v),
+      testOne: (p: Proxy) => fnsRef.current.testOne(p),
+      fetchIp: (p: Proxy) => fnsRef.current.fetchIp(p),
+      openEdit: (p: Proxy) => fnsRef.current.openEdit(p),
+      remove: (p: Proxy) => fnsRef.current.remove(p),
+    }),
+    [],
+  );
+
   return (
     <div>
       <PageHeader
@@ -555,88 +667,13 @@ export default function ProxiesPage() {
         }
       >
         {visible.map((p) => (
-          <tr key={p.id} className="transition-colors hover:bg-white/[0.025]">
-            <Td>
-              <Checkbox
-                ariaLabel={`选择 ${p.name}`}
-                checked={selected.has(p.id)}
-                onChange={() => toggleOne(p.id)}
-              />
-            </Td>
-            <Td className="font-medium text-gray-200">{p.name}</Td>
-            <Td>
-              <code className="rounded border border-line bg-white/[0.03] px-1.5 py-0.5 text-[10px] font-medium uppercase text-info">
-                {p.protocol}
-              </code>
-            </Td>
-            <Td className="font-mono text-xs text-mute">
-              {p.host}:{p.port}
-            </Td>
-            <Td className="text-mute">{p.group_name || "—"}</Td>
-            <Td className="font-mono text-xs text-mute">{p.public_ip || "—"}</Td>
-            <Td className="text-mute">{p.country || "—"}</Td>
-            <Td
-              className="tabular-nums"
-              title={p.latency_ms != null ? `${p.latency_ms} ms` : undefined}
-            >
-              <span
-                className={
-                  p.latency_ms == null ? "text-faint"
-                    : p.latency_ms < 300 ? "text-ok"
-                    : p.latency_ms < 1000 ? "text-gray-200"
-                    : "text-warn"
-                }
-              >
-                {fmtLatency(p.latency_ms)}
-              </span>
-            </Td>
-            <Td>
-              <Badge status={p.status} />
-            </Td>
-            <Td>
-              <Toggle
-                checked={p.enabled}
-                disabled={busyId === p.id}
-                onChange={(v) => setEnabled(p, v)}
-              />
-            </Td>
-            <Td className="text-xs text-faint">{fmtTime(p.last_check_at)}</Td>
-            <Td>
-              <div className="flex items-center gap-0.5">
-                <IconButton
-                  title="测速"
-                  aria-label="测速"
-                  disabled={busyId === p.id}
-                  onClick={() => testOne(p)}
-                >
-                  <Gauge size={14} />
-                </IconButton>
-                <IconButton
-                  title="获取 IP"
-                  aria-label="获取 IP"
-                  disabled={busyId === p.id}
-                  onClick={() => fetchIp(p)}
-                >
-                  <Globe size={14} />
-                </IconButton>
-                <IconButton
-                  title="编辑"
-                  aria-label="编辑"
-                  onClick={() => setEditItem(p)}
-                >
-                  <Pencil size={14} />
-                </IconButton>
-                <IconButton
-                  title="删除"
-                  aria-label="删除"
-                  danger
-                  onClick={() => remove(p)}
-                >
-                  <Trash2 size={14} />
-                </IconButton>
-              </div>
-            </Td>
-          </tr>
+          <ProxyRow
+            key={p.id}
+            p={p}
+            selected={selected.has(p.id)}
+            busy={busyId === p.id}
+            actions={rowActions}
+          />
         ))}
       </DataTable>
 

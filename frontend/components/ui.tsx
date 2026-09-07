@@ -351,7 +351,10 @@ export function Th({ children, className }: { children?: React.ReactNode; classN
     <th
       scope="col"
       className={cx(
-        "px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-faint",
+        // sticky 表头：代理表 12 列、展开到 200 行后横向+纵向滚动会完全失去
+        // 列对应关系（哪列是延迟、哪列是状态）。背景必须不透明，否则行会从
+        // 表头底下透出来。
+        "sticky top-0 z-10 bg-[#131417] px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-faint",
         className
       )}
     >
@@ -399,30 +402,56 @@ export function DataTable({
   /** 填满容器宽度：去掉 min-w-max，让长内容单元格（模型名等）能按 max-w 收缩省略 */
   fill?: boolean;
 }) {
+  // 空态/加载态的 colSpan 由表头列数算出来。此前写死 50 / 100 "反正够大"，
+  // 列数一变就得记得改，而且 colSpan 过大本身不影响渲染但会误导读代码的人。
+  const cols = Math.max(1, React.Children.count(head));
   return (
     <div className="overflow-x-auto rounded-xl border border-line bg-panel">
       <table className={cx("w-full border-collapse", !fill && "min-w-max")}>
         <thead>
-          <tr className="border-b border-line bg-white/[0.015]">{head}</tr>
+          <tr className="border-b border-line">{head}</tr>
         </thead>
         <tbody className="divide-y divide-line/60">
           {children}
           {!loading && React.Children.count(children) === 0 && (
             <tr>
-              <td colSpan={50} className="px-3 py-14 text-center">
+              <td colSpan={cols} className="px-3 py-14 text-center">
                 <p className="text-[13px] text-faint">{empty || "暂无数据"}</p>
               </td>
             </tr>
           )}
           {loading && (
-            <tr>
-              <td colSpan={100} className="px-3 py-14 text-center">
-                <Loader2 className="mx-auto animate-spin text-faint" size={20} />
+            // 骨架行而不是单个转圈：首屏时表格已经有形状，滚动位置和列宽都不跳，
+            // 数据到位后原地替换——比"空白 + 中间一个 spinner"体感快得多。
+            <tr aria-busy="true">
+              <td colSpan={cols} className="p-0">
+                <TableSkeleton cols={cols} />
               </td>
             </tr>
           )}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+/** 表格骨架行。列数少时按列画，多时收敛到 6 段避免 200 个 div。 */
+function TableSkeleton({ cols }: { cols: number }) {
+  const n = Math.min(Math.max(cols, 3), 6);
+  const rows = 6;
+  return (
+    <div className="space-y-px">
+      {Array.from({ length: rows }, (_, r) => (
+        <div key={r} className="flex items-center gap-3 px-3 py-3">
+          {Array.from({ length: n }, (_, c) => (
+            <div
+              key={c}
+              className="h-3 animate-pulse rounded bg-white/[0.06]"
+              style={{ width: c === 0 ? "22%" : `${100 / n - 6}%` }}
+            />
+          ))}
+        </div>
+      ))}
     </div>
   );
 }
