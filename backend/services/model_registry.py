@@ -29,12 +29,15 @@ logger = logging.getLogger("nvidia2api.registry")
 #   避免无信号的批量写导致注册表永久陈旧。
 _CACHE_TTL = 3.0
 _cache: tuple[float, list[AIModel]] | None = None
+# 渠道内解析表（/c/<slug>/v1/* 的热路径）：channel_id -> (时间戳, 对外名->模型)
+_channel_cache: dict[int, tuple[float, dict[str, AIModel]]] = {}
 
 
 def invalidate() -> None:
     """清空注册表缓存（模型/渠道发生变更时调用）。"""
     global _cache
     _cache = None
+    _channel_cache.clear()
 
 
 def _candidates_cached() -> list[AIModel]:
@@ -127,25 +130,40 @@ def resolve(name: str) -> AIModel | None:
     return None
 
 
+def channel_index(channel: Channel) -> dict[str, AIModel]:
+    """渠道内「任意可调用名 -> 模型」表：主对外名（alias > 上游名）+ 附加别名
+    + 上游原始名。重名时按 (-route_priority, id) 取第一个。
+
+    缓存策略与全局注册表一致（信号即时失效 + 3s TTL 兜底批量写）。
+    """
+    cid = channel.id
+    now = time.monotonic()
+    hit = _channel_cache.get(cid)
+    if hit is not None and now - hit[0] < _CACHE_TTL:
+        return hit[1]
+    table: dict[str, AIModel] = {}
+    for m in (channel.models.filter(enabled=True)
+              .order_by("-route_priority", "id")):
+        for n in public_names(m):
+            table.setdefault(n, m)
+        table.setdefault(m.model_name, m)
+    _channel_cache[cid] = (now, table)
+    return table
+
+
 def resolve_in_channel(name: str, channel: Channel) -> AIModel | None:
-    """在指定渠道内解析：任意对外名（含附加别名）/ 上游原始名命中即可。"""
+    """在指定渠道内解析：任意对外名（含附加别名）/ 上游原始名命中即可。
+
+    此前每次调用都要打两条查询：第一条按 alias/model_name 精确匹配，落空后
+    第二条把该渠道**全部**启用模型读进内存再 Python 扫 `aliases`（JSON 数组
+    不便在 SQLite 上做索引匹配）。`/c/<slug>/v1/*` 每个请求都走这里，而那
+    一切串行在 asgiref 唯一那条同步视图线程上，实测 1.5 ms/请求。
+    改成缓存解析表后，稳态下零查询。
+    """
     name = (name or "").strip()
     if not name:
         return None
-    rec = (
-        channel.models.filter(enabled=True)
-        .filter(Q(alias=name) | Q(model_name=name))
-        .order_by("-route_priority", "id")
-        .first()
-    )
-    if rec:
-        return rec
-    # 附加别名在 Python 层匹配（JSON list 不便在 SQLite 上做索引/contains）
-    for m in channel.models.filter(enabled=True).order_by("-route_priority", "id"):
-        for n in (m.aliases or []):
-            if str(n).strip() == name:
-                return m
-    return None
+    return channel_index(channel).get(name)
 
 
 def conflicts() -> dict[str, list[int]]:
