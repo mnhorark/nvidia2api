@@ -18,7 +18,11 @@ import {
 } from "lucide-react";
 import { api, DashboardStats, UsageResponse } from "@/lib/api";
 import { useLocalStorage } from "@/lib/use-local-storage";
-import { Button, Card, PageHeader, StatusDot, cx } from "@/components/ui";
+import { Button, Card, ErrorBanner, PageHeader, StatusDot, cx, statusLabel } from "@/components/ui";
+
+/** usage 缓存新鲜窗口：区间切换是最高频交互，60s 内命中直接渲染、
+ *  过期则由轮询或手动刷新静默重拉。 */
+const USAGE_CACHE_TTL_MS = 60_000;
 
 /* ==================== KPI 大卡 ==================== */
 function KpiCard({
@@ -207,7 +211,7 @@ function StatusPanel({
             {entries.map(([status, count]) => (
               <div key={status} className="flex items-center gap-2">
                 <StatusDot status={status} />
-                <span className="flex-1 text-xs text-mute">{statusLabels[status] ?? status}</span>
+                <span className="flex-1 text-xs text-mute">{statusLabel(status)}</span>
                 <span className="text-xs font-semibold tabular-nums text-gray-200">{count}</span>
               </div>
             ))}
@@ -218,21 +222,6 @@ function StatusPanel({
     </Card>
   );
 }
-
-const statusLabels: Record<string, string> = {
-  available: "正常",
-  healthy: "正常",
-  enabled: "启用",
-  success: "成功",
-  rate_limited: "限流",
-  degraded: "降级",
-  error: "异常",
-  unhealthy: "异常",
-  failed: "失败",
-  invalid: "无效",
-  disabled: "禁用",
-  unknown: "未知",
-};
 
 function fmtNum(n: number) {
   if (n == null || Number.isNaN(n)) return "—";
@@ -274,11 +263,15 @@ export default function DashboardPage() {
   // 界面停留在新筛选但显示旧区间的数据。
   const seqRef = useRef(0);
 
-  // usage 客户端缓存（按 range 键控，60s 内有效）：切换时间尺度是最频繁的
-  // 交互，命中即免请求直接渲染；后端指纹缓存只有 3s，挡不住“来回切”。
+  // usage 客户端缓存（按 range 键控，带抓取时间戳）：切换时间尺度是最频繁的
+  // 交互，命中且未过期即免请求直接渲染；后端指纹缓存只有 3s，挡不住"来回切"。
   // 后端 usage 跨渠道全量汇总，与渠道无关，随 range 缓存不会串数据。
-  const usageCacheRef = useRef<Map<string, UsageResponse>>(new Map());
-  const USAGE_CACHE_TTL_MS = 60_000;
+  //
+  // 时间戳是必需的，不是装饰：上一版缓存是 Map<string, UsageResponse>，
+  // 声明了 USAGE_CACHE_TTL_MS 却从未读取过它，也没有任何地方把后台刷新的结果
+  // 写回 state —— 于是"stale-while-revalidate"实际是"首次加载后永久冻结"：
+  // KPI 每 10s 在跳，用量图一直停在第一次拉到的数字，点刷新也不动。
+  const usageCacheRef = useRef<Map<string, { data: UsageResponse; at: number }>>(new Map());
 
   async function loadStats() {
     const s = await api.get<DashboardStats>("/api/admin/dashboard");
@@ -292,21 +285,31 @@ export default function DashboardPage() {
       ? `hours=5&tz=${encodeURIComponent(tz)}`
       : `days=${r}&tz=${encodeURIComponent(tz)}`;
     const u = await api.get<UsageResponse>(`/api/admin/dashboard/usage?${usageQs}`);
-    usageCacheRef.current.set(r, u);
+    usageCacheRef.current.set(r, { data: u, at: Date.now() });
     return u;
+  }
+
+  /** 缓存里是否已有该区间且仍在新鲜窗口内。 */
+  function freshUsage(r: string): UsageResponse | null {
+    const hit = usageCacheRef.current.get(r);
+    if (!hit) return null;
+    return Date.now() - hit.at < USAGE_CACHE_TTL_MS ? hit.data : null;
   }
 
   async function load(r = range) {
     const seq = ++seqRef.current;
     setLoading(true);
     setError("");
-    const cached = usageCacheRef.current.get(r);
+    const cached = freshUsage(r);
     if (cached) {
-      // 缓存命中：直接上屏，仍异步刷新 stats（运行指标实时性要求高），
-      // 并后台静默更新 usage（60s 窗口内的数据足够新鲜）。
+      // 缓存命中：旧数据立即上屏消除白屏，但**后台刷新结果同样要写回 state**。
+      // 只 setUsage(cached) 而丢弃 loadUsage 的返回值，等于把重校验做成了空转。
       setUsage(cached);
       try {
-        await Promise.all([loadStats(), loadUsage(r)]);
+        const u = await loadUsage(r);
+        if (seq !== seqRef.current) return; // 期间又切了区间，丢弃过期结果
+        setUsage(u);
+        setError("");
       } catch {
         /* 缓存已上屏，后台刷新失败静默等待下一次轮询 */
       } finally {
@@ -332,19 +335,30 @@ export default function DashboardPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 轻量轮询：每 10s 刷新运行指标（实时并发等），不重拉用量图。
+  // 轻量轮询：每 10s 刷新运行指标（实时并发等）。用量图查询重，不参与 10s 轮询，
+  // 但**超过新鲜窗口就必须跟上**——否则停在仪表盘上不动，用量图会永久冻结。
   // 标签页不可见时暂停，避免多标签页 / 切后台时对后端空轮询。
   useEffect(() => {
     const timer = window.setInterval(async () => {
       if (document.hidden) return;
+      // 轮询不递增 seqRef（它不该抢占手动刷新的"最新一次"地位），
+      // 但落地前必须确认期间没有发生过手动请求，否则会把旧区间盖回新区间。
+      const seq = seqRef.current;
       try {
         await loadStats();
+        if (!freshUsage(range)) {
+          // 过期：静默重拉。失败不打扰用户，等下一轮。
+          await loadUsage(range)
+            .then((u) => { if (seq === seqRef.current) setUsage(u); })
+            .catch(() => {});
+        }
       } catch {
         /* 静默，等待下一次轮询 */
       }
     }, 10_000);
     return () => window.clearInterval(timer);
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [range]);
 
   function changeRange(r: string) {
     setRange(r);
@@ -371,17 +385,7 @@ export default function DashboardPage() {
         }
       />
 
-      {error && (
-        <div className="mb-4 flex items-center justify-between rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-[13px] text-err">
-          <span>{error}</span>
-          <button
-            onClick={() => load()}
-            className="shrink-0 rounded-md border border-err/25 bg-err/10 px-2.5 py-1 text-xs font-medium text-err transition-colors hover:bg-err/20"
-          >
-            重试
-          </button>
-        </div>
-      )}
+      <ErrorBanner message={error} onRetry={() => load()} />
 
       {/* ── KPI 卡片区 ── */}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
