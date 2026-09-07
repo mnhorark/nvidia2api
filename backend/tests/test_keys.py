@@ -113,8 +113,9 @@ class RateLimitTests(TestCase):
         key.refresh_from_db()
         self.assertEqual(key.minute_request_count, 0)
 
-    def test_concurrent_claims_do_not_exceed_rpm(self):
-        pass
+    # 曾经这里有一个同名但函数体只有 `pass` 的空壳用例：真测试在
+    # ConcurrentRateLimitTests 里，所以它无害但会污染"已覆盖并发安全"的判断
+    # （收集列表里看着有两条，实际只有一条）。两份审查都点过名，删掉。
 
 
 class ConcurrentRateLimitTests(TransactionTestCase):
@@ -133,6 +134,56 @@ class ConcurrentRateLimitTests(TransactionTestCase):
         self.assertEqual(sum(results), 5)
         key.refresh_from_db()
         self.assertEqual(key.minute_request_count, 5)
+
+    def test_concurrent_bulk_claims_do_not_exceed_rpm(self):
+        """批量领取必须与逐条版同样严格：并发下总领取数恰好等于 rpm_limit。
+
+        `claim_rpm_slots` 把 100 次条件 UPDATE 合成 1 条，条件仍在 SQL 里
+        （minute_request_count < rpm_limit），所以超扣风险不应变化——但这是
+        AGENTS.md §六十一 明确要求的并发安全，必须实测钉住而不是靠推理。
+        同时验证"领到的人数"判定（用 last_used_at 回读）不会虚报。
+        """
+        key = ChannelKey.objects.create(channel=_ch(), name="kb",
+                                         api_key="nvapi-b", rpm_limit=7)
+        won: list[int] = []
+        lock = threading.Lock()
+
+        def worker():
+            fresh = ChannelKey.objects.get(pk=key.pk)
+            got = key_service.claim_rpm_slots([fresh])
+            with lock:
+                won.append(len(got))
+
+        threads = [threading.Thread(target=worker) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sum(won), 7, f"批量领取超扣/少扣：{won}")
+        key.refresh_from_db()
+        self.assertEqual(key.minute_request_count, 7)
+
+    def test_bulk_claims_respect_per_key_limits(self):
+        """一批多把 Key 混合状态：只有未超限的被领到，且各自计数正确。"""
+        ch = _ch()
+        under = ChannelKey.objects.create(channel=ch, name="under",
+                                          api_key="nvapi-u", rpm_limit=10)
+        at_limit = ChannelKey.objects.create(channel=ch, name="full",
+                                             api_key="nvapi-f", rpm_limit=1,
+                                             minute_window_start=timezone.now(),
+                                             minute_request_count=1)
+        unlimited = ChannelKey.objects.create(channel=ch, name="free",
+                                              api_key="nvapi-f2", rpm_limit=0)
+        keys = [under, at_limit, unlimited]
+        got = key_service.claim_rpm_slots(keys)
+        ids = {k.id for k in got}
+        self.assertIn(under.id, ids)
+        self.assertNotIn(at_limit.id, ids, "已达上限的 Key 不应领到名额")
+        self.assertIn(unlimited.id, ids, "rpm_limit<=0 应视为不限流")
+        under.refresh_from_db()
+        at_limit.refresh_from_db()
+        self.assertEqual(under.minute_request_count, 1)
+        self.assertEqual(at_limit.minute_request_count, 1, "落选的 Key 计数不应被改动")
 
 
 class FailureStatusTests(TestCase):

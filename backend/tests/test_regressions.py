@@ -1883,16 +1883,21 @@ class R14_RpmClaimUnavailableTests(TestCase):
         self.assertFalse(key_service.claim_rpm_slot(self.keys[0].id))
 
     def test_build_routes_stops_instead_of_masking_as_no_keys(self):
-        """DB 争用时 build_routes 提前结束并留痕，而不是静默返回空列表。"""
+        """DB 争用时 build_routes 提前结束并留痕，而不是静默返回空列表。
+
+        两个领取入口一起 patch：`build_routes` 现在走批量的 `claim_rpm_slots`
+        （逐条版留给其它调用方），只 patch 其中一个会让这条守卫空转。
+        """
         from unittest.mock import patch
 
         from services import key_service, load_balancer
         from services.key_service import RpmClaimUnavailable
 
-        def boom(key_id):
+        def boom(*a, **kw):
             raise RpmClaimUnavailable("database is locked")
 
         with patch.object(key_service, "claim_rpm_slot", side_effect=boom), \
+                patch.object(key_service, "claim_rpm_slots", side_effect=boom), \
                 patch.object(load_balancer, "logger") as lg:
             routes = load_balancer.build_routes(self.ch)
 
@@ -1900,6 +1905,25 @@ class R14_RpmClaimUnavailableTests(TestCase):
         self.assertTrue(
             any("数据库争用" in str(c.args) for c in lg.warning.call_args_list),
             "DB 争用必须留下可区分于'配额耗尽'的日志")
+
+    def test_build_routes_uses_the_bulk_claim(self):
+        """钉住"热路径走批量领取"这件事本身。
+
+        逐条 claim 每把 Key 3 条 SQL，max_routes=100 时是 300 条串行在唯一
+        那条同步视图线程上（实测 124 ms，占整站吞吐上限的大头）。批量版 4 条。
+        若有人改回逐条，性能回退不会让任何功能测试变红——所以单独钉一条。
+        """
+        from unittest.mock import patch
+
+        from services import key_service, load_balancer
+
+        with patch.object(key_service, "claim_rpm_slots",
+                          side_effect=lambda keys: list(keys)) as bulk, \
+                patch.object(key_service, "claim_rpm_slot",
+                             side_effect=AssertionError("热路径不应再逐条领取")):
+            load_balancer.build_routes(self.ch)
+
+        self.assertTrue(bulk.called, "build_routes 没有走批量领取")
 
 
 class R16_NonStreamRetryExcludesDeadRoutes(TestCase):

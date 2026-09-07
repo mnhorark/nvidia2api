@@ -215,38 +215,36 @@ def report_proxy_result(proxy_id: int, success: bool, latency_ms: float | None =
         logger.warning("report_proxy_result %s failed (swallowed): %s", proxy_id, exc)
 
 
-def schedulable_proxies(channel: Channel, group: int | None = None) -> list[Proxy]:
-    """Enabled, not in cooldown, healthy-ish proxies, best first.
+def schedulable_proxies(channel: Channel, group: int | None = None,
+                        limit: int | None = None) -> list[Proxy]:
+    """Enabled, not in cooldown, best first.
 
     `group` 非空时仅返回该分组内的代理；分组内无代理时返回空列表。
+    `limit` 非空时只取前 N 条（`build_routes` 最多用 route_count-1 条）。
+
+    过滤与排序都下推到 SQL：原先取回该渠道全部启用代理（实测 300 条）再在
+    Python 里过滤排序，光 ORM 建行就 5.6 ms，而这 5.6 ms 串行在 asgiref 唯一
+    那条同步视图线程上。`limit` 把行数从 300 压到个位数才是真解。
+
+    不再 `select_related("group")`：调度侧只用 `proxy.url / name / id /
+    public_ip`，没有一处读 `.group`；那个 JOIN 外加 300 个 ProxyGroup 对象
+    纯属白付。控制台展示走序列化器，不经过本函数。
+
+    B7：unhealthy 是**可恢复**的熔断状态而非永久判决——唯一排除条件是
+    `cooldown_until` 未过期。真死的代理会快速失败（connect 超时 10s）并被
+    `report_proxy_result` 重新置 UNHEALTHY + 新冷却，自动回到 open。
+    渠道级 `disable_proxy_unhealthy` 打开时连冷却一起豁免（保持可调度）。
     """
     now = timezone.now()
-    out = []
-    qs = channel.proxies.filter(enabled=True).select_related("group")
+    qs = channel.proxies.filter(enabled=True)
     if group is not None:
         qs = qs.filter(group_id=group)
-    cancel_unhealthy = bool(channel.disable_proxy_unhealthy)
-    for p in qs:
-        if not cancel_unhealthy:
-            if p.cooldown_until and p.cooldown_until > now:
-                continue
-            # B7：unhealthy 曾经是**永久**判决——上面那行冷却判断只看
-            # `cooldown_until`，而这一行无条件跳过 UNHEALTHY，于是冷却到期后
-            # 代理依然回不到调度池，唯一出路是有人在控制台手点测速
-            # （只有 `report_proxy_result(success=True)` 会恢复 HEALTHY）。
-            # 一条代理被偶发网络抖动连续打挂三次，就得等人工复检——
-            # 在 1200+ 代理的池子里等于永久损失一条线路。
-            #
-            # 现在退化成标准熔断器的 half-open：`cooldown_until` 过期即重新
-            #  eligible。真死的代理会快速失败（connect 超时 10s）并被
-            # `report_proxy_result` 重新置 UNHEALTHY + 新冷却，自动回到 open。
-            # 状态字段本身不改——读路径不做写操作。
-        out.append(p)
-    out.sort(key=lambda p: (
-        p.latency_ms if p.latency_ms is not None else float("inf"),
-        p.failure_count,
-    ))
-    return out
+    if not channel.disable_proxy_unhealthy:
+        qs = qs.filter(Q(cooldown_until__isnull=True) | Q(cooldown_until__lte=now))
+    qs = qs.order_by(F("latency_ms").asc(nulls_last=True), "failure_count", "id")
+    if limit is not None:
+        qs = qs[:max(0, int(limit))]
+    return list(qs)
 
 
 def add_group(channel: Channel, name: str, **kwargs) -> ProxyGroup:

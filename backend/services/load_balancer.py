@@ -61,12 +61,17 @@ def build_routes(channel: Channel | None = None,
     cfg_max = sysconfig.get("max_routes_per_request", channel)
     max_routes = min(max_routes or cfg_max, cfg_max)
 
-    proxies = proxy_service.schedulable_proxies(channel, group=proxy_group)
+    # 候选集在 SQL 侧就过滤 + 排序 + 截断（见两个函数各自的说明）：
+    # 代理侧 1:1 消耗、不会"领取失败"，所以精确取 route_count-1 的上界即可；
+    # Key 侧留 8 条余量给并发领取落选的情况（本进程内同步视图串行，落选几乎
+    # 只可能来自后台线程的管理写），余量用尽时宁可少发几条线路也不会越权复用。
+    proxies = proxy_service.schedulable_proxies(
+        channel, group=proxy_group, limit=max(max_routes - 1, 0))
     # 整轮停用的坏代理先过滤：exclude_proxies 命中即不参与本轮任何配对，
     # 且不计入线路配额（否则"1 直连 + N 代理"会膨胀出多余的直连线路）。
     if exclude_proxies:
         proxies = [p for p in proxies if p.id not in exclude_proxies]
-    keys = key_service.available_keys(channel)
+    keys = key_service.available_keys(channel, limit=max_routes + 8)
 
     route_count = min(len(proxies) + 1, len(keys), max_routes)
     if route_count <= 0:
@@ -91,19 +96,31 @@ def build_routes(channel: Channel | None = None,
     # 高并发重试轮次下"5 Key 4 代理"可能实际只发出 1-2 条线路，竞速冗余
     # 名存实亡。
     ki = 0
+    # 逐条 claim 时 100 把 Key = 300 条 SQL / 124ms，且全部串行在 asgiref
+    # 唯一那条同步视图线程上（实测把整站吞吐压到 ≈9 req/s）。改成**每轮一次
+    # 批量领取**：先按代理指针与排除集挑出候选，一次 claim，再按实际领到的
+    # 顺序配对。名额不足时下一轮继续补位，语义与逐条版一致。
     while len(routes) < route_count and ki < len(keys):
-        key = keys[ki]
-        ki += 1
-        proxy = proxies[proxy_ptr] if proxy_ptr < n_proxies else None
-        # 上一轮被判定死亡（静默掐断）的 Key+代理组合：本轮不参与竞速。
-        # 直连（proxy=None）也可被排除：被掐线路就是 winner，其 Key 被盗用
-        # 概率低，但组合级排除能同时换掉"Key 或代理"任一嫌疑。
-        if exclude and (key.id, proxy.id if proxy else None) in exclude:
-            # 被排除组合：跳过该 Key，不 claim（组合排除换的是 Key，代理保留
-            # 给后续可用 Key，避免被排除的代理被白白消耗）
-            continue
+        need = route_count - len(routes)
+        candidates: list[ChannelKey] = []
+        scan = ki
+        lookahead = proxy_ptr
+        while len(candidates) < need and scan < len(keys):
+            key = keys[scan]
+            scan += 1
+            proxy = proxies[lookahead] if lookahead < n_proxies else None
+            if exclude and (key.id, proxy.id if proxy else None) in exclude:
+                # 被排除组合：跳过该 Key，不 claim（组合排除换的是 Key，代理保留
+                # 给后续可用 Key，避免被排除的代理被白白消耗）
+                continue
+            candidates.append(key)
+            if proxy is not None:
+                lookahead += 1
+        ki = scan
+        if not candidates:
+            break
         try:
-            claimed_ok = key_service.claim_rpm_slot(key.id)
+            claimed = key_service.claim_rpm_slots(candidates)
         except key_service.RpmClaimUnavailable:
             # 数据库判不出来（锁 / 连接故障）。继续往后试每一把 Key 只会得到
             # 同样的结果，而且会把"DB 不可用"伪装成"整池配额耗尽"。
@@ -114,12 +131,19 @@ def build_routes(channel: Channel | None = None,
                 "build_routes: RPM 领取无法判定（数据库争用），本轮提前结束，"
                 "已构建 %d 条线路（channel=%s）", len(routes), channel.slug)
             break
-        if not claimed_ok:
-            continue
-        if proxy is not None:
-            proxy_ptr += 1
-        routes.append(Route(kind="proxy" if proxy else "direct", key=key,
-                            proxy=proxy, claimed=True,
-                            url_override=endpoint or None))
+        for key in claimed:
+            proxy = proxies[proxy_ptr] if proxy_ptr < n_proxies else None
+            combo = (key.id, proxy.id if proxy else None)
+            if exclude and combo in exclude:
+                # 候选阶段的排除判断基于"假设全部领到"的指针，实际有 Key 落选时
+                # 指针会错位，这里按真实配对再判一次。名额已经领了，必须退回，
+                # 否则拥塞期会按比率虚耗配额。
+                key_service.release_rpm_slot(key.id)
+                continue
+            if proxy is not None:
+                proxy_ptr += 1
+            routes.append(Route(kind="proxy" if proxy else "direct", key=key,
+                                proxy=proxy, claimed=True,
+                                url_override=endpoint or None))
 
     return routes

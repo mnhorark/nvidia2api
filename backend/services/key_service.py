@@ -143,11 +143,25 @@ def bulk_import_keys(text: str, channel: Channel) -> dict:
     return result
 
 
-def available_keys(channel: Channel) -> list[ChannelKey]:
+def available_keys(channel: Channel, limit: int | None = None) -> list[ChannelKey]:
     """Keys eligible for scheduling: enabled status + not in cooldown + under RPM.
 
     渠道处于熔断冷却时直接返回空列表（该渠道不参与线路构建），
     请求会流向其他渠道 / 默认渠道。
+
+    `limit` 非空时只取前 N 条。`build_routes` 最多用 route_count 条，而实测
+    一个渠道有 300+ 把 Key：把整池读进内存再 Python 过滤排序，光 ORM 建行
+    就 5.6 ms，且串行在 asgiref 唯一那条同步视图线程上。过滤与排序下推 SQL、
+    再用 limit 把行数压到个位数才是真解。
+
+    过滤条件与 `_key_under_rpm` / 旧 Python 循环逐条对应：
+    - 排除 DISABLED / INVALID
+    - 排除冷却未到期
+    - 窗口为空或已过期 → 必然可用；否则 minute_request_count < rpm_limit
+    - rpm_limit <= 0 视为不限流（与 claim_rpm_slot 同口径；旧 Python 版靠
+      "不限流的 Key 其窗口恒为 None"间接成立，这里显式写出）
+    排序沿用 `_score`（failure_count 升序、last_used_at 升序）：SQLite 里
+    NULL 在 ASC 下排最前，正好对应 `_score` 给 None 记 0 的语义。
     """
     from services.channel_health import is_open
 
@@ -156,15 +170,27 @@ def available_keys(channel: Channel) -> list[ChannelKey]:
                        channel.slug)
         return []
     now = timezone.now()
-    out = []
-    for k in channel.keys.all():
-        if k.status in (ChannelKeyStatus.DISABLED, ChannelKeyStatus.INVALID):
-            continue
-        if k.cooldown_until and k.cooldown_until > now:
-            continue
-        if _key_under_rpm(k, now):
-            out.append(k)
-    out.sort(key=_score)
+    cutoff = now - timedelta(seconds=MINUTE_SECONDS)
+    qs = (
+        channel.keys
+        .exclude(status__in=(ChannelKeyStatus.DISABLED, ChannelKeyStatus.INVALID))
+        .filter(Q(cooldown_until__isnull=True) | Q(cooldown_until__lte=now))
+        .filter(
+            Q(rpm_limit__lte=0)
+            | Q(minute_window_start__isnull=True)
+            | Q(minute_window_start__lte=cutoff)
+            | Q(minute_request_count__lt=F("rpm_limit"))
+        )
+        .order_by("failure_count", "last_used_at", "id")
+    )
+    if limit is not None:
+        qs = qs[:max(0, int(limit))]
+    out = list(qs)
+    # 把渠道对象挂到每行上：race_engine 的 _client_kwargs / _route_headers 会读
+    # route.key.channel，那是个惰性外键——没有 select_related 时每把 Key 第一次
+    # 访问都要多打一条 SELECT。它们同属一个渠道，直接赋值即可。
+    for k in out:
+        k.channel = channel
     return out
 
 
@@ -191,6 +217,94 @@ class RpmClaimUnavailable(RuntimeError):
     整批 `continue` 后返回空线路 → `no_available_route` → 503，
     而日志里与真实限流长得一模一样，排查时会被引向"配额配置错了"。
     """
+
+
+_OK_STATES = (ChannelKeyStatus.AVAILABLE, ChannelKeyStatus.RATE_LIMITED,
+              ChannelKeyStatus.ERROR)
+
+
+def claim_rpm_slots(keys: list[ChannelKey]) -> list[ChannelKey]:
+    """一次性为一批 Key 领取 RPM 名额，返回实际领到的（保持入参顺序）。
+
+    为什么需要它：`claim_rpm_slot` 每把 Key 要 1 条 SELECT + 1~2 条 UPDATE，
+    `max_routes_per_request=100` 时 `build_routes` 光 claim 就是
+    **124 ms / 300 条 SQL**，而这一切全部串行在 asgiref 唯一那条
+    thread-sensitive 线程上（本项目每个入口都是同步视图）。实测整站吞吐上限
+    因此被压到 ≈9 req/s，与上游快慢完全无关。
+
+    批量化后同样 100 把 Key 只要 4 条语句：
+    1. 省掉 SELECT —— `available_keys()` 已经把判定要用的字段
+       （rpm_limit / minute_window_start / minute_request_count / status /
+       cooldown_until）全读进内存了，逐条再查纯属浪费。
+    2. 「窗口过期重置」与「窗口内递增」各一条批量条件 UPDATE，SQL 里重新校验
+       状态/冷却/窗口/配额，原子性与逐条版完全一致。
+    3. 用 `last_used_at == now` 作为本次领取的标记回读一次，精确知道**哪些**
+       Key 被领到（rowcount 只给数量不给身份）。没被领到的自然落选，
+       宁可少发一条线路也不会给没领到名额的 Key 建线路。
+    4. 顺手把确实撞上限的 Key 标成 rate_limited（原来每把一条装饰性 UPDATE）。
+
+    `rpm_limit <= 0` 视为不限流：直接算领到、不写库（与逐条版一致）。
+    数据库判不出来时抛 `RpmClaimUnavailable`，不伪装成"配额耗尽"。
+    """
+    if not keys:
+        return []
+    now = timezone.now()
+    window_cutoff = now - timedelta(seconds=MINUTE_SECONDS)
+
+    unlimited: list[ChannelKey] = []
+    stale_ids: list[int] = []
+    active_ids: list[int] = []
+    for k in keys:
+        if (k.rpm_limit or 0) <= 0:
+            unlimited.append(k)
+        elif k.minute_window_start is None or k.minute_window_start <= window_cutoff:
+            stale_ids.append(k.id)
+        else:
+            active_ids.append(k.id)
+
+    guarded = ChannelKey.objects.filter(
+        status__in=_OK_STATES,
+    ).filter(Q(cooldown_until__isnull=True) | Q(cooldown_until__lte=now))
+
+    claimed_ids: set[int] = {k.id for k in unlimited}
+    try:
+        with transaction.atomic():
+            if stale_ids:
+                guarded.filter(
+                    pk__in=stale_ids,
+                ).filter(
+                    Q(minute_window_start__isnull=True) |
+                    Q(minute_window_start__lte=window_cutoff),
+                ).update(minute_window_start=now, minute_request_count=1,
+                         last_used_at=now, status=ChannelKeyStatus.AVAILABLE)
+            if active_ids:
+                guarded.filter(
+                    pk__in=active_ids,
+                    minute_window_start__gt=window_cutoff,
+                    minute_request_count__lt=F("rpm_limit"),
+                ).update(minute_request_count=F("minute_request_count") + 1,
+                         last_used_at=now)
+            touched = [k.id for k in keys if k.id not in claimed_ids]
+            if touched:
+                claimed_ids.update(
+                    ChannelKey.objects.filter(
+                        pk__in=touched, last_used_at=now,
+                    ).values_list("id", flat=True))
+            # 撞上限的 Key 标 rate_limited（供控制台展示；下一轮窗口过期后
+            # Case 1 会自动把它恢复成 available，所以这里只是标记）
+            missed = [k.id for k in keys
+                      if k.id in set(active_ids) and k.id not in claimed_ids]
+            if missed:
+                ChannelKey.objects.filter(
+                    pk__in=missed, status=ChannelKeyStatus.AVAILABLE,
+                    minute_request_count__gte=F("rpm_limit"), rpm_limit__gt=0,
+                ).update(status=ChannelKeyStatus.RATE_LIMITED)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("claim_rpm_slots unavailable for %d keys (swallowed->raise): %s",
+                       len(keys), exc)
+        raise RpmClaimUnavailable("claim_rpm_slots unavailable") from exc
+
+    return [k for k in keys if k.id in claimed_ids]
 
 
 def claim_rpm_slot(key_id: int) -> bool:
