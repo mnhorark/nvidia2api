@@ -14,20 +14,46 @@ interface ChatMessage {
   meta?: AdminChatResponse["meta"];
 }
 
-const THINK_RE = /\s*<thinking>([\s\S]*?)<\/thinking>/i;
+// 思考标签有两种常见写法：DeepSeek / Qwen / Kimi 系用 think，NVIDIA 等用
+// thinking（均为尖括号成对标签）。旧正则只认后者，于是前者会带着原始标签直接
+// 渲染进正文（whitespace-pre-wrap，标签字面可见）——而原代码的注释当时就写着
+// "content may still hold think tags"。两种都要剥。
+//
+// 必须用**无 g 标志**的正则：带 g 的 .match() 只返回整串列表、拿不到捕获组，
+// 且 .test() 会推进 lastIndex 变成有状态的。多段思考块由下面的循环逐个剥离，
+// 不靠 g。
+const THINK_PAIR_RE =
+  /\s*<(think|thinking)>([\s\S]*?)<\/\1>/i;
+
+/** 剥掉正文里所有成对思考标签（可能有多段）。 */
+function stripThink(raw: string): string {
+  let out = raw;
+  for (;;) {
+    const next = out.replace(THINK_PAIR_RE, "");
+    if (next === out) break;
+    out = next;
+  }
+  return out.trim();
+}
+
+/** 抽出第一段思考内容（用于没有独立 reasoning 载体时的回落展示）。 */
+function firstThink(raw: string): string | null {
+  const m = raw.match(THINK_PAIR_RE);
+  return m ? m[2].trim() : null;
+}
 
 function splitReasoning(raw: string, explicitReasoning?: string) {
   if (explicitReasoning && explicitReasoning.trim()) {
-    // NVIDIA returns reasoning_content separately; content may still hold <think> tags
-    const content = raw.replace(THINK_RE, "").trim();
-    return { reasoning: explicitReasoning.trim(), content };
+    // reasoning_content 是独立载体，正文里的思考标签只是重复出现，剥掉即可
+    return { reasoning: explicitReasoning.trim(), content: stripThink(raw) };
   }
-  const m = raw.match(THINK_RE);
-  if (m) {
-    return { reasoning: m[1].trim(), content: raw.replace(THINK_RE, "").trim() };
+  const inline = firstThink(raw);
+  if (inline) {
+    return { reasoning: inline, content: stripThink(raw) };
   }
   return { reasoning: "", content: raw };
 }
+
 
 export default function ChatPage() {
   const [models, setModels] = useState<Model[]>([]);
@@ -312,7 +338,12 @@ export default function ChatPage() {
                       : "max-w-[80%] rounded-2xl rounded-bl-md border border-line bg-white/[0.03] px-4 py-2.5 text-[13px] text-gray-200"
                   }
                 >
-                  {m.reasoning && <ReasoningBlock text={m.reasoning} autoOpen={sending} />}
+                  {m.reasoning && (
+                    <ReasoningBlock
+                      text={m.reasoning}
+                      streaming={sending && i === messages.length - 1}
+                    />
+                  )}
                   {m.content
                     ? <p className="whitespace-pre-wrap leading-relaxed">{m.content}</p>
                     : <p className="text-faint">&nbsp;</p>}
@@ -401,13 +432,20 @@ function MetaBlock({ meta }: { meta: NonNullable<ChatMessage["meta"]> }) {
   );
 }
 
-function ReasoningBlock({ text, autoOpen }: { text: string; autoOpen?: boolean }) {
-  const [open, setOpen] = useState(autoOpen ?? false);
+function ReasoningBlock({ text, streaming }: { text: string; streaming?: boolean }) {
+  // 用户手动开合过就以用户为准；否则"正在流式的那条"展开、其余收起。
+  //
+  // 上一版是 `useState(autoOpen ?? false)`：思考块必然在 sending=true 期间挂载，
+  // 初值恒为 true，而 useState 不会因 prop 变化重置——于是"结束后自动收起"
+  // 从未生效，长思考模型（kimi 这类）把对话区永久撑成一屏滚动条，正文被挤到底部。
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
+  const open = userOpen ?? !!streaming;
   return (
     <div className="mb-2 rounded-lg border border-warn/20 bg-warn/[0.05]">
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => setUserOpen(!open)}
+        aria-expanded={open}
         className="flex w-full items-center gap-1.5 px-3 py-2 text-[11px] font-medium text-warn"
       >
         <Brain size={12} />

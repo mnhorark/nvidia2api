@@ -261,7 +261,22 @@ export default function RequestLogsPage() {
                 className="cursor-pointer transition-colors hover:bg-white/[0.025]"
               >
                 <Td className="w-6 text-faint">
-                  {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                  {/* 展开控件必须是真 button：此前整行只有 onClick，
+                      没有 role / tabIndex / onKeyDown，键盘用户完全无法查看
+                      任何一条日志明细——而这是这一页的主功能。
+                      行的 onClick 保留给鼠标用户，这里阻止冒泡避免触发两次。 */}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleExpand(l);
+                    }}
+                    aria-expanded={open}
+                    aria-label={open ? "收起请求明细" : "展开请求明细"}
+                    className="rounded p-0.5 transition-colors hover:bg-white/[0.08] hover:text-gray-200"
+                  >
+                    {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                  </button>
                 </Td>
                 <Td className="font-mono text-xs text-mute">{l.request_id}</Td>
                 <Td className="text-xs text-faint">{fmtTime(l.created_at)}</Td>

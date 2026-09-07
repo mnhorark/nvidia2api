@@ -10,6 +10,7 @@ import {
   Button,
   Checkbox,
   DataTable,
+  ErrorBanner,
   Field,
   fmtTime,
   IconButton,
@@ -21,6 +22,7 @@ import {
   Td,
   Textarea,
   Th,
+  confirmDialog,
 } from "@/components/ui";
 import { toast } from "@/components/toaster";
 
@@ -44,11 +46,20 @@ export default function ChannelKeysPage() {
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState("");
   const [importResult, setImportResult] = useState<ImportResult | null>(null);
+  // 导入在途状态：此前没有，双击就是两次导入
+  const [importing, setImporting] = useState(false);
   const [genCount, setGenCount] = useState(50);
   // 批量导入快捷生成：模式 = 匿名(无 Key) / public(复用同一 Key) / sk(前缀+任意后缀)
   const [genMode, setGenMode] = useState<"anon" | "public" | "sk">("anon");
   const [genKey, setGenKey] = useState("sk-");
   const [editItem, setEditItem] = useState<Partial<ChannelKey> | null>(null);
+  // 新增表单里"用户本次真正输入的 Key"。与 editItem 分开存：
+  // editItem 在编辑态是从列表行带进来的（含后端脱敏后的 api_key），
+  // 若复用它判断"是否要提交 Key"，就得靠 includes("*") 反推后端掩码口径——
+  // 那是把 crypto.mask_secret（后端 docstring 自称"脱敏口径的单一事实来源"）
+  // 在前端复制第二份，口径一改就会把掩码串当新 Key 写库；反方向上，真实值
+  // 含 * 的 Key 会被判成"没改"而静默丢弃。分开存就不存在这个猜测。
+  const [apiKeyDraft, setApiKeyDraft] = useState("");
   const [busyId, setBusyId] = useState<number | null>(null);
   const [saving, submit] = useSubmitGuard();
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -79,7 +90,14 @@ export default function ChannelKeysPage() {
         api.get<{ results: Channel[]; current: string }>("/api/admin/channels"),
       ]);
       setKeys(asList<ChannelKey>(k));
-      setSelected(new Set());
+      // 保留仍然存在的选中项（见 proxies 页同样的说明）：行内测速/编辑都会重拉。
+      setSelected((prev) => {
+        if (prev.size === 0) return prev;
+        const alive = new Set(asList<ChannelKey>(k).map((x) => x.id));
+        const next = new Set<number>();
+        for (const id of prev) if (alive.has(id)) next.add(id);
+        return next;
+      });
       const list = asList<Channel>(ch.results);
       setChannelName(list.find((c) => c.slug === ch.current)?.name ?? "");
     } catch (e) {
@@ -111,7 +129,21 @@ export default function ChannelKeysPage() {
     });
   }
 
+  /** 打开新增/编辑弹窗。两处都必须清空 apiKeyDraft：它是"本次输入的新 Key"，
+   *  残留上一次的值会把旧 Key 提交到新行上。 */
+  function openEdit(item: Partial<ChannelKey>) {
+    setApiKeyDraft("");
+    setEditItem(item);
+  }
+
+  function closeEdit() {
+    setApiKeyDraft("");
+    setEditItem(null);
+  }
+
   async function doImport() {
+    if (importing) return;
+    setImporting(true);
     try {
       const res = await api.post<ImportResult>("/api/admin/keys/import", {
         text: importText,
@@ -120,7 +152,15 @@ export default function ChannelKeysPage() {
       load();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "导入失败");
+    } finally {
+      setImporting(false);
     }
+  }
+
+  function closeImport() {
+    setImportOpen(false);
+    setImportResult(null);
+    setImportText("");
   }
 
   function generateLines() {
@@ -157,17 +197,17 @@ export default function ChannelKeysPage() {
     // 在途防重：双击/连按回车不应重复提交（会创建出重复记录）
     await submit(async () => {
       const body: Record<string, unknown> = { name: editItem.name };
-      // 留空表示不修改；各渠道 Key 的格式不同，不做前缀校验
-      if (editItem.api_key && !editItem.api_key.includes("••")
-          && !editItem.api_key.includes("*")) {
-        body.api_key = editItem.api_key;
-      }
+      // 只提交"本次表单里真正输入过"的 Key（见 apiKeyDraft 的注释）。
+      // 编辑态不渲染 Key 输入框，draft 恒为空 → 不会碰 Key。
+      const typed = apiKeyDraft.trim();
+      if (typed) body.api_key = typed;
       if (editItem.rpm_limit != null) body.rpm_limit = editItem.rpm_limit;
       try {
         const row = editItem.id
           ? await api.patch<ChannelKey>(`/api/admin/keys/${editItem.id}`, body)
           : await api.post<ChannelKey>("/api/admin/keys", body);
         setEditItem(null);
+        setApiKeyDraft("");
         upsertRow(row);
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "保存失败");
@@ -190,7 +230,12 @@ export default function ChannelKeysPage() {
   }
 
   async function remove(k: ChannelKey) {
-    if (!confirm(`确认删除 ${k.name}？`)) return;
+    if (!(await confirmDialog({
+      title: "删除 Key",
+      message: <>确认删除 <b className="text-gray-100">{k.name}</b>？删除后该 Key 立即从调度池移除。</>,
+      confirmText: "删除",
+      danger: true,
+    }))) return;
     try {
       await api.del(`/api/admin/keys/${k.id}`);
       // 204 无响应体，删除结果可本地推导：就地摘除
@@ -230,7 +275,12 @@ export default function ChannelKeysPage() {
 
   async function cleanupInvalid() {
     if (invalidCount === 0) return;
-    if (!confirm(`确认删除 ${invalidCount} 个失效 Key？此操作不可恢复。`)) return;
+    if (!(await confirmDialog({
+      title: "清理失效 Key",
+      message: <>确认删除 <b className="text-gray-100">{invalidCount}</b> 个鉴权失败（401/403）的 Key？此操作不可恢复。</>,
+      confirmText: `清理 ${invalidCount} 个`,
+      danger: true,
+    }))) return;
     setCleaning(true);
     try {
       const res = await api.post<{ deleted?: number }>("/api/admin/keys/cleanup-invalid", {});
@@ -252,16 +302,19 @@ export default function ChannelKeysPage() {
     });
   }
 
+  // 全选/反选/表头基准一律作用于 **filtered**（当前搜索下真正可见的集合）。
+  // 此前按全集 keys 计算：搜出 3 行、点表头全选，实际选中上千条隐藏 Key，
+  // 然后一次批量删除就把它们全删了。models 页一直是正确写法。
   function toggleAll() {
     setSelected((prev) =>
-      prev.size === keys.length ? new Set() : new Set(keys.map((k) => k.id))
+      prev.size === filtered.length ? new Set() : new Set(filtered.map((k) => k.id))
     );
   }
 
   function invertSelection() {
     setSelected((prev) => {
       const next = new Set<number>();
-      for (const k of keys) {
+      for (const k of filtered) {
         if (!prev.has(k.id)) next.add(k.id);
       }
       return next;
@@ -273,7 +326,12 @@ export default function ChannelKeysPage() {
     rpm?: number
   ) {
     if (selected.size === 0) return;
-    if (action === "delete" && !confirm(`确认删除选中的 ${selected.size} 个 Key？`)) return;
+    if (action === "delete" && !(await confirmDialog({
+      title: "批量删除 Key",
+      message: <>确认删除选中的 <b className="text-gray-100">{selected.size}</b> 个 Key？此操作不可恢复。</>,
+      confirmText: `删除 ${selected.size} 个`,
+      danger: true,
+    }))) return;
     setBatchBusy(true);
     try {
       const res = await api.post<{ succeeded?: number; results?: unknown[] }>(
@@ -293,19 +351,25 @@ export default function ChannelKeysPage() {
     }
   }
 
-  function setRpmBatch() {
+  // 批量改 RPM：此前用 window.prompt 收一个数字——原生框与深色主题断裂，
+  // 且任何文本都能输进去，校验只能在 JS 里报错。改成带 number 输入框的弹窗。
+  const [rpmModal, setRpmModal] = useState(false);
+  const [rpmValue, setRpmValue] = useState(40);
+
+  function openRpmModal() {
     if (selected.size === 0) return;
-    const raw = window.prompt(
-      `设置选中的 ${selected.size} 个 Key 的 RPM 限制（0=不限流）`,
-      "40"
-    );
-    if (raw === null) return;
-    const n = Number(raw.trim());
+    setRpmValue(40);
+    setRpmModal(true);
+  }
+
+  async function applyRpmModal() {
+    const n = Math.floor(Number(rpmValue));
     if (!Number.isFinite(n) || n < 0) {
       toast.error("RPM 需要是非负整数");
       return;
     }
-    void batch("set_rpm", Math.floor(n));
+    setRpmModal(false);
+    await batch("set_rpm", n);
   }
 
   return (
@@ -333,18 +397,14 @@ export default function ChannelKeysPage() {
             <Button onClick={load} loading={loading}>
               <RefreshCw size={14} /> 刷新
             </Button>
-            <Button variant="primary" onClick={() => setEditItem({ name: "", rpm_limit: 40 })}>
+            <Button variant="primary" onClick={() => openEdit({ name: "", rpm_limit: 40 })}>
               <Plus size={14} /> 添加 Key
             </Button>
           </>
         }
       />
 
-      {error && (
-        <div className="mb-4 rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-[13px] text-err">
-          {error}
-        </div>
-      )}
+      <ErrorBanner message={error} onRetry={load} />
 
       <div className="relative mb-4 max-w-sm">
         <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-faint" />
@@ -362,7 +422,7 @@ export default function ChannelKeysPage() {
         <Button size="sm" disabled={batchBusy} onClick={() => batch("test")}>
           <FlaskConical size={13} /> 测试
         </Button>
-        <Button size="sm" disabled={batchBusy} onClick={setRpmBatch}>
+        <Button size="sm" disabled={batchBusy} onClick={openRpmModal}>
           <Gauge size={13} /> 改 RPM
         </Button>
         <Button size="sm" variant="danger" disabled={batchBusy} onClick={() => batch("delete")}>
@@ -380,9 +440,9 @@ export default function ChannelKeysPage() {
           <>
             <Th>
               <Checkbox
-                ariaLabel="全选"
-                checked={keys.length > 0 && selected.size === keys.length}
-                indeterminate={selected.size > 0 && selected.size < keys.length}
+                ariaLabel="全选（当前搜索结果）"
+                checked={filtered.length > 0 && selected.size === filtered.length}
+                indeterminate={selected.size > 0 && selected.size < filtered.length}
                 onChange={toggleAll}
               />
             </Th>
@@ -448,7 +508,7 @@ export default function ChannelKeysPage() {
                   <IconButton
                     title="编辑"
                     aria-label="编辑"
-                    onClick={() => setEditItem(k)}
+                    onClick={() => openEdit(k)}
                   >
                     <Pencil size={14} />
                   </IconButton>
@@ -486,11 +546,8 @@ export default function ChannelKeysPage() {
         open={importOpen}
         wide
         title="批量导入渠道 Key"
-        onClose={() => {
-          setImportOpen(false);
-          setImportResult(null);
-          setImportText("");
-        }}
+        dismissable={!importing}
+        onClose={closeImport}
       >
         {importResult ? (
           <div>
@@ -510,7 +567,7 @@ export default function ChannelKeysPage() {
                 </div>
               ))}
             </div>
-            <Button variant="primary" onClick={() => { setImportOpen(false); setImportResult(null); setImportText(""); }}>
+            <Button variant="primary" onClick={closeImport}>
               完成
             </Button>
           </div>
@@ -564,8 +621,8 @@ export default function ChannelKeysPage() {
               onChange={(e) => setImportText(e.target.value)}
             />
             <div className="mt-4 flex justify-end gap-2">
-              <Button onClick={() => setImportOpen(false)}>取消</Button>
-              <Button variant="primary" onClick={doImport} disabled={!importText.trim()}>
+              <Button onClick={closeImport} disabled={importing}>取消</Button>
+              <Button variant="primary" onClick={doImport} loading={importing} disabled={!importText.trim()}>
                 导入
               </Button>
             </div>
@@ -573,11 +630,39 @@ export default function ChannelKeysPage() {
         )}
       </Modal>
 
+      {/* 批量改 RPM */}
+      <Modal
+        open={rpmModal}
+        title={`设置 ${selected.size} 个 Key 的 RPM`}
+        onClose={() => setRpmModal(false)}
+      >
+        <div className="space-y-3.5">
+          <Field label="每分钟请求上限（0 = 不限流）">
+            <Input
+              type="number"
+              min={0}
+              value={rpmValue}
+              onChange={(e) => setRpmValue(Number(e.target.value))}
+            />
+          </Field>
+          <p className="text-xs text-faint">
+            覆盖式写入：选中的 {selected.size} 个 Key 全部改成这个值，包括原本单独设过 RPM 的。
+          </p>
+          <div className="flex justify-end gap-2 pt-1">
+            <Button type="button" onClick={() => setRpmModal(false)}>取消</Button>
+            <Button variant="primary" type="button" onClick={applyRpmModal} disabled={batchBusy}>
+              应用
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
       {/* 新增/编辑 */}
       <Modal
         open={!!editItem}
         title={editItem?.id ? "编辑 Key" : "添加渠道 Key"}
-        onClose={() => setEditItem(null)}
+        dismissable={!saving}
+        onClose={closeEdit}
       >
         <form onSubmit={save} className="space-y-3.5">
           <Field label="名称">
@@ -591,7 +676,8 @@ export default function ChannelKeysPage() {
             <Field label="API Key">
               <Input
                 placeholder="上游 API Key"
-                onChange={(e) => setEditItem((p) => ({ ...p, api_key: e.target.value }))}
+                value={apiKeyDraft}
+                onChange={(e) => setApiKeyDraft(e.target.value)}
                 required
               />
             </Field>
@@ -608,7 +694,7 @@ export default function ChannelKeysPage() {
             <p className="mt-1 text-xs text-faint">0 = 不限流</p>
           </Field>
           <div className="flex justify-end gap-2 pt-2">
-            <Button type="button" onClick={() => setEditItem(null)}>
+            <Button type="button" onClick={closeEdit}>
               取消
             </Button>
             <Button variant="primary" type="submit" loading={saving}>

@@ -10,6 +10,7 @@ import {
   Button,
   Checkbox,
   DataTable,
+  ErrorBanner,
   Field,
   fmtLatency,
   fmtTime,
@@ -22,11 +23,26 @@ import {
   Textarea,
   Th,
   Toggle,
+  confirmDialog,
 } from "@/components/ui";
 import { toast } from "@/components/toaster";
 
 // 大列表渲染窗口：每次“加载更多”展开的行数（一千多代理全量渲染会卡顿）
 const RENDER_WINDOW = 200;
+
+/**
+ * 关键字命中判定。**列表过滤、"匹配 N" 计数、按区间选择必须共用这一个谓词**：
+ * 此前 kwMatched 只比 name/host，而列表过滤额外比 group_name，
+ * 于是按分组名搜索时计数说"匹配 0"、下面却列出十几行。
+ */
+function matchKw(p: Proxy, needle: string): boolean {
+  if (!needle) return true;
+  return (
+    (p.name || "").toLowerCase().includes(needle) ||
+    (p.host || "").toLowerCase().includes(needle) ||
+    (p.group_name || "").toLowerCase().includes(needle)
+  );
+}
 
 export default function ProxiesPage() {
   const [proxies, setProxies] = useState<Proxy[]>([]);
@@ -43,6 +59,9 @@ export default function ProxiesPage() {
   const [error, setError] = useState("");
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState("");
+  // 批量导入此前没有在途状态：双击就是两次导入（第二次全被判重复，
+  // 用户看到"重复 N"会以为自己的粘贴出了问题）。
+  const [importing, setImporting] = useState(false);
   const [editItem, setEditItem] = useState<Partial<Proxy> | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
   const [saving, submit] = useSubmitGuard();
@@ -68,7 +87,15 @@ export default function ProxiesPage() {
       ]);
       const proxyList = asList<Proxy>(p);
       setProxies(proxyList);
-      setSelected(new Set());
+      // 保留仍然存在的选中项。此前无条件清空，于是"批量操作前先测一条看看"
+      // 这种很自然的顺序会把用户刚勾好的选择全部抹掉。
+      setSelected((prev) => {
+        if (prev.size === 0) return prev;
+        const alive = new Set(proxyList.map((x) => x.id));
+        const next = new Set<number>();
+        for (const id of prev) if (alive.has(id)) next.add(id);
+        return next;
+      });
       setEnabledCount(proxyList.filter((x) => x.enabled).length);
       setGroups(asList<ProxyGroup>(g));
       // Key 总数与启用上限都取自本接口 summary：过去这里还额外整拉
@@ -95,17 +122,9 @@ export default function ProxiesPage() {
     setWindowSize(RENDER_WINDOW);
   }, [kw]);
 
-  // 渲染列表的真过滤：名称 / host / 分组名命中即保留；
-  // 注：上面的批量选择 chips 与“匹配 N”统计仍沿用原有的 name/host 语义，不受影响
+  // 关键字过滤：名称 / host / 分组名命中即保留（谓词见 matchKw）
   const needle = kw.trim().toLowerCase();
-  const filtered = !needle
-    ? proxies
-    : proxies.filter(
-        (p) =>
-          (p.name || "").toLowerCase().includes(needle) ||
-          (p.host || "").toLowerCase().includes(needle) ||
-          (p.group_name || "").toLowerCase().includes(needle)
-      );
+  const filtered = proxies.filter((p) => matchKw(p, needle));
   const visible = filtered.slice(0, windowSize);
 
   /** 就地写入/更新一行：PATCH/POST 的响应就是权威整行序列化，
@@ -189,7 +208,16 @@ export default function ProxiesPage() {
   }
 
   async function remove(p: Proxy) {
-    if (!confirm(`确认删除代理 ${p.name}？`)) return;
+    if (!(await confirmDialog({
+      title: "删除代理",
+      message: (
+        <>确认删除 <b className="text-gray-100">{p.name}</b>（{p.protocol}://{p.host}:{p.port}）？
+          {p.enabled && <span className="text-warn"> 该代理当前已启用，删除后线路数会减少。</span>}
+        </>
+      ),
+      confirmText: "删除",
+      danger: true,
+    }))) return;
     try {
       await api.del(`/api/admin/proxies/${p.id}`);
       // 204 无响应体，但删除结果完全可本地推导：就地摘除，省一次全表重拉
@@ -214,16 +242,19 @@ export default function ProxiesPage() {
     });
   }
 
+  // 全选/反选/表头基准一律作用于 **filtered**（当前关键字下真正可见的集合），
+  // 与 models 页保持一致。此前这里按全集 proxies 计算：筛出 3 行、点表头全选，
+  // 实际选中上千条隐藏代理。
   function toggleAll() {
     setSelected((prev) =>
-      prev.size === proxies.length ? new Set() : new Set(proxies.map((p) => p.id))
+      prev.size === filtered.length ? new Set() : new Set(filtered.map((p) => p.id))
     );
   }
 
   function invertSelection() {
     setSelected((prev) => {
       const next = new Set<number>();
-      for (const p of proxies) {
+      for (const p of filtered) {
         if (!prev.has(p.id)) next.add(p.id);
       }
       return next;
@@ -232,7 +263,12 @@ export default function ProxiesPage() {
 
   async function batch(action: "enable" | "disable" | "delete" | "test") {
     if (selected.size === 0) return;
-    if (action === "delete" && !confirm(`确认删除选中的 ${selected.size} 个代理？`)) return;
+    if (action === "delete" && !(await confirmDialog({
+      title: "批量删除代理",
+      message: <>确认删除选中的 <b className="text-gray-100">{selected.size}</b> 个代理？此操作不可恢复。</>,
+      confirmText: `删除 ${selected.size} 个`,
+      danger: true,
+    }))) return;
     setBatchBusy(true);
     try {
       const res = await api.post<{
@@ -277,13 +313,7 @@ export default function ProxiesPage() {
 
   /** 按关键字匹配 + 指定前后区间，一键加入选中 */
   function selectByRange(rangeKey: string) {
-    const needle = kw.trim().toLowerCase();
-    const matched = proxies.filter(
-      (p) =>
-        !needle ||
-        (p.name || "").toLowerCase().includes(needle) ||
-        (p.host || "").toLowerCase().includes(needle)
-    );
+    const matched = proxies.filter((p) => matchKw(p, needle));
     let picked: typeof proxies = [];
     switch (rangeKey) {
       case "all":
@@ -327,15 +357,11 @@ export default function ProxiesPage() {
     ["back100_150", "后100-150"],
   ];
 
-  const kwMatched = kw.trim()
-    ? proxies.filter(
-        (p) =>
-          (p.name || "").toLowerCase().includes(kw.trim().toLowerCase()) ||
-          (p.host || "").toLowerCase().includes(kw.trim().toLowerCase())
-      ).length
-    : proxies.length;
+  const kwMatched = filtered.length;
 
   async function doImport() {
+    if (importing) return;
+    setImporting(true);
     try {
       const res = await api.post<Record<string, number>>("/api/admin/proxies/import", {
         text: importText,
@@ -346,6 +372,8 @@ export default function ProxiesPage() {
       load();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "导入失败");
+    } finally {
+      setImporting(false);
     }
   }
 
@@ -439,11 +467,7 @@ export default function ProxiesPage() {
         </div>
       </div>
 
-      {error && (
-        <div className="mb-4 rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-[13px] text-err">
-          {error}
-        </div>
-      )}
+      <ErrorBanner message={error} onRetry={load} />
 
       {/* 快速选择 / 筛选 */}
       <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-line bg-panel px-3 py-2.5">
@@ -510,9 +534,9 @@ export default function ProxiesPage() {
           <>
             <Th>
               <Checkbox
-                ariaLabel="全选"
-                checked={proxies.length > 0 && selected.size === proxies.length}
-                indeterminate={selected.size > 0 && selected.size < proxies.length}
+                ariaLabel="全选（当前筛选结果）"
+                checked={filtered.length > 0 && selected.size === filtered.length}
+                indeterminate={selected.size > 0 && selected.size < filtered.length}
                 onChange={toggleAll}
               />
             </Th>
@@ -630,7 +654,7 @@ export default function ProxiesPage() {
         </div>
       )}
 
-      <Modal open={importOpen} wide title="批量导入代理" onClose={() => setImportOpen(false)}>
+      <Modal open={importOpen} wide title="批量导入代理" dismissable={!importing} onClose={() => setImportOpen(false)}>
         <p className="mb-3 text-xs leading-relaxed text-mute">
           每行一条：名称---协议://[user:pass@]host:port，或直接写代理地址
         </p>
@@ -641,8 +665,8 @@ export default function ProxiesPage() {
           onChange={(e) => setImportText(e.target.value)}
         />
         <div className="mt-4 flex justify-end gap-2">
-          <Button onClick={() => setImportOpen(false)}>取消</Button>
-          <Button variant="primary" onClick={doImport} disabled={!importText.trim()}>
+          <Button onClick={() => setImportOpen(false)} disabled={importing}>取消</Button>
+          <Button variant="primary" onClick={doImport} loading={importing} disabled={!importText.trim()}>
             导入
           </Button>
         </div>
@@ -651,6 +675,7 @@ export default function ProxiesPage() {
       <Modal
         open={!!editItem}
         title={editItem?.id ? "编辑代理" : "添加代理"}
+        dismissable={!saving}
         onClose={() => setEditItem(null)}
       >
         <form onSubmit={save} className="space-y-3.5">

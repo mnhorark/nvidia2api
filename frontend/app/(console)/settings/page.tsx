@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Eraser, RefreshCw, RotateCcw, Save } from "lucide-react";
 import { api, RuntimeParam } from "@/lib/api";
-import { Button, Card, Input, PageHeader, Select } from "@/components/ui";
+import { Button, Card, ErrorBanner, Input, PageHeader, Select, confirmDialog } from "@/components/ui";
 import { toast } from "@/components/toaster";
 
 // 隐藏不需要在控制台调整的参数；后端仍可通过 API / env 修改，
@@ -98,8 +98,20 @@ export default function SettingsPage() {
   async function cleanLogs() {
     const retention = params.find((p) => p.key === "log_retention_days");
     const days = Number(draft["log_retention_days"] ?? retention?.value ?? 30);
-    const label = days > 0 ? `当前渠道早于 ${days} 天的` : "过期的";
-    if (!confirm(`确认删除${label}请求日志？该操作不可恢复。`)) return;
+    if (!(days > 0)) {
+      toast.info("保留天数为 0 表示永不清理，请先设置一个大于 0 的天数");
+      return;
+    }
+    if (!(await confirmDialog({
+      title: "清理请求日志",
+      message: (
+        <>确认删除当前渠道 <b className="text-gray-100">早于 {days} 天</b> 的请求日志？
+          <span className="text-err">该操作不可恢复</span>，历史用量统计会随之减少。</>
+      ),
+      confirmText: `清理 ${days} 天前`,
+      danger: true,
+      requireText: String(days),
+    }))) return;
     setCleaning(true);
     try {
       const res = await api.post<{ deleted: number; retention_days: number }>(
@@ -157,11 +169,7 @@ export default function SettingsPage() {
         }
       />
 
-      {error && (
-        <div className="mb-4 rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-[13px] text-err">
-          {error}
-        </div>
-      )}
+      <ErrorBanner message={error} onRetry={load} />
 
       <Card className="p-0">
         {params.length === 0 && !loading ? (

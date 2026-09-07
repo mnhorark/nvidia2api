@@ -10,6 +10,7 @@ import {
   Button,
   Checkbox,
   DataTable,
+  ErrorBanner,
   Field,
   fmtTime,
   IconButton,
@@ -20,6 +21,7 @@ import {
   Td,
   Th,
   Toggle,
+  confirmDialog,
 } from "@/components/ui";
 import { toast } from "@/components/toaster";
 
@@ -76,6 +78,19 @@ export default function ModelsPage() {
     setWindowSize(RENDER_WINDOW);
   }, [q]);
 
+  /** 就地写入/更新一行：PATCH/POST 的响应就是权威整行序列化
+   *  （ModelSerializer / ChannelSerializer 都返回整行）。
+   *  单行开关一次就重拉上千行模型列表，是这一页最浪费的地方。 */
+  function upsertRow(row: Model) {
+    setModels((prev) => {
+      const idx = prev.findIndex((x) => x.id === row.id);
+      if (idx < 0) return [...prev, row];
+      const next = prev.slice();
+      next[idx] = row;
+      return next;
+    });
+  }
+
   const filtered = models.filter(
     (m) =>
       !q ||
@@ -113,8 +128,8 @@ export default function ModelsPage() {
   async function setEnabled(m: Model, enabled: boolean) {
     setBusyId(m.id);
     try {
-      await api.patch(`/api/admin/models/${m.id}`, { enabled });
-      await load();
+      const row = await api.patch<Model>(`/api/admin/models/${m.id}`, { enabled });
+      upsertRow(row);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "操作失败");
     } finally {
@@ -123,10 +138,21 @@ export default function ModelsPage() {
   }
 
   async function remove(m: Model) {
-    if (!confirm(`确认删除模型 ${m.model_name}？`)) return;
+    if (!(await confirmDialog({
+      title: "删除模型",
+      message: <>确认删除 <b className="text-gray-100 font-mono">{m.model_name}</b>？删除后该模型不再可被调用。</>,
+      confirmText: "删除",
+      danger: true,
+    }))) return;
     try {
       await api.del(`/api/admin/models/${m.id}`);
-      load();
+      // 204 无响应体，删除结果可本地推导
+      setModels((prev) => prev.filter((x) => x.id !== m.id));
+      setSelected((prev) => {
+        const next = new Set(prev);
+        next.delete(m.id);
+        return next;
+      });
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "删除失败");
     }
@@ -169,7 +195,12 @@ export default function ModelsPage() {
 
   async function batch(action: "enable" | "disable" | "delete") {
     if (selected.size === 0) return;
-    if (action === "delete" && !confirm(`确认删除选中的 ${selected.size} 个模型？`)) return;
+    if (action === "delete" && !(await confirmDialog({
+      title: "批量删除模型",
+      message: <>确认删除选中的 <b className="text-gray-100">{selected.size}</b> 个模型？此操作不可恢复。</>,
+      confirmText: `删除 ${selected.size} 个`,
+      danger: true,
+    }))) return;
     setBatchBusy(true);
     try {
       await api.post("/api/admin/models/batch", { ids: [...selected], action });
@@ -198,10 +229,11 @@ export default function ModelsPage() {
           proxy_group: edit.proxy_group ?? null,
           endpoint: edit.endpoint ?? "",
         };
-        if (edit.id) await api.patch(`/api/admin/models/${edit.id}`, body);
-        else await api.post("/api/admin/models", body);
+        let row: Model;
+        if (edit.id) row = await api.patch<Model>(`/api/admin/models/${edit.id}`, body);
+        else row = await api.post<Model>("/api/admin/models", body);
         setEdit(null);
-        load();
+        upsertRow(row);
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "保存失败");
       }
@@ -244,11 +276,7 @@ export default function ModelsPage() {
         />
       </div>
 
-      {error && (
-        <div className="mb-4 rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-[13px] text-err">
-          {error}
-        </div>
-      )}
+      <ErrorBanner message={error} onRetry={load} />
 
       <BatchBar count={selected.size}>
         <Button size="sm" disabled={batchBusy} onClick={() => batch("enable")}>启用</Button>
@@ -268,7 +296,7 @@ export default function ModelsPage() {
           <>
             <Th>
               <Checkbox
-                ariaLabel="全选"
+                ariaLabel="全选（当前搜索结果）"
                 checked={filtered.length > 0 && selected.size === filtered.length}
                 indeterminate={selected.size > 0 && selected.size < filtered.length}
                 onChange={toggleAll}
@@ -360,6 +388,7 @@ export default function ModelsPage() {
                   <Pencil size={14} />
                 </IconButton>
                 <IconButton
+                  title="删除"
                   aria-label="删除"
                   danger
                   onClick={() => remove(m)}
@@ -386,7 +415,7 @@ export default function ModelsPage() {
         </div>
       )}
 
-      <Modal open={!!edit} title={edit?.id ? "编辑模型" : "添加模型"} onClose={() => setEdit(null)}>
+      <Modal open={!!edit} title={edit?.id ? "编辑模型" : "添加模型"} dismissable={!saving} onClose={() => setEdit(null)}>
         <form onSubmit={save} className="space-y-3.5">
           <Field label="模型名称">
             <Input

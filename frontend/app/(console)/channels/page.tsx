@@ -14,13 +14,14 @@ import {
   Star,
   Trash2,
 } from "lucide-react";
-import { Channel, api, asList, setChannel } from "@/lib/api";
+import { Channel, api, asList, getChannel, setChannel } from "@/lib/api";
 import { useSubmitGuard } from "@/lib/use-submit-guard";
 import {
   Button,
   Card,
   Checkbox,
   DataTable,
+  ErrorBanner,
   Field,
   fmtTime,
   IconButton,
@@ -32,6 +33,7 @@ import {
   Textarea,
   Th,
   Toggle,
+  confirmDialog,
 } from "@/components/ui";
 import { toast } from "@/components/toaster";
 
@@ -97,8 +99,10 @@ function ChannelsInner() {
       );
       setChannels(asList<Channel>(data.results));
       setCurrent(data.current ?? "");
+      return data;
     } catch (e) {
       setError(e instanceof Error ? e.message : "加载失败");
+      return null;
     } finally {
       setLoading(false);
     }
@@ -142,11 +146,15 @@ function ChannelsInner() {
       notes: edit.notes ?? "",
     };
       try {
-        if (edit.id) await api.patch(`/api/admin/channels/${edit.id}`, body);
-        else await api.post("/api/admin/channels", body);
+        const row = edit.id
+          ? await api.patch<Channel>(`/api/admin/channels/${edit.id}`, body)
+          : await api.post<Channel>("/api/admin/channels", body);
         setEdit(null);
         setApplyRpmToKeys(false);
-        await load();
+        // 设默认会连带改掉其它渠道的 is_default，响应里只有被改那一行 → 必须重拉；
+        // 其余情况就地合并即可。
+        if (body.is_default) await load();
+        else upsertRow(row);
         // 通知 layout 重拉渠道列表，侧边栏名称等信息保持同步（不带 slug，不切换全局渠道）
         window.dispatchEvent(new CustomEvent("nvidia2api:channel-change"));
         toast.success("渠道已保存");
@@ -156,7 +164,20 @@ function ChannelsInner() {
     });
   }
 
-  async function switchTo(c: Channel) {
+  /** 就地更新一行：PATCH 的响应就是权威整行序列化（含各计数）。
+   *  makeDefault 例外——设默认会把其它渠道的 is_default 一起改掉，
+   *  响应里只有被改的那一行，必须重拉全表。 */
+  function upsertRow(row: Channel) {
+    setChannels((prev) => {
+      const idx = prev.findIndex((x) => x.id === row.id);
+      if (idx < 0) return [...prev, row];
+      const next = prev.slice();
+      next[idx] = row;
+      return next;
+    });
+  }
+
+  function switchTo(c: Channel) {
     if (c.slug === current) return;
     setChannel(c.slug); // setChannel 内部已派发 channel-change，layout 据此重挂载
     setCurrent(c.slug);
@@ -176,8 +197,8 @@ function ChannelsInner() {
   async function toggleEnabled(c: Channel, enabled: boolean) {
     setBusyId(c.id);
     try {
-      await api.patch(`/api/admin/channels/${c.id}`, { enabled });
-      await load();
+      const row = await api.patch<Channel>(`/api/admin/channels/${c.id}`, { enabled });
+      upsertRow(row);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "操作失败");
     } finally {
@@ -217,10 +238,39 @@ function ChannelsInner() {
   }
 
   async function remove(c: Channel) {
-    if (!confirm(`确认删除渠道「${c.name}」？其下的 Key、代理、模型与日志会一并删除。`)) return;
+    // 全平台破坏性最强的操作：级联删掉该渠道下的 Key / 代理 / 模型 / 日志。
+    // 此前用的是一个原生 OK/Cancel 框——点错一下就没了，所以要求输入渠道名确认。
+    if (!(await confirmDialog({
+      title: "删除渠道",
+      message: (
+        <>
+          删除 <b className="text-gray-100">{c.name}</b>（<code className="text-mute">{c.slug}</code>）
+          会一并删除其下所有内容，<span className="text-err">不可恢复</span>：
+          <ul className="mt-2 space-y-0.5 text-mute">
+            <li>· {c.key_count} 个 Key（启用 {c.enabled_key_count}）</li>
+            <li>· {c.proxy_count} 个代理（启用 {c.enabled_proxy_count}）</li>
+            <li>· {c.model_count} 个模型（启用 {c.enabled_model_count}）</li>
+            <li>· 该渠道的全部请求日志与用量统计</li>
+          </ul>
+        </>
+      ),
+      confirmText: "删除渠道",
+      cancelText: "取消",
+      danger: true,
+      requireText: c.name,
+    }))) return;
     try {
       await api.del(`/api/admin/channels/${c.id}`);
-      await load();
+      const data = await load();
+      // 删除的正是当前作用域渠道时，必须显式把全局 slug 切走。
+      // 后端对未知 X-Channel 是**静默回落默认渠道**（channel_service.resolve），
+      // 不切就会让控制台顶着已删渠道的名字、把后续所有增删改查打到另一个渠道上——
+      // 对管理台而言"静默改错作用域"比直接报错危险得多。
+      if (getChannel() === c.slug) {
+        const list = data ? asList<Channel>(data.results) : [];
+        setChannel(data?.current || list[0]?.slug || "");
+      }
+      toast.success(`渠道「${c.name}」已删除`);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "删除失败");
     }
@@ -243,11 +293,7 @@ function ChannelsInner() {
         }
       />
 
-      {error && (
-        <div className="mb-4 rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-[13px] text-err">
-          {error}
-        </div>
-      )}
+      <ErrorBanner message={error} onRetry={load} />
 
       <DataTable
         loading={loading}
@@ -406,6 +452,7 @@ function ChannelsInner() {
         open={!!edit}
         wide
         title={edit?.id ? `编辑渠道 · ${edit.name}` : "新增渠道"}
+        dismissable={!saving}
         onClose={() => setEdit(null)}
       >
         <form onSubmit={save} className="space-y-3.5">

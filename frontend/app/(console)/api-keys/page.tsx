@@ -1,13 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Check, Copy, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Check, Copy, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api, asList, UserApiKey } from "@/lib/api";
 import { useSubmitGuard } from "@/lib/use-submit-guard";
 import {
   Badge,
   Button,
   DataTable,
+  ErrorBanner,
   Field,
   fmtTime,
   IconButton,
@@ -17,6 +18,8 @@ import {
   Td,
   Th,
   Toggle,
+  cx,
+  confirmDialog,
 } from "@/components/ui";
 import { toast } from "@/components/toaster";
 
@@ -31,7 +34,12 @@ export default function ApiKeysPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [create, setCreate] = useState<{ name: string; rate_limit: number; quota: number } | null>(null);
-  const [quotaEdit, setQuotaEdit] = useState<UserApiKey | null>(null);
+  // 事后编辑（名称 / 限流 / 额度）。此前只有 quotaEdit，且入口挂在
+  // `k.quota > 0` 分支里 —— 结果是"额度设了就再也改不回不限、
+  // 创建时留 0 就再也加不上额度"，rate_limit 更是只有创建时能设。
+  // 后端 PATCH 早就支持 name/rate_limit/quota/enabled 并返回整行序列化，
+  // 缺的只是前端入口。
+  const [editKey, setEditKey] = useState<UserApiKey | null>(null);
   const [createdKey, setCreatedKey] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [busyId, setBusyId] = useState<number | null>(null);
@@ -52,6 +60,17 @@ export default function ApiKeysPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  /** PATCH 的响应就是权威整行，单行改动不必重拉全表。 */
+  function upsertRow(row: UserApiKey) {
+    setKeys((prev) => {
+      const idx = prev.findIndex((x) => x.id === row.id);
+      if (idx < 0) return [...prev, row];
+      const next = prev.slice();
+      next[idx] = row;
+      return next;
+    });
+  }
 
   async function doCreate(e: React.FormEvent) {
     e.preventDefault();
@@ -74,8 +93,8 @@ export default function ApiKeysPage() {
   async function setEnabled(k: UserApiKey, enabled: boolean) {
     setBusyId(k.id);
     try {
-      await api.patch(`/api/admin/api-keys/${k.id}`, { enabled });
-      await load();
+      const row = await api.patch<UserApiKey>(`/api/admin/api-keys/${k.id}`, { enabled });
+      upsertRow(row);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "操作失败");
     } finally {
@@ -84,24 +103,38 @@ export default function ApiKeysPage() {
   }
 
   async function remove(k: UserApiKey) {
-    if (!confirm(`确认删除 API Key「${k.name}」？该 Key 将立即失效。`)) return;
+    if (!(await confirmDialog({
+      title: "删除 API Key",
+      message: (
+        <>确认删除 <b className="text-gray-100">{k.name}</b>（{k.key_prefix}…）？
+          <span className="text-err">该 Key 将立即失效</span>，用它调用的客户端会全部收到 401。</>
+      ),
+      confirmText: "删除",
+      danger: true,
+    }))) return;
     try {
       await api.del(`/api/admin/api-keys/${k.id}`);
-      load();
+      // 204 无响应体，删除结果可本地推导
+      setKeys((prev) => prev.filter((x) => x.id !== k.id));
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "删除失败");
     }
   }
 
-  async function saveQuota(k: UserApiKey) {
-    if (!quotaEdit) return;
+  async function saveEdit() {
+    if (!editKey) return;
     await submit(async () => {
       try {
-        await api.patch(`/api/admin/api-keys/${k.id}`, { quota: quotaEdit.quota });
-        setQuotaEdit(null);
-        load();
+        const row = await api.patch<UserApiKey>(`/api/admin/api-keys/${editKey.id}`, {
+          name: editKey.name,
+          rate_limit: editKey.rate_limit,
+          quota: editKey.quota,
+        });
+        setEditKey(null);
+        upsertRow(row);
+        toast.success("已更新");
       } catch (e) {
-        toast.error(e instanceof Error ? e.message : "修改额度失败");
+        toast.error(e instanceof Error ? e.message : "保存失败");
       }
     });
   }
@@ -157,11 +190,7 @@ export default function ApiKeysPage() {
         }
       />
 
-      {error && (
-        <div className="mb-4 rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-[13px] text-err">
-          {error}
-        </div>
-      )}
+      <ErrorBanner message={error} onRetry={load} />
 
       <DataTable
         loading={loading}
@@ -191,22 +220,29 @@ export default function ApiKeysPage() {
               <Badge status={k.enabled ? "enabled" : "disabled"} />
             </Td>
             <Td className="tabular-nums text-mute">
-              {k.rate_limit > 0 ? `${k.rate_limit}/分钟` : "不限"}
+              <span
+                className="cursor-pointer underline decoration-line decoration-dotted underline-offset-2 hover:text-gray-200"
+                title="点击修改名称 / 限流 / 额度"
+                onClick={() => setEditKey(k)}
+              >
+                {k.rate_limit > 0 ? `${k.rate_limit}/分钟` : "不限"}
+              </span>
             </Td>
             <Td className="tabular-nums">
-              {k.quota > 0 ? (
-                <span
-                  className={`cursor-pointer font-mono text-xs ${
-                    k.used_quota >= k.quota ? "text-err" : "text-mute"
-                  }`}
-                  title="点击调整 Token 额度"
-                  onClick={() => setQuotaEdit(k)}
-                >
-                  {fmtQuota(k.used_quota)} / {fmtQuota(k.quota)}
-                </span>
-              ) : (
-                <span className="text-faint">不限</span>
-              )}
+              {/* 整格可点，不再挂在 quota>0 分支上：否则"已设额度改回不限"
+                  和"创建时留 0 后来想加额度"两条路都不存在。 */}
+              <span
+                className={cx(
+                  "cursor-pointer underline decoration-line decoration-dotted underline-offset-2 hover:text-gray-200",
+                  k.quota > 0 && k.used_quota >= k.quota ? "text-err" : "text-mute"
+                )}
+                title="点击修改名称 / 限流 / 额度"
+                onClick={() => setEditKey(k)}
+              >
+                {k.quota > 0
+                  ? `${fmtQuota(k.used_quota)} / ${fmtQuota(k.quota)}`
+                  : "不限"}
+              </span>
             </Td>
             <Td className="tabular-nums">{k.total_requests}</Td>
             <Td className="tabular-nums">
@@ -223,19 +259,29 @@ export default function ApiKeysPage() {
               />
             </Td>
             <Td>
-              <IconButton
-                aria-label="删除"
-                danger
-                onClick={() => remove(k)}
-              >
-                <Trash2 size={14} />
-              </IconButton>
+              <div className="flex items-center gap-0.5">
+                <IconButton
+                  title="编辑"
+                  aria-label="编辑"
+                  onClick={() => setEditKey(k)}
+                >
+                  <Pencil size={14} />
+                </IconButton>
+                <IconButton
+                  title="删除"
+                  aria-label="删除"
+                  danger
+                  onClick={() => remove(k)}
+                >
+                  <Trash2 size={14} />
+                </IconButton>
+              </div>
             </Td>
           </tr>
         ))}
       </DataTable>
 
-      <Modal open={!!create} title="创建 API Key" onClose={() => setCreate(null)}>
+      <Modal open={!!create} title="创建 API Key" dismissable={!saving} onClose={() => setCreate(null)}>
         <form onSubmit={doCreate} className="space-y-3.5">
           <Field label="名称">
             <Input
@@ -275,7 +321,14 @@ export default function ApiKeysPage() {
         </form>
       </Modal>
 
-      <Modal open={!!createdKey} title="API Key 创建成功" onClose={() => setCreatedKey(null)}>
+      {/* 一次性密钥：禁止 Esc / 点遮罩 / X 关闭。误按一下就永久丢失这把 Key，
+          只能删掉重建；唯一出口是下面的"我已保存"。 */}
+      <Modal
+        open={!!createdKey}
+        title="API Key 创建成功"
+        dismissable={false}
+        onClose={() => setCreatedKey(null)}
+      >
         <p className="mb-3 flex items-start gap-2 rounded-lg border border-warn/25 bg-warn/[0.08] px-3 py-2.5 text-xs text-warn">
           完整 Key 只会显示这一次，请立即复制保存。
         </p>
@@ -297,31 +350,47 @@ export default function ApiKeysPage() {
       </Modal>
 
       <Modal
-        open={!!quotaEdit}
-        title={`调整 Token 额度 · ${quotaEdit?.name ?? ""}`}
-        onClose={() => setQuotaEdit(null)}
+        open={!!editKey}
+        title={`编辑 API Key · ${editKey?.name ?? ""}`}
+        dismissable={!saving}
+        onClose={() => setEditKey(null)}
       >
-        {quotaEdit && (
+        {editKey && (
           <div className="space-y-3.5">
-            <p className="text-xs text-mute">
-              当前已用 {fmtQuota(quotaEdit.used_quota)} / {fmtQuota(quotaEdit.quota)} tokens。
-              设置新额度后，已用量会保留；0 表示不限额度。
-            </p>
-            <Field label="总 Token 额度">
+            <Field label="名称">
+              <Input
+                value={editKey.name}
+                onChange={(e) => setEditKey({ ...editKey, name: e.target.value })}
+              />
+            </Field>
+            <Field label="每分钟限流（0 表示不限）">
               <Input
                 type="number"
                 min={0}
-                value={quotaEdit.quota}
+                value={editKey.rate_limit}
                 onChange={(e) =>
-                  setQuotaEdit({ ...quotaEdit, quota: Number(e.target.value) })
+                  setEditKey({ ...editKey, rate_limit: Number(e.target.value) })
                 }
               />
             </Field>
+            <Field label="总 Token 额度（0 表示不限）">
+              <Input
+                type="number"
+                min={0}
+                value={editKey.quota}
+                onChange={(e) =>
+                  setEditKey({ ...editKey, quota: Number(e.target.value) })
+                }
+              />
+            </Field>
+            <p className="text-xs text-faint">
+              当前已用 {fmtQuota(editKey.used_quota)} tokens；改额度只动上限，已用量保留。
+            </p>
             <div className="flex justify-end gap-2 pt-2">
-              <Button type="button" onClick={() => setQuotaEdit(null)}>
+              <Button type="button" onClick={() => setEditKey(null)}>
                 取消
               </Button>
-              <Button variant="primary" onClick={() => saveQuota(quotaEdit)} loading={saving}>
+              <Button variant="primary" onClick={saveEdit} loading={saving}>
                 保存
               </Button>
             </div>

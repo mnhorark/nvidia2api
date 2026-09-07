@@ -3,10 +3,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api, asList, ProxyGroup } from "@/lib/api";
+import { useSubmitGuard } from "@/lib/use-submit-guard";
 import {
   Badge,
   Button,
   DataTable,
+  ErrorBanner,
   Field,
   fmtTime,
   IconButton,
@@ -15,6 +17,7 @@ import {
   PageHeader,
   Td,
   Th,
+  confirmDialog,
 } from "@/components/ui";
 import { toast } from "@/components/toaster";
 
@@ -23,6 +26,9 @@ export default function ProxyGroupsPage() {
   const [loading, setLoading] = useState(false);
   const [edit, setEdit] = useState<Partial<ProxyGroup> | null>(null);
   const [error, setError] = useState("");
+  // 本页此前是唯一没上提交防重的表单：双击或连按回车会 POST 两次，
+  // 建出两个同名分组（分组名无唯一约束兜底）。
+  const [saving, submit] = useSubmitGuard();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -43,23 +49,33 @@ export default function ProxyGroupsPage() {
   async function save(e: React.FormEvent) {
     e.preventDefault();
     if (!edit) return;
-    try {
-      const body = {
-        name: edit.name,
-        description: edit.description ?? "",
-        country: edit.country ?? "",
-      };
-      if (edit.id) await api.patch(`/api/admin/proxy-groups/${edit.id}`, body);
-      else await api.post("/api/admin/proxy-groups", body);
-      setEdit(null);
-      load();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "保存失败");
-    }
+    await submit(async () => {
+      try {
+        const body = {
+          name: edit.name,
+          description: edit.description ?? "",
+          country: edit.country ?? "",
+        };
+        if (edit.id) await api.patch(`/api/admin/proxy-groups/${edit.id}`, body);
+        else await api.post("/api/admin/proxy-groups", body);
+        setEdit(null);
+        load();
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "保存失败");
+      }
+    });
   }
 
   async function remove(g: ProxyGroup) {
-    if (!confirm(`确认删除分组 ${g.name}？分组内代理将变为未分组。`)) return;
+    if (!(await confirmDialog({
+      title: "删除分组",
+      message: (
+        <>确认删除分组 <b className="text-gray-100">{g.name}</b>？
+          分组内的 {(g.proxy_count ?? 0) > 0 ? <b className="text-gray-100">{g.proxy_count}</b> : null} 个代理不会被删除，但会变为未分组。</>
+      ),
+      confirmText: "删除",
+      danger: true,
+    }))) return;
     try {
       await api.del(`/api/admin/proxy-groups/${g.id}`);
       load();
@@ -85,11 +101,7 @@ export default function ProxyGroupsPage() {
         }
       />
 
-      {error && (
-        <div className="mb-4 rounded-lg border border-err/25 bg-err/10 px-3 py-2 text-[13px] text-err">
-          {error}
-        </div>
-      )}
+      <ErrorBanner message={error} onRetry={load} />
 
       <DataTable
         loading={loading}
@@ -126,6 +138,7 @@ export default function ProxyGroupsPage() {
                   <Pencil size={14} />
                 </IconButton>
                 <IconButton
+                  title="删除"
                   aria-label="删除"
                   danger
                   onClick={() => remove(g)}
@@ -141,6 +154,7 @@ export default function ProxyGroupsPage() {
       <Modal
         open={!!edit}
         title={edit?.id ? "编辑分组" : "新建分组"}
+        dismissable={!saving}
         onClose={() => setEdit(null)}
       >
         <form onSubmit={save} className="space-y-3.5">
@@ -167,7 +181,7 @@ export default function ProxyGroupsPage() {
             <Button type="button" onClick={() => setEdit(null)}>
               取消
             </Button>
-            <Button variant="primary" type="submit">
+            <Button variant="primary" type="submit" loading={saving}>
               保存
             </Button>
           </div>
