@@ -52,17 +52,28 @@ export default function RequestLogsPage() {
   // 已展开窗口大小（加载更多后会 > PAGE_SIZE），供自动刷新保持窗口不塌回首屏
   const logsLenRef = useRef(PAGE_SIZE);
 
-  const load = useCallback(async () => {
+  /**
+   * @param silent 自动刷新走这条：不置 loading、不闪骨架行，并且只拉最新一页增量合并。
+   *
+   * 两处修的是同一个体验问题——开着自动刷新时：
+   * 1. 原来每次都 setLoading(true)，DataTable 就把整张表换成 6 行骨架，
+   *    等于每 5 秒把列表"清空一次再长回来"，看着像坏了；
+   * 2. 原来为了保住用户"加载更多"展开的窗口，按同等大小重拉（1000 行 ×
+   *    每 5 秒），既压后端也压前端渲染。
+   * 改成"拉最新一页 + 新行接到前面 + 保留其余已加载行"，窗口大小不变、
+   * 负载恒定为一页。
+   */
+  const load = useCallback(async (silent = false) => {
     if (inflightRef.current) return;
     inflightRef.current = true;
-    setLoading(true);
-    setLoadingMore(false);
+    // 整窗重拉要让「加载更多」按钮复位；静默增量不该打断正在进行的追加
+    if (!silent) setLoadingMore(false);
+    const incremental = silent && logsLenRef.current > PAGE_SIZE;
+    if (!silent) setLoading(true);
     setError("");
     const seq = ++seqRef.current;
     try {
-      // 自动刷新时保留用户已展开的窗口：若已加载更多（logs.length > PAGE_SIZE），
-      // 用同等大小的窗口重拉，否则轮询会把列表拍回首屏、滚动位置丢失。
-      const windowSize = Math.max(PAGE_SIZE, logsLenRef.current);
+      const windowSize = incremental ? PAGE_SIZE : Math.max(PAGE_SIZE, logsLenRef.current);
       const params = new URLSearchParams({ limit: String(windowSize) });
       if (model) params.set("model", model);
       if (status) params.set("status", status);
@@ -73,8 +84,18 @@ export default function RequestLogsPage() {
         has_more: boolean;
       }>(`/api/admin/logs${qs ? `?${qs}` : ""}`);
       if (seq !== seqRef.current) return; // 筛选已变，丢弃过期结果
-      setLogs(data.results ?? []);
-      logsLenRef.current = (data.results ?? []).length;
+      const fresh = data.results ?? [];
+      if (incremental) {
+        setLogs((prev) => {
+          const seen = new Set(fresh.map((r) => r.id));
+          const keep = Math.max(0, prev.length);
+          const rest = prev.filter((r) => !seen.has(r.id)).slice(0, keep);
+          return [...fresh, ...rest];
+        });
+      } else {
+        setLogs(fresh);
+        logsLenRef.current = fresh.length;
+      }
       setTotal(data.total ?? null);
       setHasMore(Boolean(data.has_more));
     } catch (e) {
@@ -82,7 +103,7 @@ export default function RequestLogsPage() {
       setError(e instanceof Error ? e.message : "加载失败");
     } finally {
       inflightRef.current = false;
-      if (seq === seqRef.current) setLoading(false);
+      if (seq === seqRef.current && !silent) setLoading(false);
     }
   }, [model, status]);
 
@@ -133,7 +154,7 @@ export default function RequestLogsPage() {
   useEffect(() => {
     if (!autoRefresh) return;
     const t = window.setInterval(() => {
-      if (!document.hidden) load();
+      if (!document.hidden) load(true);
     }, safeRefreshSec * 1000);
     return () => window.clearInterval(t);
   }, [autoRefresh, safeRefreshSec, load]);
@@ -195,7 +216,7 @@ export default function RequestLogsPage() {
                 <option value="60">60s</option>
               </Select>
             </div>
-            <Button onClick={load} loading={loading}>
+            <Button onClick={() => load()} loading={loading}>
               <RefreshCw size={14} /> 刷新
             </Button>
           </>
