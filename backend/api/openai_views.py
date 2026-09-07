@@ -568,10 +568,18 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
 
         result = None
         last_exc: Exception | None = None
+        # B2：重试必须排除上一轮已判定死亡的 Key+代理组合。
+        # 流式路径一直这么做（见下方 _stream_response 的 excluded /
+        # excluded_proxies），非流式路径此前**没传**这两个参数——于是
+        # `retry_count>0` 时第二轮 build_routes 很可能又抽回同一条死线路，
+        # 重试等于白跑一轮，还多烧一次 RPM。
+        # load_balancer.build_routes 的 docstring 明说这两个参数就是为此存在的。
+        excluded: set[tuple[int, int | None]] = set()
+        excluded_proxies: set[int] = set()
         for attempt in range(max_attempts):
             attempt_routes = routes if attempt == 0 else build_routes(
-                channel, proxy_group=model.proxy_group_id, endpoint=model.endpoint)
-
+                channel, proxy_group=model.proxy_group_id, endpoint=model.endpoint,
+                exclude=excluded or None, exclude_proxies=excluded_proxies or None)
             if not attempt_routes:
                 last_exc = NoRouteAvailable()
                 continue
@@ -594,6 +602,23 @@ def _run_authed(user_key, body, channel_slug, protocol, echo_body=None):
                 result = race_chat(attempt_routes, upstream_body)
                 break
             except (NoRouteAvailable, AllRoutesFailed) as exc:
+                # 把本轮判定死亡的 Key+代理组合记入排除集，下一轮换线时
+                # 不会再抽到它们（与流式路径同一套口径）
+                comb_by_name = {
+                    r.name: (getattr(r.key, "id", None),
+                             getattr(r.proxy, "id", None)
+                             if r.proxy is not None else None)
+                    for r in attempt_routes
+                }
+                for item in (getattr(exc, "report", None) or []):
+                    if item.get("status") != "failed":
+                        continue
+                    comb = comb_by_name.get(item.get("name"))
+                    if comb is None:
+                        continue
+                    excluded.add(comb)
+                    if comb[1] is not None:
+                        excluded_proxies.add(comb[1])
                 last_exc = exc
                 # 内容被拒（探针确认）是确定性失败：同样的内容重试必然
                 # 同样 400，换线无意义——直接终止重试（对标"模型不存在

@@ -183,9 +183,23 @@ def _score(k: ChannelKey):
     return (k.failure_count, lru)
 
 
+class RpmClaimUnavailable(RuntimeError):
+    """RPM 领取**无法判定**（数据库锁 / 连接故障等瞬时错误）。
+
+    必须与"返回 False = 这个 Key 配额耗尽"区分开。旧实现把两者坍缩成同一个
+    `False`，于是 SQLite 写争用期间 `build_routes` 看每个 Key 都像被限流，
+    整批 `continue` 后返回空线路 → `no_available_route` → 503，
+    而日志里与真实限流长得一模一样，排查时会被引向"配额配置错了"。
+    """
+
+
 def claim_rpm_slot(key_id: int) -> bool:
     """Atomically claim one RPM slot. Uses conditional UPDATEs (no SELECT ... FOR UPDATE)
-    so it is safe under SQLite's serialized write locking across threads."""
+    so it is safe under SQLite's serialized write locking across threads.
+
+    返回 True = 领到名额；False = 该 Key 确实不可用（耗尽 / 禁用 / 冷却中）。
+    数据库层面判不出来时抛 `RpmClaimUnavailable`，**不伪装成 False**。
+    """
     try:
         limit = ChannelKey.objects.filter(pk=key_id).values_list(
             "rpm_limit", flat=True).first()
@@ -225,10 +239,14 @@ def claim_rpm_slot(key_id: int) -> bool:
             rpm_limit__gt=0,
         ).update(status=ChannelKeyStatus.RATE_LIMITED)
         return False
+    except RpmClaimUnavailable:
+        raise
     except Exception as exc:  # noqa: BLE001
-        # DB 锁等瞬时错误不应让线路构建崩溃：本槽位放弃，交由可用性判断兜底。
-        logger.warning("claim_rpm_slot %s failed (swallowed): %s", key_id, exc)
-        return False
+        # DB 锁等瞬时错误**不能**伪装成"这个 Key 被限流了"：那会让 SQLite
+        # 写争用表现为整池配额耗尽 → no_available_route → 503，且与真实限流
+        # 在日志里无法区分。抛出去让调用方（build_routes）自己决定降级方式。
+        logger.warning("claim_rpm_slot %s unavailable (DB error): %s", key_id, exc)
+        raise RpmClaimUnavailable(f"claim_rpm_slot({key_id}) unavailable") from exc
 
 
 def release_rpm_slot(key_id: int) -> None:

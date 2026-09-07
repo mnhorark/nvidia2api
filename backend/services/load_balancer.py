@@ -102,7 +102,19 @@ def build_routes(channel: Channel | None = None,
             # 被排除组合：跳过该 Key，不 claim（组合排除换的是 Key，代理保留
             # 给后续可用 Key，避免被排除的代理被白白消耗）
             continue
-        if not key_service.claim_rpm_slot(key.id):
+        try:
+            claimed_ok = key_service.claim_rpm_slot(key.id)
+        except key_service.RpmClaimUnavailable:
+            # 数据库判不出来（锁 / 连接故障）。继续往后试每一把 Key 只会得到
+            # 同样的结果，而且会把"DB 不可用"伪装成"整池配额耗尽"。
+            # 立刻停止本轮 claim，把已经拿到的线路交出去；一条都没有时
+            # 调用方会得到 no_available_route，但日志里有一条明确写着
+            # DB 争用，不会被引向"配额配错了"。
+            logger.warning(
+                "build_routes: RPM 领取无法判定（数据库争用），本轮提前结束，"
+                "已构建 %d 条线路（channel=%s）", len(routes), channel.slug)
+            break
+        if not claimed_ok:
             continue
         if proxy is not None:
             proxy_ptr += 1
