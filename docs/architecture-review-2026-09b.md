@@ -600,7 +600,7 @@ MouseEvent 当成 `silent`（真值），手动刷新再也不显示加载态。
 `test_build_routes_uses_the_bulk_claim`（改回逐条不会让任何功能测试变红，单独钉一条）。
 R14 的 DB 争用守卫改为同时 patch 两个领取入口 —— 只 patch 未被使用的那个会空转。
 
-**全量回归 603 passed / 0 failed**，`manage.py check` 无问题，
+**全量回归 614 passed / 0 failed**（含渲染成本与后端批量路径的源码形态守卫），`manage.py check` 无问题，
 `makemigrations --check` 无待生成迁移，`tsc --noEmit` 干净，`next build` 13 路由预渲染。
 
 ### 12.5 未做（需要决策或前置测试）

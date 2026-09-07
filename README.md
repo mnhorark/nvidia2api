@@ -88,7 +88,7 @@ cp .env.example .env
 cd backend
 pip install -r requirements.txt -r requirements-dev.txt   # 运行时与测试依赖已分离
 python manage.py migrate
-python -m pytest tests          # 603 个测试：导入/限流/代理限制/竞速/并发安全/思考强度/多渠道/额度/熔断/回归守卫/前端静态托管/前端源码级不变量守卫/心跳探测/R4 性能/R5 宽松判胜守卫/R10 上游错误详情/单进程契约/错误信封/敏感操作审计/查询计划守卫/截断重试闸门
+python -m pytest tests          # 614 个测试：导入/限流/代理限制/竞速/并发安全/思考强度/多渠道/额度/熔断/回归守卫/前端静态托管/前端源码级不变量守卫/心跳探测/R4 性能/R5 宽松判胜守卫/R10 上游错误详情/单进程契约/错误信封/敏感操作审计/查询计划守卫/截断重试闸门
 python manage.py runserver 0.0.0.0:8000
 
 # 前端
