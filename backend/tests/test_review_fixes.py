@@ -7,8 +7,11 @@ extra_body 平铺、tool_stream usage 双计。
 import asyncio
 import json
 
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 
+from apps.core.models import Channel
 from services import anthropic_api, responses_api
 
 
@@ -373,3 +376,83 @@ class MessageShapeClampTests(TestCase):
         self.assertEqual(summary["top_keys"],
                          ["model", "stream", "tool_choice", "tools"])
         self.assertEqual(summary["tool_alias_rewritten"], 1)
+
+
+class NoNPlusOneOnBulkAdminPaths(TestCase):
+    """模型同步与代理批量导入不得随行数线性打查询。
+
+    两处原本都是 N+1：sync_models 每个上游模型一次 get_or_create（NVIDIA /
+    OpenRouter 一次返回几百个模型），bulk_import_proxies 每行一次
+    `filter(...).exists()`（导入 1000 行 = 1000 条 SELECT）。
+    管理端点不是 /v1 热路径，但它们是**同步视图**，跑在 asgiref 唯一那条
+    thread-sensitive 线程上——一次慢同步期间整个控制台都在排队。
+
+    用 SQL 条数断言，而不是用耗时：耗时在 CI 上噪声太大，条数是确定性的。
+    """
+
+    def test_sync_models_is_constant_queries(self):
+        from unittest.mock import patch
+
+        from services import upstream_service
+
+        ch = Channel.objects.create(name="n1o", slug="n1o",
+                                    base_url="https://up.test/v1")
+        names = [f"m{i}" for i in range(200)]
+        with patch.object(upstream_service, "list_models_raw",
+                          return_value=(200, {"data": [{"id": n} for n in names]})):
+            with CaptureQueriesContext(connection) as cap:
+                res = upstream_service.sync_models(ch, api_key="nvapi-test")
+        self.assertEqual(res["created"], 200)
+        n = len(cap.captured_queries)
+        self.assertLess(n, 20, f"sync_models 仍随模型数线性查询：{n} 条 SQL / 200 模型")
+
+    def test_sync_models_second_run_creates_nothing_and_stays_flat(self):
+        from unittest.mock import patch
+
+        from services import upstream_service
+
+        ch = Channel.objects.create(name="n1b", slug="n1b",
+                                    base_url="https://up.test/v1")
+        payload = (200, {"data": [{"id": f"m{i}"} for i in range(200)]})
+        with patch.object(upstream_service, "list_models_raw", return_value=payload):
+            upstream_service.sync_models(ch, api_key="nvapi-test")
+            with CaptureQueriesContext(connection) as cap:
+                res = upstream_service.sync_models(ch, api_key="nvapi-test")
+        self.assertEqual(res["created"], 0)
+        self.assertEqual(res["existing"], 200)
+        self.assertLess(len(cap.captured_queries), 20,
+                        "重复同步仍应只查一次已存在集合")
+
+    def test_proxy_import_is_constant_queries(self):
+        from services import proxy_service
+
+        ch = Channel.objects.create(name="n1c", slug="n1c",
+                                    base_url="https://up.test/v1")
+        text = "\n".join(f"socks5://127.0.0.1:{10000 + i}" for i in range(300))
+        with CaptureQueriesContext(connection) as cap:
+            res = proxy_service.bulk_import_proxies(text, ch)
+        self.assertEqual(res["success"], 300)
+        # 只断言 SELECT 条数：写入仍是每行一次 INSERT，那是**故意的**——
+        # Proxy.save() 负责密码加密，换成 bulk_create 会绕过 save() 把明文写进库。
+        # 所以要钉住的是"逐行 exists() 查重"别回来，而不是总查询数。
+        selects = [q["sql"] for q in cap.captured_queries
+                   if q["sql"].lstrip().upper().startswith("SELECT")]
+        self.assertLess(len(selects), 10,
+                        f"代理导入又回到逐行查重：{len(selects)} 条 SELECT / 300 行")
+
+    def test_proxy_import_still_dedupes_against_existing(self):
+        """批量取回存量集合后，去重语义必须与逐行 exists() 完全一致。"""
+        from apps.core.models import Proxy
+
+        from services import proxy_service
+
+        ch = Channel.objects.create(name="n1d", slug="n1d",
+                                    base_url="https://up.test/v1")
+        Proxy.objects.create(channel=ch, name="p0", protocol="socks5",
+                             host="1.2.3.4", port=1080)
+        text = ("socks5://1.2.3.4:1080\n"
+                "socks5://1.2.3.4:1080\n"
+                "socks5://5.6.7.8:1080")
+        res = proxy_service.bulk_import_proxies(text, ch)
+        self.assertEqual(res["duplicate"], 2, "存量一条 + 批内一条都应算重复")
+        self.assertEqual(res["success"], 1)

@@ -105,6 +105,15 @@ def bulk_import_proxies(text: str, channel: Channel) -> dict:
 
 
 def _bulk_import_proxies_locked(lines, channel, result, seen, auto_idx) -> dict:
+    # 去重判定的存量端点集合**一次性取回**。原来是每行一条
+    # `channel.proxies.filter(...).exists()`：导入 1000 行就是 1000 条 SELECT，
+    # 而该渠道可能已有 1300 条代理。改成一条 values_list 拿全量四元组进 set，
+    # 1000 次查询变 1 次。
+    # 注意写入仍是逐行 create —— Proxy.save() 负责密码加密，
+    # 换成 bulk_create 会绕过 save() 把明文密码写进库。
+    existing_idents = set(
+        channel.proxies.values_list("protocol", "host", "port", "username")
+    )
     for ln in lines:
         auto_named = False
         if "---" in ln:
@@ -122,14 +131,13 @@ def _bulk_import_proxies_locked(lines, channel, result, seen, auto_idx) -> dict:
             result["errors"].append({"line": ln, "reason": "invalid_format"})
             continue
         ident = (parsed["protocol"], parsed["host"], parsed["port"], parsed["username"])
-        if ident in seen or channel.proxies.filter(
-            protocol=ident[0], host=ident[1], port=ident[2], username=ident[3]
-        ).exists():
+        if ident in seen or ident in existing_idents:
             result["duplicate"] += 1
             continue
         try:
             Proxy.objects.create(channel=channel, name=name, **parsed)
             seen.add(ident)
+            existing_idents.add(ident)
             if auto_named:
                 auto_idx += 1
             result["success"] += 1

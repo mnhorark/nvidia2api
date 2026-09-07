@@ -95,14 +95,33 @@ def sync_models(channel: Channel, api_key: str | None = None,
 
     created = existing = 0
     if not prune_only:
-        for name in upstream_names:
-            _, was_created = channel.models.get_or_create(
-                model_name=name, defaults={"provider": channel.slug}
+        # 上游一次可以返回几百个模型（NVIDIA / OpenRouter 都是），原来是每个名字
+        # 一次 get_or_create，同步一次就是几百条串行查询。改成一次取回已存在的
+        # 名字 + 一条 bulk_create 补齐缺失的。
+        # 上游名可能重复，先去重再算差集，否则 created 会虚高。
+        wanted = list(dict.fromkeys(n for n in upstream_names if n))
+        have = set(
+            channel.models.filter(model_name__in=wanted)
+            .values_list("model_name", flat=True)
+        )
+        missing = [n for n in wanted if n not in have]
+        if missing:
+            from apps.core.models import AIModel
+
+            # ignore_conflicts：两个管理端同时同步时撞 unique_channel_model
+            # 不该让整批失败。
+            channel.models.bulk_create(
+                [AIModel(channel=channel, model_name=n, provider=channel.slug)
+                 for n in missing],
+                ignore_conflicts=True,
             )
-            if was_created:
-                created += 1
-            else:
-                existing += 1
+            # bulk_create 不发 post_save，而 model_registry 的缓存失效是靠信号
+            # 做的——不显式清一次，新模型要等 3s TTL 才对外可见。
+            from services import model_registry
+
+            model_registry.invalidate()
+        created = len(missing)
+        existing = len(wanted) - created
 
     result = {"created": created, "existing": existing,
               "total": len(upstream_names), "channel": channel.slug,
